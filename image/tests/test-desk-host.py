@@ -16,6 +16,7 @@ in the rendered smb.conf exactly), file browser with the stock rights
 (alice ro / bob deny on "mixed", path traversal refused), settings
 validation, first setup (way A), way D (rollback marker on a test stick).
 """
+import hashlib
 import http.cookiejar
 import json
 import re
@@ -104,6 +105,7 @@ def env_for(r, stick, port):
                 ZT_UPNPC=os.path.join(HERE, "fake-upnpc"), ZT_FAKE_UPNP_STATE=r + "/upnp-state.json",
                 ZT_ISCSI_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-iscsi"), ZT_ISCSI_ROOT=r,
                 ZT_POWER_TOOL=os.path.join(BOARD, "usr/lib/untrash/untrash-power") if BOARD else "/bin/false",
+                ZT_UPDATE_TOOL="/bin/true",
                 ZT_SOUND_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-sound"), ZT_SOUND_USER=r + "/etc/untrash/sounds.json",
                 ZT_SOUND_DEVICE=r + "/tone", ZT_SOUND_LOG=r + "/tones", ZT_SOUND_LOG_MS="1", ZT_SOUND_NO_SLEEP="1",
                 ZT_SOUND_LOCK=r + "/sound.lock", ZT_EXPORT_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-export"),
@@ -477,6 +479,32 @@ def main():
             check("prefs of admin untouched", a.req("/api/me")[1]["prefs"]["theme"] == "dark")
             check("prefs: unknown value refused", u.req("/api/prefs", {"theme": "neon"})[0] == 400 and u.req("/api/prefs", {"font": "x"})[0] == 400)
             check("prefs: anonymous refused", Client(port).req("/api/prefs", {"theme": "light"})[0] == 401)
+            # updates: settings, check, the downloaded release, downgrade guard (untrash-update: test-update-host.py)
+            def utslot(ver):
+                head = os.urandom(4096)
+                man = ("format=untrash-slot-2\nversion=%s\nkernel_off=0\nkernel_len=4096\nkernel_sha256=%s\n"
+                       % (ver, hashlib.sha256(head).hexdigest())).encode()
+                return head + man.ljust(4096, b"\0") + b"\1" * 64 + b"\0" * 4032
+            open(r + "/etc/untrash-version", "w").write("1.0\n")
+            st, uj = a.req("/api/update")
+            check("update: version, settings, no release yet", st == 200 and uj["version"] == "1.0" and uj["release"] == {})
+            check("update settings saved", a.req("/api/update/settings", {"channel": "beta", "download": False})[0] == 200
+                  and a.req("/api/update")[1]["settings"]["channel"] == "beta" and a.req("/api/update")[1]["settings"]["download"] is False)
+            check("update settings: unknown channel refused", a.req("/api/update/settings", {"channel": "nightly"})[0] == 400)
+            check("update check starts", a.req("/api/update/check", {})[0] == 200)
+            check("alice: update API 403", u.req("/api/update/check", {})[0] == 403 and u.req("/api/update")[0] == 403)
+            check("install release: none ready -> 400", a.req("/api/update/install", {"source": "release"})[0] == 400)
+            ud = r + "/var/lib/untrash/update"
+            os.makedirs(ud, exist_ok=True)
+            open(ud + "/2.0.utslot", "wb").write(utslot("2.0"))
+            json.dump({"available": {"version": "2.0"}, "download": {"state": "ready", "file": ud + "/2.0.utslot"}}, open(ud + "/state.json", "w"))
+            st, ij = a.req("/api/update/install", {"source": "release"})
+            check("install the downloaded release 2.0", st == 200 and a.req("/api/update")[1]["image"] == "2.0")
+            st, _ = a.req("/api/update/upload", raw=utslot("0.9"))
+            uj = a.req("/api/update")[1]
+            check("upload of an older image: accepted, marked older", st == 200 and uj["older"] and uj["image"] == "0.9")
+            check("older image: install needs the downgrade confirmation", a.req("/api/update/install", {})[0] == 400
+                  and a.req("/api/update/install", {"downgrade": True})[0] == 200)
             # RAID / volumes (untrash-storage test double; the real tool: test-storage-host.sh)
             check("alice: raid 403", u.req("/api/raid")[0] == 403)
             st, rj = a.req("/api/raid")

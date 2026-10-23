@@ -81,6 +81,7 @@ DEFAULTS = {
     "hostname": "untrash",
     "hostname_auto": True,     # default name: untrash-netname keeps the mDNS name (untrash-2, -3, ...)
     "language": "en",          # Desk default; a browser may choose its own (i18n.js)
+    "update": {"check": True, "download": True, "channel": "stable"},   # untrash-update
     "netbios": {"name": "UNTRASH", "description": "UntrashOS", "workgroup": "WORKGROUP", "nomaster": False},
     "time": {"timezone": "Europe/Berlin", "ntp": True, "ntp_server": "pool.ntp.org"},
     "network": {"eth0": {"mode": "dhcp", "address": "", "gateway": "", "mtu": 1500},

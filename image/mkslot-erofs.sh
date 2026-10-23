@@ -120,6 +120,7 @@ ln -sf /usr/lib/systemd/system/untrash-recycle-expire.timer "$W/root/etc/systemd
 ln -sf /usr/lib/systemd/system/untrash-backup.timer "$W/root/etc/systemd/system/timers.target.wants/"
 ln -sf /usr/lib/systemd/system/untrash-leds.timer "$W/root/etc/systemd/system/timers.target.wants/"
 ln -sf /usr/lib/systemd/system/untrash-adblock-update.timer "$W/root/etc/systemd/system/timers.target.wants/"
+ln -sf /usr/lib/systemd/system/untrash-update.timer "$W/root/etc/systemd/system/timers.target.wants/"
 ln -sf /usr/lib/systemd/system/untrash-settings.service "$W/root/etc/systemd/system/sysinit.target.wants/"
 ln -sf /usr/lib/systemd/system/untrash-wdt.service "$W/root/etc/systemd/system/sysinit.target.wants/"
 # inadyn: native unit in rootfs; the SysV script made every daemon-reload

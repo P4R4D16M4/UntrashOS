@@ -1,0 +1,255 @@
+#!/usr/bin/python3
+"""untrash-update - find, download and verify UntrashOS updates.
+
+  untrash-update check      look for a newer release; download it when the
+                            settings allow (untrash-update.timer, daily)
+  untrash-update download   download (and verify) the release found
+  untrash-update status     state as JSON
+  untrash-update forget     drop the downloaded image
+
+Where: the releases of the device's firmware repository
+(/usr/share/untrash/board.json: "releases" = GitHub API URL, "asset" =
+file name pattern of the update file).  Which: the newest release that is
+not a draft, newer than the running version (/etc/untrash-version); a
+prerelease only on the beta channel.  Trust comes only from the image:
+after the download the slot file is verified like the loader does
+(signature over the manifest by a trusted key, kernel/DTB/initrd hashes;
+pylib/untrash_slot.py) and its manifest version must be the release's.
+Installing is never done here: an admin confirms it in the Desk
+(Updates), which writes the verified file to the inactive slot.
+
+Settings (untrash-config, "update"): check (daily check), download
+(download a found update at once), channel (stable | beta).
+Network: one anonymous HTTPS request per check; no data about the NAS is
+sent besides the User-Agent "UntrashOS/<version>".
+State: /var/lib/untrash/update/state.json, image <version>.utslot there.
+"""
+import fcntl
+import fnmatch
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "pylib"))
+import untrash_slot as SL  # noqa: E402
+
+E = os.environ.get
+DIR = E("ZT_UPDATE_DIR", "/var/lib/untrash/update")
+STATE = os.path.join(DIR, "state.json")
+BOARD = E("ZT_BOARD_JSON", "/usr/share/untrash/board.json")
+SETTINGS = E("ZT_SETTINGS", "/etc/untrash/settings.json")
+VERSION = E("ZT_VERSION_FILE", "/etc/untrash-version")
+TIMEOUT = float(E("ZT_UPDATE_TIMEOUT", "30"))
+
+
+def log(msg):
+    print("untrash-update: " + msg, flush=True)
+
+
+def jload(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def state():
+    return jload(STATE, {})
+
+
+def save(st):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def settings():
+    u = jload(SETTINGS, {}).get("update") or {}
+    return {"check": u.get("check", True), "download": u.get("download", True),
+            "channel": u.get("channel") if u.get("channel") in ("stable", "beta") else "stable"}
+
+
+def current():
+    try:
+        return open(VERSION).read().strip() or "?"
+    except OSError:
+        return "?"
+
+
+def request(url, headers=None):
+    h = {"User-Agent": "UntrashOS/%s" % current(), "Accept": "application/vnd.github+json"}
+    h.update(headers or {})
+    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=TIMEOUT)
+
+
+def find(channel):
+    """Newest usable release (dict) or None."""
+    board = jload(BOARD, {})
+    url = E("ZT_UPDATE_RELEASES") or board.get("releases")
+    if not url:
+        raise RuntimeError("this device has no release source (board.json)")
+    pattern = board.get("asset") or "untrash-*-update.utslot"
+    with request(url + ("&" if "?" in url else "?") + "per_page=30") as r:
+        rels = json.load(r)
+    best = None
+    for rel in rels:
+        if rel.get("draft") or (rel.get("prerelease") and channel != "beta"):
+            continue
+        ver = (rel.get("tag_name") or "").lstrip("vV")
+        asset = next((a for a in rel.get("assets") or [] if fnmatch.fnmatch(a.get("name", ""), pattern)), None)
+        if not asset or SL.version_key(ver) == ((0,), 0, 0):
+            continue
+        if best is None or SL.newer(ver, best["version"]):
+            best = {"version": ver, "tag": rel.get("tag_name"), "name": rel.get("name") or rel.get("tag_name"),
+                    "notes": (rel.get("body") or "")[:20000], "published": rel.get("published_at"),
+                    "prerelease": bool(rel.get("prerelease")), "page": rel.get("html_url"),
+                    "url": asset.get("browser_download_url"), "asset": asset.get("name"), "size": asset.get("size")}
+    return best
+
+
+def image_path(ver):
+    return os.path.join(DIR, "%s.utslot" % ver)
+
+
+def cleanup(keep=None):
+    for f in os.listdir(DIR) if os.path.isdir(DIR) else []:
+        if f.endswith((".utslot", ".utslot.part")) and f not in (keep or ()):
+            os.remove(os.path.join(DIR, f))
+
+
+def download(st):
+    """Fetch st["available"] (resuming a .part), verify it, mark it ready."""
+    av = st["available"]
+    final, part = image_path(av["version"]), image_path(av["version"]) + ".part"
+    cleanup(keep=(os.path.basename(final), os.path.basename(part)))
+    if st.get("download", {}).get("state") == "ready" and os.path.exists(final):
+        return st
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    if av.get("size") and have > av["size"]:
+        os.remove(part)
+        have = 0
+    st["download"] = {"state": "downloading", "bytes": have, "size": av.get("size"), "error": None}
+    save(st)
+    if av.get("size") and have == av["size"]:     # complete already (stopped before the check)
+        return verify_ready(st, part, final, have)
+    hdr = {"Accept": "application/octet-stream"}
+    if have:
+        hdr["Range"] = "bytes=%d-" % have
+    with request(av["url"], hdr) as r:
+        if have and r.status != 206:            # server ignored the range: start again
+            have = 0
+        mode = "ab" if have else "wb"
+        last = time.time()
+        with open(part, mode) as f:
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                f.write(b)
+                have += len(b)
+                if av.get("size") and have > av["size"]:
+                    raise RuntimeError("download larger than announced")
+                if time.time() - last > 2:
+                    st["download"]["bytes"] = have
+                    save(st)
+                    last = time.time()
+    if av.get("size") and have != av["size"]:
+        raise RuntimeError("download incomplete (%d of %d bytes)" % (have, av["size"]))
+    return verify_ready(st, part, final, have)
+
+
+def verify_ready(st, part, final, have):
+    av = st["available"]
+    os.replace(part, final)
+    st["download"].update(state="verifying", bytes=have)
+    save(st)
+    try:
+        m = SL.verify(final)
+        if m.get("version") != av["version"]:
+            raise SL.SlotError("image is version %s, the release is %s" % (m.get("version"), av["version"]))
+    except SL.SlotError as e:
+        os.remove(final)
+        raise RuntimeError(str(e))
+    st["download"].update(state="ready", file=final, verified=int(time.time()))
+    log("UntrashOS %s downloaded and verified: %s" % (av["version"], final))
+    return st
+
+
+def cmd_check(manual):
+    cfg, st = settings(), state()
+    if not cfg["check"] and not manual:
+        log("daily check is off")
+        return 0
+    st.update(checked=int(time.time()), current=current(), channel=cfg["channel"])
+    try:
+        rel = find(cfg["channel"])
+        st["error"] = None
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError) as e:
+        st["error"] = "release source not reachable: %s" % e
+        save(st)
+        log(st["error"])
+        return 1
+    if not rel or not SL.newer(rel["version"], current()):
+        st["available"], st["download"] = None, {"state": "none"}
+        cleanup()
+        save(st)
+        log("no newer release (running %s)" % current())
+        return 0
+    if (st.get("available") or {}).get("version") != rel["version"]:
+        st["download"] = {"state": "none"}
+    st["available"] = rel
+    save(st)
+    log("UntrashOS %s is available (running %s)" % (rel["version"], current()))
+    if cfg["download"]:
+        return cmd_download()
+    return 0
+
+
+def cmd_download():
+    st = state()
+    if not st.get("available"):
+        log("nothing to download")
+        return 1
+    try:
+        st = download(st)
+        save(st)
+        return 0
+    except (OSError, RuntimeError, urllib.error.URLError) as e:
+        st.setdefault("download", {}).update(state="failed", error=str(e))
+        save(st)
+        log("download failed: %s" % e)
+        return 1
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["status"]:
+        print(json.dumps(dict(state(), settings=settings(), current=current())))
+        return 0
+    if a == ["forget"]:
+        st = state()
+        cleanup()
+        st["download"] = {"state": "none"}
+        save(st)
+        return 0
+    if a not in (["check"], ["check", "--manual"], ["download"]):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    os.makedirs(DIR, exist_ok=True)
+    lock = open(os.path.join(DIR, ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another update run is busy")
+        return 0
+    return cmd_download() if a == ["download"] else cmd_check(manual=len(a) == 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

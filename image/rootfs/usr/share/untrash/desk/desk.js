@@ -172,7 +172,8 @@ function desk(st) {
   };
   const tick = () => $('#clock') && ($('#clock').textContent = new Date().toLocaleString(UTI18N.locale, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }));
   tick(); setInterval(tick, 15000);
-  if (ME.admin) { const rp = single(raidPill), ab = single(activityBar); rp(); setInterval(rp, 60000); ab(); setInterval(ab, 5000); openApp('overview'); } else openApp('files');
+  if (ME.admin) { const rp = single(raidPill), ab = single(activityBar); rp(); setInterval(rp, 60000); ab(); setInterval(ab, 5000); openApp('overview'); 
+    api('update').then(u => { const r = u.release || {}; if (r.available && (r.download || {}).state === 'ready') toast('Update', UTI18N.tr('UntrashOS %s is downloaded and checked; install it under Updates.').replace('%s', r.available.version)); }).catch(() => { }); } else openApp('files');
 }
 // polling: never a second request while the first is still open.  Browsers
 // allow 6 connections per server; slow answers that piled up blocked every
@@ -999,13 +1000,47 @@ VIEWS.backup = async b => {
 
 /* updates ---------------------------------------------------------------- */
 VIEWS.updates = async b => {
-  const u = await api('update');
+  const u = await api('update'), rel = u.release || {}, av = rel.available, dl = rel.download || {}, cfg = u.settings || {};
+  const when = t => t ? esc(new Date(t * 1000).toLocaleString(UTI18N.locale)) : '–';
+  let auto;
+  if (av) {
+    const busy = dl.state === 'downloading' || dl.state === 'verifying';
+    const pct = dl.size ? Math.round(100 * (dl.bytes || 0) / dl.size) : 0;
+    auto = `<div class="ut-card"><div class="ut-card__head"><h3>${esc(UTI18N.tr('UntrashOS %s is available').replace('%s', av.version))}</h3>
+        ${av.prerelease ? '<span class="ut-pill ut-pill--warn">Beta</span>' : ''}<span class="ut-spacer"></span>
+        ${av.page ? `<a href="${esc(av.page)}" target="_blank" rel="noopener">Release page</a>` : ''}</div>
+      ${av.notes ? `<pre translate="no" class="ut-log" style="max-height:220px">${esc(av.notes)}</pre>` : ''}
+      ${dl.state === 'ready' ? `<div class="ut-callout ut-callout--ok" style="margin-top:10px"><div>Downloaded and checked (signature, checksums). Installing writes it to the other slot; the NAS starts it after a restart and goes back on its own if it does not start cleanly.</div></div>
+          <div class="row" style="margin-top:10px"><button class="ut-btn ut-btn--primary" id="relinst">${esc(UTI18N.tr('Install UntrashOS %s').replace('%s', av.version))}</button></div>`
+        : busy ? `<div class="ut-progress" style="margin-top:10px"><i style="--v:${pct}%"></i></div><p class="ut-faint">${dl.state === 'verifying' ? 'Checking (signature, checksums) …' : esc(UTI18N.tr('Downloading …')) + ' ' + pct + ' % (' + gb(dl.bytes || 0) + ' / ' + gb(dl.size || 0) + ')'}</p>`
+        : `${dl.state === 'failed' ? `<div class="ut-callout ut-callout--danger" style="margin-top:10px"><div translate="no">${esc(dl.error || '')}</div></div>` : ''}
+          <div class="row" style="margin-top:10px"><button class="ut-btn ut-btn--primary" id="reldl">${dl.state === 'failed' ? 'Try again' : 'Download'}</button><span class="ut-faint">${gb(av.size || 0)}</span></div>`}
+    </div>`;
+    if (busy) setTimeout(() => { if (document.body.contains(b)) render('updates'); }, 2000);
+  } else auto = `<div class="ut-callout ut-callout--ok"><div>UntrashOS is up to date.</div></div>`;
   b.innerHTML = `<div class="ut-window__main"><p>Installed: <b>${esc(u.version)}</b> · running from slot <b>${esc(String(u.slot).toUpperCase())}</b></p>
+    <div class="ut-section-title">Updates from the release page</div>
+    ${rel.error ? `<div class="ut-callout ut-callout--warn" style="margin-bottom:10px"><div>${esc(rel.error)}</div></div>` : ''}
+    ${auto}
+    <div class="row" style="margin-top:10px"><button class="ut-btn" id="relchk">Check now</button><span class="ut-faint">Last check: ${when(rel.checked)}</span></div>
+    <div class="form" style="margin-top:12px">${sw('ucheck', cfg.check !== false, 'Check for updates every day')}<br>
+      ${sw('udown', cfg.download !== false, 'Download updates automatically (installing always needs your confirmation)')}
+      <div class="ut-field" style="margin-top:10px"><label for="uchan">Channel</label><select class="ut-select" id="uchan">
+        <option value="stable"${cfg.channel !== 'beta' ? ' selected' : ''}>Stable releases</option><option value="beta"${cfg.channel === 'beta' ? ' selected' : ''}>Beta (pre-releases too)</option></select>
+      <span class="ut-hint">A check is one anonymous request to the release page on github.com; nothing about this NAS is sent. Only images signed by UntrashOS are accepted.</span></div></div>
+    <div class="ut-section-title">Install from a file</div>
     <div class="form"><p class="ut-faint">A new system image (slot.utslot) is checked (signature, checksums) and written to the other slot. If it does not start cleanly, the loader automatically goes back to the current one.</p>
     <label class="ut-btn">Choose a system image …<input type="file" id="uf" accept=".utslot" hidden></label>
     <div class="ut-progress" id="upr" hidden style="margin-top:10px"><i></i></div><div class="ut-callout" id="ust" hidden style="margin-top:8px"></div>
-    ${u.state === 'ready' ? '<button class="ut-btn ut-btn--primary" id="uinst">Install</button>' : ''}${u.state === 'installed' ? '<button class="ut-btn ut-btn--primary" id="ureb">Restart now</button>' : ''}
+    ${u.state === 'ready' && u.source === 'upload' ? `${u.older ? `<div class="ut-callout ut-callout--warn" style="margin:10px 0"><div>${esc(UTI18N.tr('Image %s is not newer than the running system.').replace('%s', u.image))}</div></div>${sw('udowngrade', false, 'Install the older version anyway')}<br>` : ''}<button class="ut-btn ut-btn--primary" id="uinst">Install</button>` : ''}${u.state === 'installed' ? '<button class="ut-btn ut-btn--primary" id="ureb">Restart now</button>' : ''}
     <pre translate="no" class="ut-log" style="margin-top:10px">${esc(u.log.join('\n')) || esc(UTI18N.tr('No operation.'))}</pre></div></div>`;
+  $('#relchk', b).onclick = async () => { await api('update/check', {}).catch(fail); toast('Updates', 'Checking the release page …'); setTimeout(() => { if (document.body.contains(b)) render('updates'); }, 4000); };
+  const dlb = $('#reldl', b); if (dlb) dlb.onclick = async () => { await api('update/download', {}).catch(fail); setTimeout(() => render('updates'), 1500); };
+  const ri = $('#relinst', b); if (ri) ri.onclick = () => dialog({ title: UTI18N.tr('Install UntrashOS %s').replace('%s', av.version), ok: 'Install', okCls: 'ut-btn--primary',
+    body: '<p>The image is written to the other slot (a few minutes). Restart afterwards to start it; the current system stays as the fallback.</p>',
+    onOk: async () => { await api('update/install', { source: 'release' }); render('updates'); } });
+  const save = () => api('update/settings', { check: $('#ucheck', b).checked, download: $('#udown', b).checked, channel: $('#uchan', b).value }).catch(fail);
+  ['#ucheck', '#udown', '#uchan'].forEach(q => { $(q, b).onchange = save; });
   $('#uf', b).onchange = () => {
     const f = $('#uf', b).files[0]; if (!f) return;
     const st = $('#ust', b), bar = $('#upr', b);
@@ -1026,7 +1061,7 @@ VIEWS.updates = async b => {
     x.onerror = () => { bar.hidden = true; show(UTI18N.tr('Transfer aborted (network). Please try again.'), 'ut-callout--danger'); };
     show(UTI18N.tr('Uploading …')); x.send(f);
   };
-  const i = $('#uinst', b); if (i) i.onclick = async () => { try { await api('update/install', {}); render('updates'); } catch (e) { fail(e); } };
+  const i = $('#uinst', b); if (i) i.onclick = async () => { try { await api('update/install', { downgrade: !!($('#udowngrade', b) || {}).checked }); render('updates'); } catch (e) { fail(e); } };
   const r = $('#ureb', b); if (r) r.onclick = () => api('power', { action: 'reboot' }).then(() => toast('Restart', 'The NAS is restarting.'));
 };
 

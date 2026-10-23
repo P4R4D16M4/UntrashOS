@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.join(HERE, "pylib"))
 import untrash_auth  # noqa: E402
 import untrash_live  # noqa: E402
 import untrash_tv  # noqa: E402
+import untrash_slot  # noqa: E402
 
 PORT = int(os.environ.get("ZT_DESK_PORT", "80"))
 CONFIG = R + "/etc/untrash/zyxel/stock-config"
@@ -1551,6 +1552,8 @@ def raid_job(req):
 # ------------------------------------------------------------- slot update
 
 UPDATE = {"state": "idle", "log": []}
+UPDATE_TOOL = os.environ.get("ZT_UPDATE_TOOL", "/usr/lib/untrash/untrash-update")
+UPDATE_STATE = os.environ.get("ZT_UPDATE_STATE", R + "/var/lib/untrash/update/state.json")
 
 
 def boot_env():
@@ -1577,38 +1580,44 @@ def update_upload(handler, length):
                 raise Fail("Transfer aborted.")
             f.write(b)
             left -= len(b)
-    with open(tmp, "rb") as f:
-        f.seek(length - 8192)
-        man = f.read(4096).rstrip(b"\0").decode("utf-8", "replace")
-        block = f.read(4096)    # up to 8 signatures of 64 bytes (mkslot-erofs.sh)
-    sigs = [block[i:i + 64] for i in range(0, 512, 64) if block[i:i + 64].strip(b"\0")]
-    m = dict(l.split("=", 1) for l in man.splitlines() if "=" in l)
-    if m.get("format") != "untrash-slot-2":
-        raise Fail("Not an UntrashOS system image (format).")
-    open(tmp + ".manifest", "w").write(man)
-
-    def signed(sig):
-        open(tmp + ".sig", "wb").write(sig)
-        return any(subprocess.run(["/usr/lib/untrash/zt-sig", "verify", k, tmp + ".manifest", tmp + ".sig"],
-                                  stdout=subprocess.DEVNULL).returncode == 0
-                   for k in glob.glob("/usr/lib/untrash/keys/*.pub"))
-    ok = TEST or any(signed(s) for s in sigs)
-    if not ok:
-        raise Fail("Invalid signature: image not from UntrashOS.")
-    with open(tmp, "rb") as f:
-        for p in ("kernel", "dtb", "initrd"):
-            if m.get(p + "_off"):
-                f.seek(int(m[p + "_off"]))
-                if hashlib.sha256(f.read(int(m[p + "_len"]))).hexdigest() != m.get(p + "_sha256"):
-                    raise Fail("Image damaged (%s)." % p)
-    UPDATE.update(state="ready", version=m.get("version", "?"), file=tmp, size=length,
-                  log=["Image %s checked (signature, kernel, DTB, initrd)" % m.get("version", "?")])
+    try:
+        m = untrash_slot.verify(tmp, check_signature=not TEST)
+    except untrash_slot.SlotError as e:
+        raise Fail(str(e))
+    ver = m.get("version", "?")
+    UPDATE.update(state="ready", version=ver, file=tmp, size=length, source="upload",
+                  older=not untrash_slot.newer(ver, first("/etc/untrash-version", "?").strip()),
+                  log=["Image %s checked (signature, kernel, DTB, initrd)" % ver])
     return {"version": UPDATE["version"]}
 
 
+def update_release_state():
+    try:
+        return json.load(open(UPDATE_STATE))
+    except (OSError, ValueError):
+        return {}
+
+
 def update_install(req):
+    """Write a verified image to the inactive slot: the uploaded one, or
+    (source=release) the one untrash-update downloaded.  An image that is not
+    newer than the running system needs downgrade=true."""
+    if req.get("source") == "release":
+        st = update_release_state()
+        f = (st.get("download") or {}).get("file") or ""
+        if (st.get("download") or {}).get("state") != "ready" or not os.path.isfile(f):
+            raise Fail("No downloaded update is ready.")
+        try:
+            m = untrash_slot.trailer(f)[0]  # verified after the download; the file is root's
+        except untrash_slot.SlotError as e:
+            raise Fail(str(e))
+        UPDATE.update(state="ready", version=m.get("version", "?"), file=f, source="release",
+                      older=not untrash_slot.newer(m.get("version", "?"), first("/etc/untrash-version", "?").strip()),
+                      log=["Image %s downloaded from the release page and checked (signature, kernel, DTB, initrd)" % m.get("version", "?")])
     if UPDATE.get("state") != "ready":
         raise Fail("Upload an image first.")
+    if UPDATE.get("older") and not req.get("downgrade"):
+        raise Fail("This image is not newer than the running system (%s); confirm the downgrade." % first("/etc/untrash-version", "?").strip())
     env = boot_env()
     slot = env.get("ZT_SLOT") or ""
     other = "b" if slot == "a" else "a"
@@ -1626,6 +1635,28 @@ def update_install(req):
     UPDATE["log"].append("written to slot %s; restarting starts %s" % (other.upper(), UPDATE["version"]))
     UPDATE["state"] = "installed"
     return {"slot": other}
+
+
+def update_run(args):
+    """untrash-update in the background (check or download)."""
+    if TEST:
+        SYSLOG.append([UPDATE_TOOL] + args)
+    threading.Thread(target=lambda: subprocess.run([UPDATE_TOOL] + args, stdout=subprocess.DEVNULL), daemon=True).start()
+    return {}
+
+
+def update_settings(req):
+    s = settings_load()
+    u = s.setdefault("update", {})
+    for k in ("check", "download"):
+        if k in req:
+            u[k] = bool(req[k])
+    if "channel" in req:
+        if req["channel"] not in ("stable", "beta"):
+            raise Fail("Unknown update channel.")
+        u["channel"] = req["channel"]
+    settings_save(s, apply=False)
+    return u
 
 
 # ------------------------------------------------------------ system sounds
@@ -2533,7 +2564,10 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/groups/create": group_create, "/api/groups/delete": group_delete,
               "/api/groups/members": group_set_members, "/api/shares/save": share_save,
               "/api/shares/delete": share_delete, "/api/settings": settings_update, "/api/power": power,
-              "/api/update/install": update_install, "/api/stock/rollback": stock_rollback, "/api/raid/job": raid_job,
+              "/api/update/install": update_install,
+              "/api/update/check": lambda req: update_run(["check", "--manual"]),
+              "/api/update/download": lambda req: update_run(["download"]),
+              "/api/update/settings": update_settings, "/api/stock/rollback": stock_rollback, "/api/raid/job": raid_job,
               "/api/notify/test": notify_test, "/api/printers/cancel": printer_cancel,
               "/api/cloud/auth-start": cloud_auth_start, "/api/cloud/auth-finish": cloud_auth_finish,
               "/api/cloud/ftp": cloud_ftp, "/api/cloud/delete": cloud_delete, "/api/cloud/jobs": cloud_jobs,
@@ -2770,8 +2804,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, logs(q))
             if p == "/api/update":
                 env = boot_env()
-                return self.reply(200, {"state": UPDATE["state"], "log": UPDATE["log"],
-                                        "version": first("/etc/untrash-version", "?"), "slot": env.get("ZT_SLOT", "?")})
+                return self.reply(200, {"state": UPDATE["state"], "log": UPDATE["log"], "older": UPDATE.get("older", False),
+                                        "image": UPDATE.get("version"), "source": UPDATE.get("source"),
+                                        "version": first("/etc/untrash-version", "?"), "slot": env.get("ZT_SLOT", "?"),
+                                        "release": update_release_state(), "settings": settings_load().get("update", {})})
             if p == "/api/stock":
                 st = stock_backup()
                 return self.reply(200, {"stick": bool(st), "run": st and {k: st["run"][k] for k in ("name", "verified")},

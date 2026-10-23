@@ -35,3 +35,4 @@ test-run:
 	python3 image/tests/test-desk-host.py
 	python3 image/tests/test-backup-host.py
 	python3 image/tests/test-sound-host.py
+	python3 image/tests/test-update-host.py

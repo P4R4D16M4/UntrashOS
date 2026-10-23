@@ -1,0 +1,11 @@
+[Unit]
+Description=UntrashOS: look for a newer release and download it (installing needs an admin in the Desk)
+ConditionKernelCommandLine=!untrash.installer=1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/untrash/untrash-update check
+Nice=10
+IOSchedulingClass=idle

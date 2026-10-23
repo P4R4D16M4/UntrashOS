@@ -62,6 +62,8 @@ out; items marked *optional* are skipped when missing.
 | `/sys/bus/platform/devices/*buzzer*/play` | untrash-sound | write `"<hz> <ms>"`, one square-wave voice; *optional* |
 | `/dev/watchdog` | untrash-init, untrash-wdt | a hardware watchdog |
 
+| `/usr/share/untrash/board.json` | untrash-update, Desk | `{"name", "title", "releases", "asset"}`: `releases` = GitHub API URL of the firmware repo's releases, `asset` = file name pattern of the update file (`untrash-*-update.utslot`); without it there are no automatic updates |
+
 Board services the OS knows by name: `untrash-power.service`,
 `untrash-power-tick.timer` (enabled by untrash-config when a power schedule
 is active).
