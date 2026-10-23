@@ -1667,15 +1667,32 @@ SOUND_EVENTS = ("boot", "shutdown", "error", "critical", "success", "connect", "
 
 
 def sound_notes(notes):
-    out = []
-    for n in (notes or [])[:400]:
+    """[[hz, ms(, tie)]] as untrash-sound plays them: rest or 100..4000 Hz
+    (the PWM5 driver), 1..5000 ms, at most 4000 notes and 60 s."""
+    notes = notes or []
+    if len(notes) > 4000:
+        raise Fail("More than 4000 tones.")
+    out, total = [], 0
+    for n in notes:
         hz, ms = int(n[0]), int(n[1])
-        if not (hz == 0 or 40 <= hz <= 10000) or not 0 < ms <= 5000:
-            raise Fail("Tone out of range (40–10000 Hz, 1–5000 ms): %s" % (n,))
-        out.append([hz, ms])
+        if not (hz == 0 or 100 <= hz <= 4000) or not 0 < ms <= 5000:
+            raise Fail("Tone out of range (100–4000 Hz, 1–5000 ms): %s" % (n,))
+        total += ms
+        out.append([hz, ms, 1] if len(n) > 2 and n[2] else [hz, ms])
     if not out:
         raise Fail("No tones.")
+    if total > 60000:
+        raise Fail("Longer than 60 s.")
     return out
+
+
+def sound_score(score):
+    """The editor's own data (patterns, blocks, tempo), kept as it is."""
+    if score is None:
+        return None
+    if not isinstance(score, dict) or len(json.dumps(score)) > 200000:
+        raise Fail("Score too large or not an object.")
+    return score
 
 
 def sound_state():
@@ -1710,6 +1727,8 @@ def sound_save(req):
         if not 0.25 <= tempo <= 4.0:
             raise Fail("Tempo 0.25 to 4.")
         d.setdefault("events", {})[ev] = {"notes": sound_notes(req.get("notes")), "tempo": tempo}
+        if req.get("score") is not None:
+            d["events"][ev]["score"] = sound_score(req.get("score"))
     sound_write(d)
     return sound_state()
 
@@ -1742,9 +1761,12 @@ def sound_import(req):
     for ev, v in evs.items():
         if ev not in SOUND_EVENTS or not isinstance(v, dict):
             continue
-        notes = [[x.get("frequency_hz", 0), x.get("duration_ms", 0)] if isinstance(x, dict) else x for x in v.get("notes", [])]
+        notes = [[x.get("frequency_hz", 0), x.get("duration_ms", 0)] + ([1] if x.get("tie") else []) if isinstance(x, dict) else x
+                 for x in v.get("notes", [])]
         d.setdefault("events", {})[ev] = {"notes": sound_notes(notes), "tempo": float(v.get("tempo", 1.0) or 1.0),
                                          "source": str(ss.get("title", "Import"))[:80]}
+        if isinstance(v.get("score"), dict):
+            d["events"][ev]["score"] = sound_score(v["score"])
         n += 1
     if not n:
         raise Fail("The sound set contains no known event.")

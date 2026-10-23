@@ -135,7 +135,7 @@ const APPS = {
   status: { name: 'Status', icon: 'status', w: 760, h: 540 },
   terminal: { name: 'Terminal', icon: 'terminal', w: 860, h: 520 },
   mesh: { name: 'UntrashMesh', icon: 'mesh', w: 560, h: 500 },
-  sound: { name: 'Sounds', icon: 'synth', w: 900, h: 580 },
+  sound: { name: 'Sounds', icon: 'synth', w: 1040, h: 700 },
   feedback: { name: 'Feedback', icon: 'feedback', w: 720, h: 600 },
   manual: { name: 'Manual', icon: 'manual', w: 940, h: 640, user: true },
   media: { name: 'Media server', icon: 'mediaserver', w: 860, h: 580 },
@@ -1270,87 +1270,253 @@ async function docViewer(name, path, size) {
   } catch (e) { bd.innerHTML = `<div class="ut-callout ut-callout--danger">${esc(e.message)}</div>`; }
 }
 
-/* sounds: the buzzer jingles, editable (notes, tempo), heard in the browser
-   (square wave like the buzzer) or on the NAS; sound sets import ---------- */
-const NOTE_N = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'H'];
-const hz2note = f => { if (!f) return 'Pause'; const n = Math.round(12 * Math.log2(f / 440)) + 57; return NOTE_N[(n % 12 + 12) % 12] + Math.floor(n / 12); };
-const note2hz = t => { const m = /^([A-Ha-h])(#|b)?(-?\d)$/.exec(t.trim()); if (!m) return null; const base = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, H: 11, B: 10 }[m[1].toUpperCase()];
-  const n = base + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0) + 12 * +m[3]; return Math.round(440 * Math.pow(2, (n - 57) / 12)); };
+/* sounds: the buzzer jingles in a timeline editor (sound-render.js): note
+   blocks and motifs dragged onto a piano roll, lengths on a grid, patterns
+   repeated like loops, modulation the buzzer can play; heard in the browser
+   (square wave, the same rendering) or on the NAS ------------------------ */
 const EV_NAMES = { boot: 'Start', shutdown: 'Shut down', error: 'Error', critical: 'Critical', success: 'Success', connect: 'Device connected', disconnect: 'Device disconnected', warning: 'Warning', standby: 'Standby' };
-const SND = { ev: 'boot', notes: [], tempo: 1, st: null, ctx: null, stop: null };
-function sndPreview(notes, tempo) {
+const MODS = [['none', 'None'], ['staccato', 'Staccato'], ['vibrato', 'Vibrato'], ['slide', 'Slide'], ['fall', 'Fall'], ['arp', 'Arpeggio']];
+const MOD_SIGN = { staccato: '·', vibrato: '∿', slide: '↗', fall: '↘', arp: '⋯' };
+const MOTIFS = [['chime', 'Chime'], ['rise', 'Rise'], ['fall', 'Fall'], ['alarm', 'Alarm'], ['trill', 'Trill'], ['beep', 'Beep']];
+const ROW_H = 16;
+const SND = { ev: 'boot', score: null, cur: 0, sel: -1, zoom: 0.24, oct: 5, loaded: null, st: null, ctx: null, stop: null, dirty: false };
+
+/* the rendered notes in the browser: one square oscillator per tied run, like the buzzer */
+function sndPreview(notes) {
   if (SND.stop) SND.stop();
   const ctx = SND.ctx = SND.ctx || new (window.AudioContext || window.webkitAudioContext)();
-  let t = ctx.currentTime + 0.05; const nodes = [];
-  notes.forEach(([hz, ms], i) => {
-    const d = ms * tempo / 1000;
+  let t = ctx.currentTime + 0.05, o = null, g = null;
+  const nodes = [];
+  notes.forEach(([hz, ms, tie], i) => {
+    const d = ms / 1000;
     if (hz) {
-      const o = ctx.createOscillator(), g = ctx.createGain(); o.type = 'square'; o.frequency.value = hz;
-      g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.08, t + 0.004); g.gain.setValueAtTime(0.08, t + d - 0.006); g.gain.linearRampToValueAtTime(0.0001, t + d);
-      o.connect(g).connect(ctx.destination); o.start(t); o.stop(t + d); nodes.push(o);
+      if (!o) {
+        o = ctx.createOscillator(); g = ctx.createGain(); o.type = 'square';
+        g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.08, t + 0.004);
+        o.connect(g).connect(ctx.destination); o.start(t); nodes.push(o);
+      }
+      o.frequency.setValueAtTime(hz, t);
+      if (!tie) { g.gain.setValueAtTime(0.08, t + d - 0.005); g.gain.linearRampToValueAtTime(0.0001, t + d); o.stop(t + d); o = null; }
     }
-    t += d + (hz && notes[i + 1] && notes[i + 1][0] ? 0.015 : 0);
+    t += d + (hz && !tie && notes[i + 1] && notes[i + 1][0] ? UTSOUND.GAP / 1000 : 0);
   });
-  SND.stop = () => { nodes.forEach(o => { try { o.stop(); } catch (e) { } }); SND.stop = null; };
+  SND.stop = () => { nodes.forEach(x => { try { x.stop(); } catch (e) { } }); SND.stop = null; };
 }
+
 VIEWS.sound = async (b, sel) => {
-  if (sel) SND.ev = sel;
-  const st = SND.st = await api('sound'), user = (st.user || {})[SND.ev];
-  if (!SND.loaded || SND.loaded !== SND.ev) {
-    SND.notes = (user ? user.notes : st.builtin[SND.ev] || []).map(n => [n[0], n[1]]); SND.tempo = user ? user.tempo || 1 : 1; SND.loaded = SND.ev;
+  if (sel && sel !== SND.ev) { SND.ev = sel; SND.loaded = null; }
+  const S = UTSOUND, st = SND.st = await api('sound'), user = (st.user || {})[SND.ev];
+  if (SND.loaded !== SND.ev) {
+    SND.score = user && user.score ? JSON.parse(JSON.stringify(user.score)) : S.fromNotes(user ? user.notes : st.builtin[SND.ev] || [], user ? user.tempo || 1 : 1);
+    SND.cur = 0; SND.sel = -1; SND.loaded = SND.ev; SND.dirty = false;
   }
+  const sc = SND.score;
   const side = sidebar('sound', [['#', 'Events']].concat(Object.keys(EV_NAMES).map(k => [k, EV_NAMES[k] + ((st.user || {})[k] ? ' ★' : '')])), SND.ev);
-  const total = SND.notes.reduce((a, n) => a + n[1], 0) * SND.tempo / 1000;
+  const selBox = (id, list, cur) => `<select class="ut-select ut-select--sm" id="${id}">${list.map(([k, n]) => `<option value="${esc(k)}"${String(k) === String(cur) ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select>`;
   b.innerHTML = side + `<div class="ut-window__main ut-snd">
-    <div class="row" style="gap:8px;flex-wrap:wrap"><h2 style="margin:0">${esc(EV_NAMES[SND.ev])}</h2><span class="ut-pill ${user ? 'ut-pill--ok' : ''}">${user ? 'own version' + (user.source ? ' · ' + esc(user.source) : '') : 'built-in'}</span>
-      <span class="ut-spacer"></span><span class="muted">${SND.notes.length} tones · ${total.toFixed(1)} s</span></div>
-    <div class="row ut-snd__tempo"><label for="stp">Tempo</label><input type="range" id="stp" min="0.25" max="4" step="0.05" value="${SND.tempo}">
-      <b id="stv">${Math.round(SND.tempo * 100)} %</b><span class="muted">Note length (above 100 % = slower, longer)</span></div>
-    <div class="ut-snd__roll">${SND.notes.map(([hz, ms], i) => `<i style="flex:${ms};--h:${hz ? Math.min(100, Math.max(6, (Math.log2(hz / 200) / Math.log2(30)) * 100)) : 0}%" title="${hz2note(hz)} ${ms} ms"></i>`).join('')}</div>
-    <div class="ut-table-wrap ut-snd__tbl"><table class="ut-table"><thead><tr><th>#</th><th>Tone</th><th class="num">Hz</th><th class="num">ms</th><th></th></tr></thead><tbody>
-      ${SND.notes.map(([hz, ms], i) => `<tr data-i="${i}"><td>${i + 1}</td><td><input class="ut-input ut-input--sm" data-f="n" value="${hz2note(hz)}" size="5"></td>
-        <td class="num"><input class="ut-input ut-input--sm" data-f="hz" value="${hz}" size="6" inputmode="numeric"></td><td class="num"><input class="ut-input ut-input--sm" data-f="ms" value="${ms}" size="6" inputmode="numeric"></td>
-        <td><button class="ut-btn ut-btn--ghost ut-btn--sm" data-up>↑</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-ins>+</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-rm>✕</button></td></tr>`).join('')}
-    </tbody></table></div>
-    <div class="row" style="gap:6px;flex-wrap:wrap"><button class="ut-btn" id="sadd">+ Tone</button><button class="ut-btn" id="spause">+ Pause</button><span class="ut-spacer"></span>
-      <button class="ut-btn" id="sweb">▶ In the browser</button><button class="ut-btn" id="snas">▶ On the NAS</button><button class="ut-btn" id="sstop">■</button>
-      <button class="ut-btn ut-btn--primary" id="ssave">Save</button></div>
-    <div class="row" style="gap:6px;flex-wrap:wrap"><button class="ut-btn ut-btn--ghost" id="sreset" ${user ? '' : 'disabled'}>Back to built-in</button>
+    <div class="row"><h2 style="margin:0">${esc(EV_NAMES[SND.ev])}</h2><span class="ut-pill ${user ? 'ut-pill--ok' : ''}">${user ? 'own version' + (user.source ? ' · ' + esc(user.source) : '') : 'built-in'}</span>
+      <span class="ut-spacer"></span><span class="muted" id="sinfo"></span></div>
+    <div class="row ut-snd__bar">
+      <button class="ut-btn ut-btn--sm" id="sweb">▶ In the browser</button><button class="ut-btn ut-btn--sm" id="snas">▶ On the NAS</button><button class="ut-btn ut-btn--sm" id="sstop" aria-label="Stop">■</button>
+      <span class="ut-snd__sep"></span>
+      <label>Tempo <input class="ut-input ut-input--sm" type="number" id="sbpm" min="40" max="300" value="${sc.bpm}" style="width:64px"> BPM</label>
+      <label>Grid ${selBox('sgrid', [[8, '1/8'], [16, '1/16'], [32, '1/32']], sc.grid)}</label>
+      <label>Key ${selBox('skey', S.KEYS.map(k => [k, k]), sc.key)} ${selBox('sscale', Object.keys(S.SCALES).map(k => [k, k]), sc.scale)}</label>
+      <label>Zoom <input type="range" id="szoom" min="0.06" max="0.8" step="0.02" value="${SND.zoom}"></label></div>
+    <div class="ut-snd__arr" id="sarr"></div>
+    <div class="ut-snd__pal" id="spal"></div>
+    <div class="ut-snd__roll" id="sroll" tabindex="0" aria-label="Timeline"></div>
+    <div class="ut-snd__insp" id="sinsp"></div>
+    <div class="row" style="gap:6px;flex-wrap:wrap"><button class="ut-btn ut-btn--primary" id="ssave">Save</button>
+      <button class="ut-btn ut-btn--ghost" id="sreset" ${user ? '' : 'disabled'}>Back to built-in</button><span class="ut-spacer"></span>
       <label class="ut-btn ut-btn--ghost">Import sound set<input type="file" id="simp" accept=".json,application/json" hidden></label>
       <button class="ut-btn ut-btn--ghost" id="sexp">Export as sound set</button></div>
-    <p class="muted">The buzzer plays one tone at a time (square wave). Enter a tone as a name (C6, A#5, Bb4) or in Hz; length in milliseconds.</p></div>`;
+    <p class="muted">Drag notes or motifs from the palette onto the timeline, or click into it. Drag a block to move it, its right edge to change its length; double-click removes it.
+      Keys: ← → move, ↑ ↓ pitch, Shift+← → length, Delete removes. The buzzer plays one tone at a time (square wave, 100–4000 Hz).</p></div>`;
   navBind(b, 'sound');
-  const rer = () => render('sound');
-  $$('tr[data-i]', b).forEach(tr => {
-    const i = +tr.dataset.i;
-    $$('input', tr).forEach(inp => inp.onchange = () => {
-      const f = inp.dataset.f;
-      if (f === 'n') { const h = /^p/i.test(inp.value) ? 0 : note2hz(inp.value); if (h === null) return toast('Unknown tone', inp.value, 'warn'); SND.notes[i][0] = h; }
-      else SND.notes[i][f === 'hz' ? 0 : 1] = Math.max(0, parseInt(inp.value, 10) || 0);
-      rer();
-    });
-    $('[data-rm]', tr).onclick = () => { SND.notes.splice(i, 1); rer(); };
-    $('[data-ins]', tr).onclick = () => { SND.notes.splice(i + 1, 0, SND.notes[i].slice()); rer(); };
-    $('[data-up]', tr).onclick = () => { if (i) { [SND.notes[i - 1], SND.notes[i]] = [SND.notes[i], SND.notes[i - 1]]; rer(); } };
-  });
-  $('#stp', b).oninput = e => { SND.tempo = +e.target.value; $('#stv', b).textContent = Math.round(SND.tempo * 100) + ' %'; };
-  $('#stp', b).onchange = rer;
-  $('#sadd', b).onclick = () => { SND.notes.push([1047, 200]); rer(); };
-  $('#spause', b).onclick = () => { SND.notes.push([0, 200]); rer(); };
-  $('#sweb', b).onclick = () => sndPreview(SND.notes, SND.tempo);
+  const pat = () => sc.patterns[SND.cur];
+  const step = () => S.stepMs(sc);
+  const snap = ms => Math.max(0, Math.round(ms / step()) * step());
+  const rows = () => S.rows(sc);
+  const rowOf = hz => { const m = S.hz2midi(hz), r = rows(); let bi = 0; r.forEach((x, i) => { if (Math.abs(x - m) < Math.abs(r[bi] - m)) bi = i; }); return bi; };
+  const free = (p, t, d, skip) => p.notes.every((n, i) => i === skip || n.t + n.d <= t + 0.5 || n.t >= t + d - 0.5);
+  const nextStart = (p, t, skip) => Math.min(Infinity, ...p.notes.filter((n, i) => i !== skip && n.t >= t + 0.5).map(n => n.t));
+  const changed = () => { SND.dirty = true; info(); };
+
+  function info() {
+    const r = S.render(sc), secs = S.total(r) / 1000, ok = S.fits(r);
+    $('#sinfo', b).innerHTML = `${esc(UTI18N.tr('%s steps').replace('%s', r.length))} · ${secs.toFixed(1)} s${ok ? '' : ' · <b class="ut-snd__over">' + esc(UTI18N.tr('too long for the buzzer (60 s, 4000 tones)')) + '</b>'}${SND.dirty ? ' · ' + esc(UTI18N.tr('not saved')) : ''}`;
+    $('#ssave', b).disabled = !ok;
+  }
+
+  function drawArr() {
+    $('#sarr', b).innerHTML = `<span class="ut-snd__lbl">Arrangement</span>` + sc.arrangement.map((c, i) => `<span class="ut-snd__clip${c.p === SND.cur ? ' is-cur' : ''}" data-ci="${i}">
+        <button class="ut-snd__clipname" data-cpick="${i}" translate="no">${esc(sc.patterns[c.p].name)}</button>
+        <button data-cdec="${i}" aria-label="One repeat less">−</button><b translate="no">×${c.n}</b><button data-cinc="${i}" aria-label="One repeat more">+</button>
+        ${i ? `<button data-cleft="${i}" aria-label="Earlier">◀</button>` : ''}${sc.arrangement.length > 1 ? `<button data-cdel="${i}" aria-label="Remove from the arrangement">✕</button>` : ''}</span>`).join('')
+      + `<button class="ut-btn ut-btn--sm" id="snewp">+ Pattern</button><button class="ut-btn ut-btn--sm ut-btn--ghost" id="sdupp">Duplicate pattern</button>`;
+    $$('[data-cpick]', b).forEach(x => x.onclick = () => { SND.cur = sc.arrangement[+x.dataset.cpick].p; SND.sel = -1; drawArr(); drawRoll(); drawInsp(); });
+    $$('[data-cinc]', b).forEach(x => x.onclick = () => { const c = sc.arrangement[+x.dataset.cinc]; c.n = Math.min(32, c.n + 1); drawArr(); changed(); });
+    $$('[data-cdec]', b).forEach(x => x.onclick = () => { const c = sc.arrangement[+x.dataset.cdec]; c.n = Math.max(1, c.n - 1); drawArr(); changed(); });
+    $$('[data-cleft]', b).forEach(x => x.onclick = () => { const i = +x.dataset.cleft; [sc.arrangement[i - 1], sc.arrangement[i]] = [sc.arrangement[i], sc.arrangement[i - 1]]; drawArr(); changed(); });
+    $$('[data-cdel]', b).forEach(x => x.onclick = () => { sc.arrangement.splice(+x.dataset.cdel, 1); drawArr(); changed(); });
+    const nextName = () => String.fromCharCode(65 + sc.patterns.length % 26) + (sc.patterns.length >= 26 ? Math.floor(sc.patterns.length / 26) : '');
+    $('#snewp', b).onclick = () => { sc.patterns.push({ name: nextName(), notes: [], len: 16 * step() }); sc.arrangement.push({ p: sc.patterns.length - 1, n: 1 }); SND.cur = sc.patterns.length - 1; SND.sel = -1; drawArr(); drawRoll(); drawInsp(); changed(); };
+    $('#sdupp', b).onclick = () => { const c = JSON.parse(JSON.stringify(pat())); c.name = nextName(); sc.patterns.push(c); sc.arrangement.push({ p: sc.patterns.length - 1, n: 1 }); SND.cur = sc.patterns.length - 1; SND.sel = -1; drawArr(); drawRoll(); drawInsp(); changed(); };
+  }
+
+  function drawPal() {
+    const r = rows().filter(m => Math.floor(m / 12) - 1 === SND.oct).reverse();
+    $('#spal', b).innerHTML = `<span class="ut-snd__lbl">Notes</span><button class="ut-btn ut-btn--sm ut-btn--ghost" id="soctd" aria-label="Octave down">‹</button><b translate="no">${SND.oct}</b><button class="ut-btn ut-btn--sm ut-btn--ghost" id="soctu" aria-label="Octave up">›</button>`
+      + r.map(m => `<span class="ut-snd__chip" draggable="true" data-drag="note:${m}" translate="no">${S.name(m)}</span>`).join('')
+      + `<span class="ut-snd__lbl">Motifs</span>` + MOTIFS.map(([k, n]) => `<span class="ut-snd__chip ut-snd__chip--motif" draggable="true" data-drag="motif:${k}">${esc(n)}</span>`).join('');
+    $('#soctd', b).onclick = () => { SND.oct = Math.max(2, SND.oct - 1); drawPal(); };
+    $('#soctu', b).onclick = () => { SND.oct = Math.min(7, SND.oct + 1); drawPal(); };
+    $$('[data-drag]', b).forEach(c => c.ondragstart = e => { e.dataTransfer.setData('text/plain', c.dataset.drag); e.dataTransfer.effectAllowed = 'copy'; });
+  }
+
+  function drawRoll() {
+    const p = pat(), r = rows(), z = SND.zoom, len = Math.max(S.patLen(p), 16 * step()) + 8 * step(), w = Math.ceil(len * z);
+    const beat = 60000 / sc.bpm, bar = beat * 4;
+    const roll = $('#sroll', b), keep = roll.scrollTop, keepX = roll.scrollLeft;
+    roll.innerHTML = `<div class="ut-snd__keys">${r.map(m => `<div class="${S.name(m).startsWith(sc.key) && S.name(m)[sc.key.length] !== '#' ? 'is-root' : ''}" translate="no">${S.name(m)}</div>`).join('')}</div>
+      <div class="ut-snd__grid" id="sgridel" style="width:${w}px;height:${r.length * ROW_H}px;--step:${step() * z}px;--beat:${beat * z}px;--bar:${bar * z}px">
+        ${p.notes.map((n, i) => `<div class="ut-snd__blk${i === SND.sel ? ' is-sel' : ''}${n.mod && n.mod.k !== 'none' ? ' has-mod' : ''}" data-i="${i}" style="left:${n.t * z}px;width:${Math.max(4, n.d * z)}px;top:${rowOf(n.hz) * ROW_H}px" title="${S.name(Math.round(S.hz2midi(n.hz)))} · ${Math.round(n.d)} ms">
+          <span translate="no">${S.name(Math.round(S.hz2midi(n.hz)))}${n.mod && MOD_SIGN[n.mod.k] ? ' ' + MOD_SIGN[n.mod.k] : ''}</span><i class="ut-snd__rz"></i></div>`).join('')}
+        <div class="ut-snd__end" id="send" style="left:${S.patLen(p) * z}px" title="${esc(UTI18N.tr('End of the pattern (drag)'))}"></div>
+      </div>`;
+    roll.scrollTop = keep || (p.notes.length ? Math.max(0, rowOf(p.notes[0].hz) * ROW_H - 100) : rows().indexOf(72) * ROW_H - 100);
+    roll.scrollLeft = keepX;
+    bindRoll();
+  }
+
+  function drawInsp() {
+    const p = pat(), n = p.notes[SND.sel];
+    if (!n) { $('#sinsp', b).innerHTML = `<span class="muted">Pattern <b translate="no">${esc(p.name)}</b> · ${esc(UTI18N.tr('length %s ms').replace('%s', Math.round(S.patLen(p))))} · ${esc(UTI18N.tr('select a block to set its modulation'))}</span>`; return; }
+    const m = n.mod || { k: 'none' }, r = rows();
+    const rng = (id, label, v, min, max, stp) => `<label>${esc(label)} <input type="range" id="${id}" min="${min}" max="${max}" step="${stp}" value="${v}"> <b id="${id}v">${v}</b></label>`;
+    $('#sinsp', b).innerHTML = `<label>Note <select class="ut-select ut-select--sm" id="inote" translate="no">${r.map(x => `<option value="${x}"${x === r[rowOf(n.hz)] ? ' selected' : ''}>${S.name(x)}</option>`).join('')}</select></label>
+      <label>Length <input class="ut-input ut-input--sm" type="number" id="ilen" min="1" max="64" value="${Math.max(1, Math.round(n.d / step()))}" style="width:56px"> × ${sc.grid === 8 ? '1/8' : sc.grid === 32 ? '1/32' : '1/16'}</label>
+      <label>Modulation ${selBox('imod', MODS, m.k)}</label>
+      ${m.k === 'staccato' ? rng('ig', UTI18N.tr('Gap %'), Math.round((m.g ?? 0.5) * 100), 10, 80, 5) : ''}
+      ${m.k === 'vibrato' ? rng('idep', UTI18N.tr('Depth (semitones)'), m.depth ?? 0.5, 0.1, 2, 0.1) + rng('irate', UTI18N.tr('Rate (Hz)'), m.rate ?? 6, 2, 14, 1) : ''}
+      ${m.k === 'slide' ? rng('ist', UTI18N.tr('To (semitones)'), m.st ?? 12, -24, 24, 1) : ''}
+      ${m.k === 'arp' ? `<label>Chord ${selBox('ichord', [['major', 'Major'], ['minor', 'Minor'], ['fifth', 'Fifth'], ['octave', 'Octave']], m.chord || 'major')}</label>` + rng('ims', UTI18N.tr('Speed (ms)'), m.ms ?? 60, 30, 150, 5) : ''}
+      <span class="ut-spacer"></span><button class="ut-btn ut-btn--sm" id="idup">Duplicate</button><button class="ut-btn ut-btn--sm ut-btn--danger" id="idel">Remove</button>`;
+    const upd = () => { drawRoll(); changed(); };
+    $('#inote', b).onchange = e => { n.hz = S.midi2hz(+e.target.value); upd(); };
+    $('#ilen', b).onchange = e => { const d = Math.max(1, +e.target.value || 1) * step(); n.d = Math.min(d, nextStart(p, n.t, SND.sel) - n.t); upd(); drawInsp(); };
+    $('#imod', b).onchange = e => { n.mod = e.target.value === 'none' ? undefined : { k: e.target.value }; upd(); drawInsp(); };
+    const bindR = (id, key, f = x => x) => { const x = $('#' + id, b); if (x) x.oninput = () => { n.mod[key] = f(+x.value); $('#' + id + 'v', b).textContent = x.value; upd(); }; };
+    bindR('ig', 'g', v => v / 100); bindR('idep', 'depth'); bindR('irate', 'rate'); bindR('ist', 'st'); bindR('ims', 'ms');
+    const ch = $('#ichord', b); if (ch) ch.onchange = () => { n.mod.chord = ch.value; upd(); };
+    $('#idel', b).onclick = () => { p.notes.splice(SND.sel, 1); SND.sel = -1; drawRoll(); drawInsp(); changed(); };
+    $('#idup', b).onclick = () => dup();
+  }
+
+  function dup() {
+    const p = pat(), n = p.notes[SND.sel];
+    if (!n) return;
+    const c = JSON.parse(JSON.stringify(n)); c.t = n.t + n.d;
+    if (!free(p, c.t, c.d, -1)) return toast('No room', 'The place after the block is taken.', 'warn');
+    p.notes.push(c); SND.sel = p.notes.length - 1; drawRoll(); drawInsp(); changed();
+  }
+
+  function bindRoll() {
+    const p = pat(), grid = $('#sgridel', b), z = SND.zoom;
+    const at = e => { const r = grid.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+    grid.onpointerdown = e => {
+      if (e.button) return;
+      const blk = e.target.closest('.ut-snd__blk'), end = e.target.closest('.ut-snd__end'), p0 = at(e);
+      if (end) {                            // pattern end marker
+        grid.setPointerCapture(e.pointerId);
+        grid.onpointermove = ev => { end.style.left = Math.max(S.patLen({ notes: p.notes }), snap(at(ev).x / z)) * z + 'px'; };
+        grid.onpointerup = ev => { grid.onpointermove = grid.onpointerup = null; p.len = Math.max(Math.max(0, ...p.notes.map(n => n.t + n.d)), snap(at(ev).x / z)); drawRoll(); drawInsp(); changed(); };
+        return;
+      }
+      if (!blk) {                           // empty grid: a new note, one beat long
+        const t = Math.floor(p0.x / z / step()) * step(), row = Math.floor(p0.y / ROW_H), m = rows()[row];
+        if (m === undefined || !free(p, t, step(), -1)) return;
+        const d = Math.min(Math.max(step(), 60000 / sc.bpm), nextStart(p, t, -1) - t);
+        p.notes.push({ t, d, hz: S.midi2hz(m) }); SND.sel = p.notes.length - 1;
+        drawRoll(); drawInsp(); changed(); sndPreview([[Math.round(S.midi2hz(m)), 150]]);
+        return;
+      }
+      const i = +blk.dataset.i, n = p.notes[i], resize = e.target.classList.contains('ut-snd__rz');
+      SND.sel = i; $$('.ut-snd__blk', grid).forEach(x => x.classList.toggle('is-sel', x === blk));
+      grid.setPointerCapture(e.pointerId);
+      let nt = n.t, nd = n.d, nrow = rowOf(n.hz);
+      grid.onpointermove = ev => {
+        const q = at(ev);
+        if (resize) { nd = Math.max(step(), snap(n.d + (q.x - p0.x) / z)); nd = Math.min(nd, nextStart(p, n.t, i) - n.t); blk.style.width = nd * z + 'px'; }
+        else { nt = snap(n.t + (q.x - p0.x) / z); nrow = Math.min(rows().length - 1, Math.max(0, rowOf(n.hz) + Math.round((q.y - p0.y) / ROW_H)));
+          blk.style.left = nt * z + 'px'; blk.style.top = nrow * ROW_H + 'px'; }
+      };
+      grid.onpointerup = () => {
+        grid.onpointermove = grid.onpointerup = null;
+        if (resize) n.d = nd;
+        else if (nt !== n.t || nrow !== rowOf(n.hz)) {
+          if (free(p, nt, n.d, i)) { const moved = nrow !== rowOf(n.hz); n.t = nt; if (moved) n.hz = S.midi2hz(rows()[nrow]); if (moved) sndPreview([[Math.round(n.hz), 150]]); }
+          else toast('No room', 'The buzzer plays one tone at a time: blocks must not overlap.', 'warn');
+        }
+        drawRoll(); drawInsp(); changed();
+      };
+    };
+    grid.ondblclick = e => { const blk = e.target.closest('.ut-snd__blk'); if (!blk) return; p.notes.splice(+blk.dataset.i, 1); SND.sel = -1; drawRoll(); drawInsp(); changed(); };
+    grid.ondragover = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
+    grid.ondrop = e => {
+      e.preventDefault();
+      const [kind, v] = (e.dataTransfer.getData('text/plain') || '').split(':'), q = at(e);
+      const t = Math.floor(q.x / z / step()) * step(), m = kind === 'note' ? +v : rows()[Math.max(0, Math.floor(q.y / ROW_H))];
+      const add = kind === 'note' ? [{ t, d: Math.max(step(), 60000 / sc.bpm), hz: S.midi2hz(m) }] : kind === 'motif' ? S.motif(v, sc, m, t) : [];
+      if (!add.length) return;
+      if (!add.every(n => free(p, n.t, n.d, -1) && add.every(o => o === n || o.t + o.d <= n.t || o.t >= n.t + n.d)))
+        return toast('No room', 'The buzzer plays one tone at a time: blocks must not overlap.', 'warn');
+      p.notes.push(...add); SND.sel = p.notes.length - 1; drawRoll(); drawInsp(); changed();
+      sndPreview(S.render({ ...sc, patterns: [{ name: 'x', notes: add.map(n => ({ ...n, t: n.t - t })) }], arrangement: [{ p: 0, n: 1 }] }));
+    };
+  }
+
+  $('#sroll', b).onkeydown = e => {
+    const p = pat(), n = p.notes[SND.sel];
+    if (!n) return;
+    const r = rows(), row = rowOf(n.hz);
+    if (e.key === 'Delete' || e.key === 'Backspace') { p.notes.splice(SND.sel, 1); SND.sel = -1; }
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { const nr = Math.min(r.length - 1, Math.max(0, row + (e.key === 'ArrowUp' ? -1 : 1))); n.hz = S.midi2hz(r[nr]); sndPreview([[Math.round(n.hz), 120]]); }
+    else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && e.shiftKey) { const d = Math.max(step(), n.d + (e.key === 'ArrowRight' ? step() : -step())); if (free(p, n.t, d, SND.sel)) n.d = d; }
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { const t = Math.max(0, n.t + (e.key === 'ArrowRight' ? step() : -step())); if (free(p, t, n.d, SND.sel)) n.t = t; }
+    else if (e.key === 'd' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); return dup(); }
+    else return;
+    e.preventDefault(); drawRoll(); drawInsp(); changed(); $('#sroll', b).focus();
+  };
+  $('#sbpm', b).onchange = e => {
+    const bpm = Math.min(300, Math.max(40, +e.target.value || 120)), f = sc.bpm / bpm;
+    sc.patterns.forEach(p => { p.notes.forEach(n => { n.t *= f; n.d *= f; }); if (p.len) p.len *= f; });   // the music keeps its shape, only faster or slower
+    sc.bpm = bpm; drawRoll(); drawInsp(); changed();
+  };
+  $('#sgrid', b).onchange = e => { sc.grid = +e.target.value; drawRoll(); drawInsp(); };
+  $('#skey', b).onchange = e => { sc.key = e.target.value; drawPal(); drawRoll(); drawInsp(); changed(); };
+  $('#sscale', b).onchange = e => { sc.scale = e.target.value; drawPal(); drawRoll(); drawInsp(); changed(); };
+  $('#szoom', b).oninput = e => { SND.zoom = +e.target.value; drawRoll(); };
+  $('#sweb', b).onclick = () => sndPreview(S.render(sc));
   $('#sstop', b).onclick = () => { if (SND.stop) SND.stop(); api('sound/play', { stop: true }).catch(() => { }); };
-  $('#snas', b).onclick = () => api('sound/play', { notes: SND.notes, tempo: SND.tempo }).catch(fail);
-  $('#ssave', b).onclick = () => save('sound/save', { event: SND.ev, notes: SND.notes, tempo: SND.tempo }, 'sound');
+  $('#snas', b).onclick = () => api('sound/play', { notes: S.render(sc), tempo: 1 }).catch(fail);
+  $('#ssave', b).onclick = async () => { await save('sound/save', { event: SND.ev, notes: S.render(sc), tempo: 1, score: sc }, 'sound'); SND.dirty = false; };
   $('#sreset', b).onclick = () => { SND.loaded = null; save('sound/save', { event: SND.ev, reset: true }, 'sound'); };
   $('#simp', b).onchange = async e => {
-    try { const j = JSON.parse(await e.target.files[0].text()); const r = await api('sound/import', { soundset: j }); SND.loaded = null; toast('Imported', r.imported + ' Events'); rer(); }
+    try { const j = JSON.parse(await e.target.files[0].text()); const r = await api('sound/import', { soundset: j }); SND.loaded = null; toast('Imported', r.imported + ' Events'); render('sound'); }
     catch (x) { fail(x); }
   };
   $('#sexp', b).onclick = () => {
-    const ev = {}; for (const k of Object.keys(EV_NAMES)) { const u = (SND.st.user || {})[k]; if (u) ev[k] = { tempo: u.tempo, notes: u.notes.map(([h, m]) => ({ frequency_hz: h, duration_ms: m })) }; }
+    const ev = {};
+    for (const k of Object.keys(EV_NAMES)) {
+      const u = (SND.st.user || {})[k];
+      if (u) ev[k] = { tempo: u.tempo, notes: u.notes.map(([h, m, t]) => Object.assign({ frequency_hz: h, duration_ms: m }, t ? { tie: true } : {})), ...(u.score ? { score: u.score } : {}) };
+    }
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify({ title: 'UntrashOS sound set', events: ev }, null, 1)], { type: 'application/json' }));
     a.download = 'untrash-soundset.json'; a.click();
   };
+  drawArr(); drawPal(); drawRoll(); drawInsp(); info();
 };
 
 

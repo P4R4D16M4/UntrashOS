@@ -142,7 +142,7 @@ def collect():
                 # markup and attribute lists, not text ("<a class=", 'type=password autocomplete=...')
                 if t.startswith("<") or '="' in t or re.search(r"(^|\s)[\w-]+=[\w\"]", t) or "translate=" in t:
                     continue
-                if re.fullmatch(r"ut-[\w-]+", t) or len(WORD.findall(t)) == 0 or CODEY.search(t) and not ENGLISH.search(t) and not capword:
+                if re.fullmatch(r"(ut|is|has)-[\w-]+", t) or len(WORD.findall(t)) == 0 or CODEY.search(t) and not ENGLISH.search(t) and not capword:
                     continue
                 if not ENGLISH.search(t) and len(t) < 4:
                     continue

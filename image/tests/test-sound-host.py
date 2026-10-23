@@ -39,6 +39,24 @@ with tempfile.TemporaryDirectory() as w:
     r = subprocess.run([TOOL, "play-json"], env=env2, input='{"notes": [[99999, 120]]}',
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     check("play-json refuses a frequency the buzzer cannot play", r.returncode == 2)
+    # editor scores: ties (no gap, no off between tied parts), driver limits, long notes split
+    open(log, "w").close()
+    r = subprocess.run([TOOL, "play-json"], env=env2, input='{"notes": [[440, 20, 1], [466, 20, 1], [494, 30], [523, 40]]}',
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    got = open(log).read().split(chr(10))[:-1]
+    check("tied notes run into each other, the untied end stops", r.returncode == 0 and
+          got == ["440 20", "466 20", "494 30", "0 0", "523 40", "0 0", "0 0"])
+    open(log, "w").close()
+    r = subprocess.run([TOOL, "play-json"], env=env2, input='{"notes": [[880, 2500]]}', stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    got = open(log).read().split(chr(10))[:-1]
+    check("a 2.5 s note becomes tied 1000 + 1000 + 500 ms writes (driver limit)", r.returncode == 0 and got[:3] == ["880 1000", "880 1000", "880 500"])
+    for bad, what in (('[[50, 100]]', "below 100 Hz"), ('[[4500, 100]]', "above 4000 Hz")):
+        r = subprocess.run([TOOL, "play-json"], env=env2, input='{"notes": %s}' % bad, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check("refused: %s (the driver cannot play it)" % what, r.returncode == 2)
+    r = subprocess.run([TOOL, "play-json"], env=env2, input=json.dumps({"notes": [[440, 20]] * 4001}), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    check("refused: more than 4000 notes", r.returncode == 2)
+    r = subprocess.run([TOOL, "play-json"], env=env2, input=json.dumps({"notes": [[440, 1000]] * 61}), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    check("refused: longer than 60 s", r.returncode == 2)
     r = subprocess.run([TOOL, "show"], env=env2, stdout=subprocess.PIPE, text=True)
     sh = json.loads(r.stdout)
     check("show: built-in and user scores", "boot" in sh["builtin"] and sh["user"]["boot"]["tempo"] == 2.0)

@@ -7,13 +7,19 @@ that accesses PWM5; this program writes each frequency and duration to its
 bounded `play' sysfs file.
 
   untrash-sound play boot|shutdown|error|critical|success|connect|disconnect|warning|standby
-  untrash-sound play-json           notes from stdin: {"notes": [[hz, ms], ...], "tempo": 1.0}
+  untrash-sound play-json           notes from stdin: {"notes": [[hz, ms(, tie)], ...], "tempo": 1.0}
   untrash-sound show                built-in and user scores as JSON (Desk synthesizer)
   untrash-sound stop
 
 User scores (Desk synthesizer, imported sound sets) live in /etc/untrash/sounds.json
-({"events": {"boot": {"notes": [[hz, ms], ...], "tempo": 1.0}}}) and replace the
-built-in score of that event; tempo stretches every note and rest (2.0 = half speed).
+({"events": {"boot": {"notes": [[hz, ms], ...], "tempo": 1.0, "score": {...}}}}) and
+replace the built-in score of that event; tempo stretches every note and rest
+(2.0 = half speed).  "score" is the Desk editor's own data, not read here.
+
+A note is [hz, ms] or [hz, ms, 1]: hz 0 = rest, else 100..4000 (what the
+driver plays); tie = 1 runs straight into the next note (no 15 ms gap, no
+off), which the editor uses for slides, vibrato and arpeggios.  The driver
+plays at most 1000 ms per write: longer notes are split into tied parts.
 
 ZT_SOUND_DEVICE overrides sysfs discovery.  ZT_SOUND_LOG makes a host test
 record requested frequencies instead of writing hardware; ZT_SOUND_NO_SLEEP=1
@@ -28,6 +34,9 @@ import sys
 import time
 
 GAP_MS = 15
+MIN_HZ, MAX_HZ = 100, 4000          # nas542 PWM5 driver (kernel patch 0013)
+MAX_WRITE_MS = 1000                 # driver limit of one write
+MAX_NOTES, MAX_TOTAL_MS = 4000, 60000
 SCORES = {
     "boot": [(1047,115),(1047,115),(1047,115),(1047,240),(831,180),(932,180),(1047,240),(932,125),(1047,500),(0,160),(784,200),(698,200),(784,200),(698,200),(932,180),(932,180),(880,180),(932,180),(880,180),(880,180),(784,210),(698,210),(659,210),(698,230),(587,440)],
     "shutdown": [(784,180),(659,180),(523,240),(392,180),(523,550)],
@@ -84,14 +93,24 @@ def user_scores():
 
 
 def clean(notes, tempo=1.0):
-    """[(hz, ms)] within what the buzzer driver accepts; tempo stretches."""
+    """[(hz, ms, tie)] within what the buzzer driver accepts; tempo stretches,
+    notes longer than one driver write become tied parts."""
     tempo = min(max(float(tempo or 1.0), 0.25), 4.0)
-    out = []
-    for n in notes[:400]:
-        hz, ms = int(n[0]), int(n[1])
-        if not (hz == 0 or 40 <= hz <= 10000) or not 0 < ms <= 5000:
+    if len(notes) > MAX_NOTES:
+        raise ValueError("more than %d notes" % MAX_NOTES)
+    out, total = [], 0
+    for n in notes:
+        hz, ms, tie = int(n[0]), int(n[1]), bool(n[2]) if len(n) > 2 else False
+        if not (hz == 0 or MIN_HZ <= hz <= MAX_HZ) or not 0 < ms <= 5000:
             raise ValueError("note %r out of range" % (n,))
-        out.append((hz, max(1, round(ms * tempo))))
+        ms = max(1, round(ms * tempo))
+        total += ms
+        while hz and ms > MAX_WRITE_MS:
+            out.append((hz, MAX_WRITE_MS, True))
+            ms -= MAX_WRITE_MS
+        out.append((hz, ms, tie))
+    if total > MAX_TOTAL_MS:
+        raise ValueError("longer than %d s" % (MAX_TOTAL_MS // 1000))
     return out
 
 
@@ -102,7 +121,7 @@ def score_for(event):
             return clean(u["notes"], u.get("tempo", 1.0))
         except (ValueError, TypeError, IndexError):
             pass                    # a broken user score falls back to the built-in one
-    return SCORES[event]
+    return [(hz, ms, False) for hz, ms in SCORES[event]]
 
 
 def main():
@@ -115,7 +134,8 @@ def main():
         return 0
     if args == ["show"]:
         print(json.dumps({"builtin": {k: [list(n) for n in v] for k, v in SCORES.items()}, "user": user_scores(),
-                          "gap_ms": GAP_MS}))
+                          "gap_ms": GAP_MS, "min_hz": MIN_HZ, "max_hz": MAX_HZ, "max_notes": MAX_NOTES,
+                          "max_total_ms": MAX_TOTAL_MS}))
         return 0
     if args == ["play-json"]:
         try:
@@ -140,13 +160,15 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX)
             old = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
             try:
-                for i, (hz, ms) in enumerate(score):
+                for i, (hz, ms, tie) in enumerate(score):
                     if hz:
                         put(path, hz, ms)
                     else:
                         # Silence has no PWM waveform; retain its score time
                         # in userspace so rests are not collapsed.
                         pause(ms)
+                    if tie and hz:
+                        continue        # straight into the next note (slide, vibrato, arpeggio)
                     put(path, 0, 0)
                     if i + 1 < len(score) and hz and score[i + 1][0]:
                         pause(GAP_MS)

@@ -708,6 +708,16 @@ def main():
             check("sound: user score saved", st == 200 and sd["user"]["boot"]["tempo"] == 1.5)
             check("sound: out-of-range note refused", a.req("/api/sound/save", {"event": "boot", "notes": [[5, 100]]})[0] == 400)
             check("sound: users may not change sounds", u.req("/api/sound/save", {"event": "boot", "notes": [[440, 100]]})[0] == 403)
+            # editor scores: tied notes and the editor's own data are kept; the driver's limits apply
+            score = {"v": 1, "bpm": 120, "grid": 16, "key": "C", "scale": "major", "patterns": [{"name": "A", "notes": [{"t": 0, "d": 250, "hz": 523.25}]}],
+                     "arrangement": [{"p": 0, "n": 2}]}
+            st, sd = a.req("/api/sound/save", {"event": "warning", "notes": [[523, 20, 1], [540, 20], [0, 100]], "tempo": 1, "score": score})
+            check("sound: tied notes and the editor score saved", st == 200 and sd["user"]["warning"]["notes"][0] == [523, 20, 1]
+                  and sd["user"]["warning"]["score"]["arrangement"] == [{"p": 0, "n": 2}])
+            check("sound: the buzzer's limits (100..4000 Hz)", a.req("/api/sound/save", {"event": "boot", "notes": [[90, 100]]})[0] == 400
+                  and a.req("/api/sound/save", {"event": "boot", "notes": [[4100, 100]]})[0] == 400)
+            check("sound: at most 60 s", a.req("/api/sound/save", {"event": "boot", "notes": [[440, 1000]] * 61})[0] == 400)
+            check("sound: score must be an object", a.req("/api/sound/save", {"event": "boot", "notes": [[440, 100]], "score": [1]})[0] == 400)
             open(r + "/tones", "w").close()
             a.req("/api/sound/play", {"notes": [[440, 100]], "tempo": 2})
             for _ in range(30):
