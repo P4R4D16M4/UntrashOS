@@ -912,7 +912,7 @@ def start(req):
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Set up UntrashOS</title>
-<link rel="icon" href="ut/assets/favicon.ico"><link rel="stylesheet" href="ut/untrash.css">
+<link rel="icon" href="ut/assets/favicon.ico"><script src="ut/theme.js"></script><link rel="stylesheet" href="ut/untrash.css">
 <script src="ut/i18n/i18n.js"></script>
 <style>
 /* fallback when the design files are missing: still dark and readable */

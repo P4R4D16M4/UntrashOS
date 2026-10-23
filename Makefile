@@ -22,6 +22,7 @@ test:
 
 test-run:
 	python3 image/tests/test_exec_bits.py
+	python3 design/tests/test_themes.py
 	python3 image/tests/test_live_host.py
 	python3 image/tests/test_bootstate.py
 	python3 image/tests/test_export_host.py

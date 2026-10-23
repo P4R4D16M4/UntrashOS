@@ -74,10 +74,10 @@ for d in usr/lib/untrash usr/sbin usr/share/untrash; do find "$W/root/$d" -name 
 DSN="$OS/design"; DD="$W/root/usr/share/untrash/design"
 [ -f "$DSN/assets/logo-mark-96.png" ] || python3 "$DSN/mk-assets.py"
 mkdir -p "$DD/assets/icons"
-cp "$DSN/untrash.css" "$DD/"
+cp "$DSN/untrash.css" "$DSN/theme.js" "$DD/"
 # UI translations (design/i18n, built by tools/i18n/build.py)
 mkdir -p "$DD/i18n" && cp "$DSN"/i18n/{i18n.js,de.json,fr.json} "$DD/i18n/"
-cp "$DSN"/assets/{favicon.ico,logo-mark-48.png,logo-mark-96.png,logo-mark-192.png,wordmark-300.png,wallpaper.jpg,wallpaper-blur.jpg} "$DD/assets/"
+cp "$DSN"/assets/{favicon.ico,logo-mark-48.png,logo-mark-96.png,logo-mark-192.png,wordmark-300.png,wallpaper.jpg,wallpaper-blur.jpg,wallpaper-light.jpg,wallpaper-light-blur.jpg} "$DD/assets/"
 cp "$DSN"/assets/icons/*-64.png "$DSN"/assets/icons/*-128.png "$DSN"/assets/icons/*.svg "$DD/assets/icons/"
 # user manual (docs/user-guide, built by tools/manual/build.py): Desk app and
 # installer serve it at /manual/

@@ -276,8 +276,47 @@ def user_delete(req):
         c.close()
     sysrun(["pdbedit", "-x", "-u", name], check=False)
     sysrun(["userdel", name], check=False)
+    try:
+        os.remove(prefs_path(name))
+    except OSError:
+        pass
     resmb()
     return {}
+
+
+# ------------------------------------------------------------ appearance per user
+
+PREFS_DIR = R + "/etc/untrash/prefs"
+PREFS = {"theme": ("dark", "auto", "light", "contrast"),
+         "cvd": ("none", "protan", "deutan", "tritan", "achroma"),
+         "motion": ("auto", "reduce")}      # first = default (design/theme.js)
+
+
+def prefs_path(user):
+    return os.path.join(PREFS_DIR, hashlib.sha256(user.encode()).hexdigest()[:32] + ".json")
+
+
+def prefs_load(user):
+    try:
+        p = json.load(open(prefs_path(user)))
+    except (OSError, ValueError):
+        p = {}
+    return {k: p.get(k) if p.get(k) in v else v[0] for k, v in PREFS.items()}
+
+
+def prefs_save(user, req):
+    """Theme, colour vision and motion of one user (every user may set their own)."""
+    p = prefs_load(user)
+    for k, v in req.items():
+        if k not in PREFS or v not in PREFS[k]:
+            raise Fail("Unknown appearance setting.")
+        p[k] = v
+    os.makedirs(PREFS_DIR, exist_ok=True)
+    tmp = prefs_path(user) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(dict(p, user=user), f)
+    os.replace(tmp, prefs_path(user))
+    return p
 
 
 def user_quota(name):
@@ -1935,7 +1974,7 @@ def link_delete(user, req):
 
 
 LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>%s</title><link rel="stylesheet" href="/ut/untrash.css"><script src="/ut/i18n/i18n.js"></script></head>
+<title>%s</title><script src="/ut/theme.js"></script><link rel="stylesheet" href="/ut/untrash.css"><script src="/ut/i18n/i18n.js"></script></head>
 <body class="ut"><main class="ut-login"><form class="ut-login__card" method="post">
 <img class="ut-login__logo" src="/ut/assets/logo-mark-192.png" alt=""><div class="ut-login__host" translate="no">%s</div>%s</form></main></body></html>"""
 
@@ -2558,7 +2597,8 @@ class Handler(BaseHTTPRequestHandler):
             # update (new slot) or a changed file must reach the browser at once
             ver = hashlib.sha1(("%s|%s" % (first("/etc/untrash-version", "?").strip(), "|".join(
                 str(int(os.path.getmtime(x))) for x in (os.path.join(STATIC, "desk.js"), os.path.join(STATIC, "desk.css"),
-                                                        os.path.join(DESIGN, "i18n", "i18n.js"), os.path.join(DESIGN, "untrash.css"))
+                                                        os.path.join(DESIGN, "i18n", "i18n.js"), os.path.join(DESIGN, "untrash.css"),
+                                                        os.path.join(DESIGN, "theme.js"))
                 if os.path.exists(x)))).encode()).hexdigest()[:10].encode()
             page = re.sub(rb'((?:src|href)="/(?:desk|ut)/[^"?]+\.(?:js|css))"', rb'\1?v=' + ver + b'"', page)
             return self.reply(200, page, f[1])
@@ -2608,7 +2648,10 @@ class Handler(BaseHTTPRequestHandler):
             SESSIONS.pop(ck.group(1) if ck else "", None)
             return self.reply(200, {}, headers=[("Set-Cookie", "utsess=; Path=/; Max-Age=0")])
         if p == "/api/me":
-            return self.reply(200, {"user": user, "admin": admin})
+            return self.reply(200, {"user": user, "admin": admin, "prefs": prefs_load(user)})
+        if p == "/api/prefs" and method == "POST":
+            with LOCK:
+                return self.reply(200, prefs_save(user, self.json_body()))
         if p == "/api/password" and method == "POST":
             with LOCK:
                 return self.reply(200, user_password(self.json_body(), user))

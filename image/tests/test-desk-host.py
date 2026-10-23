@@ -181,7 +181,8 @@ def main():
             check("admin login", a.req("/api/login", {"user": "admin", "password": PW})[0] == 200)
             check("pc-guest cannot log in", g.req("/api/login", {"user": "pc-guest", "password": PW})[0] == 401)
             check("user login (alice)", u.req("/api/login", {"user": "alice", "password": PW})[0] == 200)
-            check("me admin", a.req("/api/me")[1] == {"user": "admin", "admin": True})
+            me = a.req("/api/me")[1]
+            check("me admin", me["user"] == "admin" and me["admin"] is True)
             check("alice is no admin, overview 403", u.req("/api/overview")[0] == 403)
             st, o = a.req("/api/overview")
             check("overview: version, RAID, volumes", st == 200 and o["version"] == "test-desk-1" and
@@ -468,6 +469,14 @@ def main():
             check("copybtn run now", a.req("/api/copybtn/run", {"kind": "copy"})[0] == 200 and a.req("/api/copybtn/run", {"kind": "x"})[0] == 400)
             check("unknown timezone refused", a.req("/api/settings", {"time": {"timezone": "Mars/Base", "ntp": False, "ntp_server": "x"}})[0] == 400)
             check("time zones listed", "Europe/Berlin" in a.req("/api/timezones")[1]["zones"])
+            # appearance per user (design/theme.js): defaults, saved per user, validated
+            check("theme.js served", a.req("/ut/theme.js")[0] == 200 and b"theme.js" in a.req("/")[1])
+            check("prefs default dark/none/auto", a.req("/api/me")[1]["prefs"] == {"theme": "dark", "cvd": "none", "motion": "auto"})
+            st, pj = u.req("/api/prefs", {"theme": "light", "cvd": "deutan"})
+            check("prefs saved for alice", st == 200 and u.req("/api/me")[1]["prefs"] == {"theme": "light", "cvd": "deutan", "motion": "auto"})
+            check("prefs of admin untouched", a.req("/api/me")[1]["prefs"]["theme"] == "dark")
+            check("prefs: unknown value refused", u.req("/api/prefs", {"theme": "neon"})[0] == 400 and u.req("/api/prefs", {"font": "x"})[0] == 400)
+            check("prefs: anonymous refused", Client(port).req("/api/prefs", {"theme": "light"})[0] == 401)
             # RAID / volumes (untrash-storage test double; the real tool: test-storage-host.sh)
             check("alice: raid 403", u.req("/api/raid")[0] == 403)
             st, rj = a.req("/api/raid")

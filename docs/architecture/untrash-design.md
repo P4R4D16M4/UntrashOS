@@ -76,3 +76,25 @@ the directory the page stays usable with a small inline fallback style.
 New icons follow the SVG pattern: dark tile with `rx=48` on 256, grey body
 with the gradient `#6a737d → #3a4249`, accent in the brand gradient, soft
 drop shadow.
+
+## Themes and colour vision
+
+`design/untrash.css` defines every colour as a token; rules only use tokens
+or `color-mix()` of tokens.  `design/theme.js` (loaded in `<head>`) sets on
+`<html>`:
+
+- `data-theme`: `dark` (default, the brand), `light`, `contrast`; the user's
+  *Automatic* is resolved from `prefers-color-scheme` / `prefers-contrast`.
+- `data-cvd`: `protan`, `deutan`, `tritan`, `achroma`: state colours chosen
+  so they stay apart under that deficiency, plus a symbol on every state pill
+  (✓ ! ✕ i), stripes on warning/error bars and symbols on rings.
+- `data-motion=reduce`: no animations.
+
+The Desk stores the choice per user on the NAS (`/api/prefs`,
+`/etc/untrash/prefs/`); the browser keeps a copy for the sign-in page.
+`design/tests/test_themes.py` checks every theme × colour vision: WCAG text
+and state contrast (4.5:1, contrast theme 7:1) and the CIEDE2000 distance of
+the states, simulated per deficiency (Machado 2009).  The light wallpaper is
+derived from the dark one by `design/mk-assets.py` (lightness turned round,
+hue kept).
+

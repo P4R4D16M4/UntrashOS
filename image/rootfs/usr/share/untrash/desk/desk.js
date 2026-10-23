@@ -64,6 +64,7 @@ async function boot() {
   if (!st.initialized) return setupScreen(st);
   if (!st.user) return loginScreen(st);
   ME = await api('me');
+  if (ME.prefs && window.UTTHEME) UTTHEME.set(ME.prefs);    // the user's appearance follows them to every browser
   desk(st);
 }
 function resetScreen(st) {
@@ -162,10 +163,12 @@ function desk(st) {
   });
   $('#desk').addEventListener('dblclick', e => { const b = e.target.closest('.ut-desk-icon'); if (b) openApp(b.dataset.app); });
   $('#user-btn').onclick = () => {
-    const d = dialog({ title: 'Sign out?', body: `<p>Signed in as <b translate="no">${esc(ME.user)}</b>.</p>
-      <div class="ut-field"><label for="ulang">Language of this browser</label>${langSel('ulang', UTI18N.own, true)}</div>`, ok: 'Sign out',
+    const d = dialog({ title: 'Account', body: `<p>Signed in as <b translate="no">${esc(ME.user)}</b>.</p>
+      <div class="ut-field"><label for="ulang">Language of this browser</label>${langSel('ulang', UTI18N.own, true)}</div>
+      <div class="ut-section-title">Appearance</div>${appearanceFields()}`, ok: 'Sign out',
       onOk: async () => { await api('logout', {}); location.reload(); } });
     $('#ulang', d).onchange = e => UTI18N.set(e.target.value);
+    appearanceBind(d);
   };
   const tick = () => $('#clock') && ($('#clock').textContent = new Date().toLocaleString(UTI18N.locale, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }));
   tick(); setInterval(tick, 15000);
@@ -272,6 +275,26 @@ const langSel = (id, cur, withSystem) => `<select class="ut-select" id="${id}" t
 const sidebar = (k, items, cur) => `<aside class="ut-sidebar">${items.map(([id, label, data]) => id[0] === '#' ? `<div class="ut-sidebar__group">${esc(label)}</div>`
   : `<button class="ut-nav" data-nav="${id}"${id === cur ? ' aria-current="page"' : ''}><span${data || /^[sugx]:/.test(id) ? ' translate="no"' : ''}>${esc(label)}</span></button>`).join('')}</aside>`;
 function navBind(b, k) { $$('[data-nav]', b).forEach(n => n.onclick = () => render(k, n.dataset.nav)); }
+/* appearance per user (design/theme.js; stored on the NAS, /api/prefs) */
+const THEMES = [['auto', 'Automatic (as the system)'], ['dark', 'Dark'], ['light', 'Light'], ['contrast', 'High contrast']];
+const CVDS = [['none', 'Normal colour vision'], ['protan', 'Red-weak (protanopia)'], ['deutan', 'Green-weak (deuteranopia)'],
+  ['tritan', 'Blue-weak (tritanopia)'], ['achroma', 'No colour vision (achromatopsia)']];
+const opts = (list, cur) => list.map(([k, n]) => `<option value="${k}"${k === cur ? ' selected' : ''}>${esc(n)}</option>`).join('');
+function appearanceFields() {
+  const p = window.UTTHEME ? UTTHEME.prefs : { theme: 'dark', cvd: 'none', motion: 'auto' };
+  return `<div class="ut-field"><label for="ap-theme">Theme</label><select class="ut-select" id="ap-theme">${opts(THEMES, p.theme)}</select></div>
+    <div class="ut-field"><label for="ap-cvd">Colour vision</label><select class="ut-select" id="ap-cvd">${opts(CVDS, p.cvd)}</select>
+    <span class="ut-hint">Other colours for states, plus a symbol on each, so that no state depends on colour alone.</span></div>
+    ${sw('ap-motion', p.motion === 'reduce', 'Reduce motion')}`;
+}
+function appearanceBind(root) {
+  const go = () => {
+    const p = { theme: $('#ap-theme', root).value, cvd: $('#ap-cvd', root).value, motion: $('#ap-motion', root).checked ? 'reduce' : 'auto' };
+    UTTHEME.set(p);
+    api('prefs', p).catch(fail);
+  };
+  ['#ap-theme', '#ap-cvd', '#ap-motion'].forEach(q => { $(q, root).onchange = go; });
+}
 const sw = (id, on, label) => `<label class="ut-switch"><input type="checkbox" id="${id}"${on ? ' checked' : ''}><i></i>${esc(label)}</label>`;
 const field = (id, label, val = '', extra = '') => `<div class="ut-field"><label for="${id}">${esc(label)}</label><input class="ut-input" id="${id}" value="${esc(val)}" ${extra}></div>`;
 async function save(what, req, k, arg) {
@@ -1020,7 +1043,9 @@ VIEWS.logs = async (b, unit = '') => {
 VIEWS.account = async b => {
   b.innerHTML = `<div class="ut-window__main"><div class="form"><p>Signed in as <b>${esc(ME.user)}</b>.</p>
     ${field('op', 'Current password', '', 'type=password autocomplete=current-password')}${field('np1', 'New password', '', 'type=password autocomplete=new-password')}${field('np2', 'Repeat', '', 'type=password autocomplete=new-password')}
-    <button class="ut-btn ut-btn--primary" id="pw">Change password</button> <button class="ut-btn" id="lo">Sign out</button></div></div>`;
+    <button class="ut-btn ut-btn--primary" id="pw">Change password</button> <button class="ut-btn" id="lo">Sign out</button>
+    <div class="ut-section-title">Appearance</div>${appearanceFields()}</div></div>`;
+  appearanceBind(b);
   $('#pw', b).onclick = () => {
     if ($('#np1', b).value !== $('#np2', b).value) return fail(new Error('The passwords do not match.'));
     save('password', { old: $('#op', b).value, password: $('#np1', b).value });

@@ -8,7 +8,7 @@ graphics change; the crop boxes below are measured on the current versions.
 import os
 import sys
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import ImageOps, Image, ImageDraw, ImageFilter
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "source")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -321,6 +321,21 @@ def wallpaper():
         os.path.join(OUT, "wallpaper-blur.jpg"), quality=80, optimize=True)
 
 
+def wallpaper_light():
+    """Light-theme wallpaper: the dark one with its lightness turned round
+    (invert, then hue back by 180 degrees: circuit lines and logo keep their
+    colours, the near-black ground becomes a light grey), softened towards
+    the light page colour so windows stay the calmest thing on screen."""
+    src = Image.open(os.path.join(ROOT, "untrash-wallpaper.png")).convert("RGB")
+    h, sat, v = ImageOps.invert(src).convert("HSV").split()
+    h = h.point(lambda x: (x + 128) % 256)
+    light = Image.merge("HSV", (h, sat, v)).convert("RGB")
+    light = Image.blend(light, Image.new("RGB", light.size, (233, 238, 241)), 0.30)
+    light.save(os.path.join(OUT, "wallpaper-light.jpg"), quality=86, optimize=True, progressive=True)
+    light.resize((480, 270), Image.LANCZOS).filter(ImageFilter.GaussianBlur(10)).save(
+        os.path.join(OUT, "wallpaper-light-blur.jpg"), quality=80, optimize=True)
+
+
 if __name__ == "__main__":
     for f in ("untrash-logo.png", "untrash-icons.png", "untrash-wallpaper.png"):
         if not os.path.exists(os.path.join(ROOT, f)):
@@ -331,4 +346,5 @@ if __name__ == "__main__":
     app_icons()
     logo()
     wallpaper()
+    wallpaper_light()
     print("assets written to", OUT)
