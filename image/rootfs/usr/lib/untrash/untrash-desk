@@ -1539,15 +1539,19 @@ def update_upload(handler, length):
     with open(tmp, "rb") as f:
         f.seek(length - 8192)
         man = f.read(4096).rstrip(b"\0").decode("utf-8", "replace")
-        sig = f.read(64)
+        block = f.read(4096)    # up to 8 signatures of 64 bytes (mkslot-erofs.sh)
+    sigs = [block[i:i + 64] for i in range(0, 512, 64) if block[i:i + 64].strip(b"\0")]
     m = dict(l.split("=", 1) for l in man.splitlines() if "=" in l)
     if m.get("format") != "untrash-slot-2":
         raise Fail("Kein UntrashOS-Systemabbild (Format).")
     open(tmp + ".manifest", "w").write(man)
-    open(tmp + ".sig", "wb").write(sig)
-    ok = TEST or any(subprocess.run(["/usr/lib/untrash/zt-sig", "verify", k, tmp + ".manifest", tmp + ".sig"],
-                                    stdout=subprocess.DEVNULL).returncode == 0
-                     for k in glob.glob("/usr/lib/untrash/keys/*.pub"))
+
+    def signed(sig):
+        open(tmp + ".sig", "wb").write(sig)
+        return any(subprocess.run(["/usr/lib/untrash/zt-sig", "verify", k, tmp + ".manifest", tmp + ".sig"],
+                                  stdout=subprocess.DEVNULL).returncode == 0
+                   for k in glob.glob("/usr/lib/untrash/keys/*.pub"))
+    ok = TEST or any(signed(s) for s in sigs)
     if not ok:
         raise Fail("Signatur ungültig: Abbild nicht von UntrashOS.")
     with open(tmp, "rb") as f:

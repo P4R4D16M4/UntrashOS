@@ -7,7 +7,8 @@
 #   offset D            DTB (padded to 4 KiB)
 #   offset I            slot initrd (mk-slot-initrd.sh, padded to 4 KiB)
 #   size-8192           manifest (text, NUL padded)  ┐ trailer, read by the
-#   size-4096           Ed25519 signature (64 bytes) ┘ loader with dd
+#   size-4096           Ed25519 signatures (64 bytes ┘ loader with dd
+#                       each, up to 8, NUL padded)
 #
 # The manifest pins kernel, DTB, initrd and the verity root hash.  `cmdline`
 # (partition boot, no initrd) contains @SLOT@, which the loader replaces with
@@ -41,7 +42,14 @@ for v in BOARD_DTB BOARD_CMDLINE BOARD_MANUAL BOARD_INITRD; do [ -n "${!v}" ] ||
 for d in "$HERE/rootfs" "$BOARD/rootfs"; do
 	python3 "$HERE/tests/test_exec_bits.py" "$d" >&2 || { echo "exec bits FAILED ($d)" >&2; exit 1; }
 done
-SEC=${ZT_SLOT_KEY:-$TOP/inputs/keys/untrash-dev.sec}
+# signing keys, in order: the first signature is the one every deployed loader
+# checks (it reads only the first 64 bytes), so it must be a key those loaders
+# know; later ones are read by newer verifiers (Desk update, newer loaders)
+if [[ -n ${ZT_SLOT_KEYS:-} ]]; then read -ra SECS <<<"$ZT_SLOT_KEYS"
+else SECS=("${ZT_SLOT_KEY:-$TOP/inputs/keys/untrash-dev.sec}")
+	[[ -f $TOP/inputs/keys/untrash-release.sec ]] && SECS+=("$TOP/inputs/keys/untrash-release.sec")
+fi
+(( ${#SECS[@]} <= 8 )) || { echo "at most 8 signing keys" >&2; exit 1; }
 PROFILE=${ZT_PROFILE:-dev}; [[ $PROFILE == dev || $PROFILE == release ]] || { echo "ZT_PROFILE dev|release" >&2; exit 1; }
 MAXCPUS=; [[ ${ZT_SMP:-1} == 1 ]] || MAXCPUS=" maxcpus=1"
 # board checks of the kernel build
@@ -230,8 +238,17 @@ cmdline=$BOARD_CMDLINE$MAXCPUS loglevel=6 panic=10 printk.devkmsg=on systemd.jou
 cmdline_file=$BOARD_CMDLINE$MAXCPUS loglevel=6 panic=10 printk.devkmsg=on systemd.journald.forward_to_kmsg=1 init=/usr/lib/untrash/untrash-init untrash.verity=$N,$RH,$SALT
 M
 gcc -O2 -I"$OS/third_party/tweetnacl" -o "$W/zt-sig" "$OS/slot/zt-sig.c" "$OS/third_party/tweetnacl/tweetnacl.c"
-"$W/zt-sig" sign "$SEC" "$W/manifest" "$W/manifest.sig"
-"$W/zt-sig" verify "$OS/slot/keys/untrash-dev.pub" "$W/manifest" "$W/manifest.sig" >/dev/null
+: >"$W/manifest.sig"
+for k in "${SECS[@]}"; do
+	"$W/zt-sig" sign "$k" "$W/manifest" "$W/one.sig"
+	# every signature must verify against a public key the image ships
+	ok=; for p in "$OS"/slot/keys/*.pub; do "$W/zt-sig" verify "$p" "$W/manifest" "$W/one.sig" >/dev/null && ok=1; done
+	[[ -n $ok ]] || { echo "signature of $k matches no key in slot/keys" >&2; exit 1; }
+	cat "$W/one.sig" >>"$W/manifest.sig"
+done
+head -c 64 "$W/manifest.sig" >"$W/first.sig"
+"$W/zt-sig" verify "$OS/slot/keys/untrash-dev.pub" "$W/manifest" "$W/first.sig" >/dev/null ||
+	{ echo "first signature is not the dev key the deployed loaders know" >&2; exit 1; }
 
 # 3. assemble (sparse, full slot size)
 rm -f "$OUT"; truncate -s "$SIZE" "$OUT"
