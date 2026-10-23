@@ -1,0 +1,68 @@
+# UntrashOS UI catalog, part G: ad filter (DNS, dnsmasq).
+T = {
+    "Werbefilter": ("Ad filter", "Filtre publicitaire"),
+    "Werbefilter eingeschaltet": ("Ad filter on", "Filtre publicitaire activé"),
+    "Werbefilter ausgeschaltet": ("Ad filter off", "Filtre publicitaire désactivé"),
+    "Adresse der Liste (hosts- oder Domain-Format)": ("List address (hosts or domain format)", "Adresse de la liste (format hosts ou domaines)"),
+    "Am häufigsten angefragt": ("Most requested", "Les plus demandés"),
+    "Am häufigsten gesperrt": ("Most blocked", "Les plus bloqués"),
+    "Anfragen (24 h)": ("Queries (24 h)", "Requêtes (24 h)"),
+    "Anteil gesperrt": ("Share blocked", "Part bloquée"),
+    "Blocklisten": ("Block lists", "Listes de blocage"),
+    "Damit der Filter wirkt, müssen die Geräte die NAS als DNS-Server fragen. Am einfachsten für alle auf einmal im Router": (
+        "For the filter to work, devices must ask the NAS as their DNS server. Easiest for all at once in the router",
+        "Pour que le filtre agisse, les appareils doivent interroger le NAS comme serveur DNS. Le plus simple pour tous à la fois : dans le routeur"),
+    "Die Listen werden wöchentlich automatisch neu geladen. Mehr Listen sperren mehr, aber auch eher etwas Gewolltes; dann hilft „Erlauben“.": (
+        "The lists are reloaded automatically every week. More lists block more, but also more likely something wanted; then “Allow” helps.",
+        "Les listes sont rechargées automatiquement chaque semaine. Plus de listes bloquent davantage, mais aussi plus facilement quelque chose de voulu ; « Autoriser » aide alors."),
+    "Die NAS braucht dafür eine feste Adresse (im Router „immer die gleiche IPv4-Adresse zuweisen“ oder Netzwerk → feste IP). Ist die NAS aus, fragen die Geräte vergeblich, bis der Router auf seinen eigenen DNS zurückfällt; manche Router tun das nicht.": (
+        "The NAS needs a fixed address for this (in the router “always assign the same IPv4 address” or Network → static IP). While the NAS is off, devices ask in vain until the router falls back to its own DNS; some routers do not.",
+        "Le NAS a besoin d'une adresse fixe (dans le routeur « toujours attribuer la même adresse IPv4 » ou Réseau → IP fixe). Quand le NAS est éteint, les appareils interrogent en vain jusqu'à ce que le routeur revienne à son propre DNS ; certains routeurs ne le font pas."),
+    "Domain": ("Domain", "Domaine"),
+    "Domain oder Gerät filtern": ("Filter by domain or device", "Filtrer par domaine ou appareil"),
+    "Dort die Adresse der NAS eintragen": ("Enter the address of the NAS there", "Y saisir l'adresse du NAS"),
+    "Eigene Regeln": ("Own rules", "Règles personnelles"),
+    "Eine Domain pro Zeile. Gesperrt gilt auch für alle Subdomains; Erlaubt hat Vorrang vor den Listen.": (
+        "One domain per line. Blocked also covers all subdomains; allowed takes precedence over the lists.",
+        "Un domaine par ligne. Bloqué vaut aussi pour tous les sous-domaines ; autorisé l'emporte sur les listes."),
+    "Einrichtung": ("Setup", "Configuration"),
+    "Einzelne Geräte lassen sich auch ohne Router umstellen: in deren Netzwerkeinstellungen als DNS-Server die Adresse oben eintragen.": (
+        "Single devices can also be switched without the router: enter the address above as DNS server in their network settings.",
+        "Des appareils isolés peuvent aussi être réglés sans le routeur : saisir l'adresse ci-dessus comme serveur DNS dans leurs réglages réseau."),
+    "Erlauben": ("Allow", "Autoriser"),
+    "Erlaubt": ("Allowed", "Autorisé"),
+    "Geräte neu verbinden (WLAN aus/an); sie bekommen den neuen DNS-Server per DHCP.": (
+        "Reconnect the devices (Wi-Fi off/on); they get the new DNS server via DHCP.",
+        "Reconnecter les appareils (Wi-Fi désactivé/activé) ; ils reçoivent le nouveau serveur DNS par DHCP."),
+    "Gesperrt": ("Blocked", "Bloqué"),
+    "Im Router die DNS-Einstellungen für das Heimnetz öffnen (FRITZ!Box: Heimnetz → Netzwerk → Netzwerkeinstellungen → IPv4-Einstellungen → „Lokaler DNS-Server“).": (
+        "Open the DNS settings for the home network in the router (FRITZ!Box: Home Network → Network → Network Settings → IPv4 Settings → “Local DNS server”).",
+        "Ouvrir les réglages DNS du réseau local dans le routeur (FRITZ!Box : Réseau domestique → Réseau → Paramètres réseau → Paramètres IPv4 → « Serveur DNS local »)."),
+    "Immer erlauben": ("Always allow", "Toujours autoriser"),
+    "Immer sperren": ("Always block", "Toujours bloquer"),
+    "Jetzt aktualisieren": ("Update now", "Mettre à jour"),
+    "Keine Anfragen.": ("No queries.", "Aucune requête."),
+    "Letzte 24 Stunden": ("Last 24 hours", "Dernières 24 heures"),
+    "Liste hinzufügen": ("Add list", "Ajouter une liste"),
+    "Listen": ("Lists", "Listes"),
+    "Listen vom": ("Lists from", "Listes du"),
+    "Listen werden geladen …": ("Loading lists …", "Chargement des listes …"),
+    "Noch keine Daten.": ("No data yet.", "Pas encore de données."),
+    "Protokoll": ("Log", "Journal"),
+    "Sperren": ("Block", "Bloquer"),
+    "Sperrt Werbung und Tracker für alle Geräte im Heimnetz, die die NAS als DNS-Server nutzen (siehe Einrichtung).": (
+        "Blocks ads and trackers for all devices in the home network that use the NAS as DNS server (see Setup).",
+        "Bloque publicités et traqueurs pour tous les appareils du réseau local qui utilisent le NAS comme serveur DNS (voir Configuration)."),
+    "Ungültige Domain: %s": ("Invalid domain: %s", "Domaine invalide : %s"),
+    "Ungültige Listen-Adresse: %s": ("Invalid list address: %s", "Adresse de liste invalide : %s"),
+    "gesperrte Domains": ("blocked domains", "domaines bloqués"),
+    "nur gesperrte": ("blocked only", "bloqués seulement"),
+    "wird aktualisiert …": ("updating …", "mise à jour …"),
+    "eingeschaltet": ("on", "activé"),
+    "ausgeschaltet": ("off", "désactivé"),
+    # installer disk table (KIND), found while writing the English guide
+    "leer": ("empty", "vide"),
+    "RAID-Mitglied": ("RAID member", "Membre RAID"),
+    "unbekannt": ("unknown", "inconnu"),
+    "gesperrt": ("blocked", "bloqué"),
+}

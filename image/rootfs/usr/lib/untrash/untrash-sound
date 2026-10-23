@@ -1,0 +1,164 @@
+#!/usr/bin/python3
+"""Play NAS542 passive-buzzer system sounds through the kernel PWM5 driver.
+
+The event scores are the UntrashOS PWM5 sound set: plain note sequences
+(frequency, duration), no sampled audio.  The kernel driver is the only process
+that accesses PWM5; this program writes each frequency and duration to its
+bounded `play' sysfs file.
+
+  untrash-sound play boot|shutdown|error|critical|success|connect|disconnect|warning|standby
+  untrash-sound play-json           notes from stdin: {"notes": [[hz, ms], ...], "tempo": 1.0}
+  untrash-sound show                built-in and user scores as JSON (Desk synthesizer)
+  untrash-sound stop
+
+User scores (Desk synthesizer, imported sound sets) live in /etc/untrash/sounds.json
+({"events": {"boot": {"notes": [[hz, ms], ...], "tempo": 1.0}}}) and replace the
+built-in score of that event; tempo stretches every note and rest (2.0 = half speed).
+
+ZT_SOUND_DEVICE overrides sysfs discovery.  ZT_SOUND_LOG makes a host test
+record requested frequencies instead of writing hardware; ZT_SOUND_NO_SLEEP=1
+removes delays in that mode.
+"""
+import fcntl
+import glob
+import json
+import os
+import signal
+import sys
+import time
+
+GAP_MS = 15
+SCORES = {
+    "boot": [(1047,115),(1047,115),(1047,115),(1047,240),(831,180),(932,180),(1047,240),(932,125),(1047,500),(0,160),(784,200),(698,200),(784,200),(698,200),(932,180),(932,180),(880,180),(932,180),(880,180),(880,180),(784,210),(698,210),(659,210),(698,230),(587,440)],
+    "shutdown": [(784,180),(659,180),(523,240),(392,180),(523,550)],
+    "error": [(659,90),(523,110),(494,280)],
+    "critical": [(659,220),(622,220),(587,300),(494,350),(392,450),(330,650)],
+    "success": [(1047,115),(1047,115),(1047,115),(1047,240),(831,180),(932,180),(1047,420)],
+    "connect": [(659,75),(880,140)],
+    "disconnect": [(880,75),(659,160)],
+    "warning": [(880,120),(0,80),(880,120),(0,80),(698,220),(659,300)],
+    "standby": [(262,125),(330,125),(392,125),(523,125),(659,125),(784,125),(1047,360)],
+}
+
+
+def device():
+    p = os.environ.get("ZT_SOUND_DEVICE")
+    if p:
+        return p
+    paths = glob.glob("/sys/bus/platform/devices/*buzzer*/play")
+    return paths[0] if paths else None
+
+
+def put(path, hz, duration_ms=0):
+    log = os.environ.get("ZT_SOUND_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(("%d %d" % (hz, duration_ms) if os.environ.get("ZT_SOUND_LOG_MS") else "%d" % hz) + chr(10))
+        return
+    with open(path, "w") as f:
+        f.write("%d %d" % (hz, duration_ms) + chr(10))
+
+
+def pause(ms):
+    if not os.environ.get("ZT_SOUND_NO_SLEEP"):
+        time.sleep(ms / 1000.0)
+
+
+def stop(path):
+    if path:
+        try:
+            put(path, 0, 0)
+        except OSError:
+            pass
+
+
+USER_SCORES = os.environ.get("ZT_SOUND_USER", "/etc/untrash/sounds.json")
+
+
+def user_scores():
+    try:
+        with open(USER_SCORES) as f:
+            return json.load(f).get("events", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def clean(notes, tempo=1.0):
+    """[(hz, ms)] within what the buzzer driver accepts; tempo stretches."""
+    tempo = min(max(float(tempo or 1.0), 0.25), 4.0)
+    out = []
+    for n in notes[:400]:
+        hz, ms = int(n[0]), int(n[1])
+        if not (hz == 0 or 40 <= hz <= 10000) or not 0 < ms <= 5000:
+            raise ValueError("note %r out of range" % (n,))
+        out.append((hz, max(1, round(ms * tempo))))
+    return out
+
+
+def score_for(event):
+    u = user_scores().get(event)
+    if u and u.get("notes"):
+        try:
+            return clean(u["notes"], u.get("tempo", 1.0))
+        except (ValueError, TypeError, IndexError):
+            pass                    # a broken user score falls back to the built-in one
+    return SCORES[event]
+
+
+def main():
+    optional = False
+    args = sys.argv[1:]
+    if args and args[0] == "--optional":
+        optional, args = True, args[1:]
+    if args == ["stop"]:
+        stop(device())
+        return 0
+    if args == ["show"]:
+        print(json.dumps({"builtin": {k: [list(n) for n in v] for k, v in SCORES.items()}, "user": user_scores(),
+                          "gap_ms": GAP_MS}))
+        return 0
+    if args == ["play-json"]:
+        try:
+            req = json.load(sys.stdin)
+            score = clean(req["notes"], req.get("tempo", 1.0))
+        except (ValueError, KeyError, TypeError, IndexError) as e:
+            print("untrash-sound: bad score: %s" % e, file=sys.stderr)
+            return 2
+    elif len(args) != 2 or args[0] != "play" or args[1] not in SCORES:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    else:
+        score = score_for(args[1])
+    path = device()
+    if not path:
+        print("untrash-sound: NAS542 PWM5 driver is unavailable", file=sys.stderr)
+        return 0 if optional else 1
+    lock_path = os.environ.get("ZT_SOUND_LOCK", "/run/untrash/sound.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    try:
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            old = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+            try:
+                for i, (hz, ms) in enumerate(score):
+                    if hz:
+                        put(path, hz, ms)
+                    else:
+                        # Silence has no PWM waveform; retain its score time
+                        # in userspace so rests are not collapsed.
+                        pause(ms)
+                    put(path, 0, 0)
+                    if i + 1 < len(score) and hz and score[i + 1][0]:
+                        pause(GAP_MS)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                stop(path)
+    except (KeyboardInterrupt, OSError) as e:
+        stop(path)
+        print("untrash-sound: %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

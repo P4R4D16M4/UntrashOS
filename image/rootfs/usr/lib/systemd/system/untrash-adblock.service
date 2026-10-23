@@ -1,0 +1,17 @@
+[Unit]
+Description=UntrashOS: ad filter for the home network (DNS, dnsmasq)
+# on/off = flag file (Desk), never a daemon-reload; always wanted by multi-user
+ConditionPathExists=/var/lib/untrash/adblock/enabled
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/lib/untrash/untrash-adblock render
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/untrash/adblock/dnsmasq.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

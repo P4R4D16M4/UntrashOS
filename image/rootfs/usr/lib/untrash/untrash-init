@@ -1,0 +1,168 @@
+#!/bin/sh
+# untrash-init -- UntrashOS stage before systemd, kernel `init=`.
+#
+# The root is erofs on dm-verity (read-only).  This makes the system writable
+# before PID 1 becomes systemd, without an initramfs:
+#   1. find the GPT partition ut-state on the disk the system slot booted from
+#   2. first boot: no signature at all (wipefs -n lists nothing) -> mkfs.ext4,
+#      never over existing data
+#   3. e2fsck -p, mount at /state
+#   4. /etc and /var become overlays (lower = image, upper = /state/<dir>.upper)
+#   5. ut-swap without any signature -> mkswap (systemd activates it by GPT type)
+#   6. exec systemd
+# The loader hands over through kexec with the LS1024A watchdog armed (17 s
+# hardware maximum).  systemd only takes it over once systemd-modules-load has
+# loaded ls1024a_wdt (~5 s after exec), so slow steps here (first-boot mkfs,
+# e2fsck) would reset the NAS.  untrash-init therefore loads the
+# driver itself and pings it (open/write/close, no magic close = keeps
+# running) every 2 s until right before exec systemd.
+# Any failure in 1-4 falls back to a tmpfs under /state ("volatile"): the
+# system still boots and stays reachable, it just forgets its changes.
+# Messages go to /dev/kmsg (prefix UNTRASH-INIT:), so the blackbox sees them.
+# Slot FILE boot (os/loader/zt-slotinit.c ran first and left
+# /run/untrash/boot.env, container at /run/untrash/host): state and swap are
+# files in /.untrash/ of the container (state.img = ext4 image on a loop
+# device, swap.img = swap file); without them (installer stick) the state is
+# volatile.
+PATH=/usr/sbin:/usr/bin
+# Empty = wipefs finds no filesystem/RAID/partition-table signature.  (blkid -p
+# is no use here: on a GPT partition it reports the partition entry and rc 0.)
+empty() { o=$(wipefs -n "$1" 2>/dev/null) && [ -z "$o" ]; }
+log() { echo "UNTRASH-INIT: $*" >/dev/kmsg 2>/dev/null || echo "UNTRASH-INIT: $*"; }
+
+mountpoint -q /proc || mount -t proc proc /proc
+mountpoint -q /sys || mount -t sysfs sysfs /sys
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+
+WDT_PID=
+modprobe -q ls1024a_wdt 2>/dev/null
+if [ -c /dev/watchdog ]; then
+	( while :; do printf x >/dev/watchdog 2>/dev/null; sleep 2; done ) &
+	WDT_PID=$!
+	log "watchdog fed by untrash-init"
+else
+	log "no /dev/watchdog"
+fi
+
+# Partition by GPT name (the kernel exports PARTNAME in the uevent; no udev yet).
+part_dev() {	# $1 = name, $2 = disk (optional) -> /dev/sdXN
+	for u in /sys/class/block/*/uevent; do
+		grep -qx "PARTNAME=$1" "$u" || continue
+		d=${u%/uevent}; d=${d##*/}
+		[ -z "$2" ] || [ "$(disk_of "$d")" = "$2" ] || continue
+		echo "/dev/$d"; return 0
+	done
+	return 1
+}
+disk_of() { basename "$(dirname "$(readlink -f "/sys/class/block/$1")")"; }
+
+STATE=; SWAP=; DISK=; SWAPFILE=
+ZT_BOOT=partition
+[ -f /run/untrash/boot.env ] && . /run/untrash/boot.env
+if [ "$ZT_BOOT" = file ]; then
+	SLOT=$ZT_SLOT
+	U=$ZT_HOST/.untrash
+	if [ "$ZT_HOST_RW" = 1 ] && [ -f "$U/state.img" ]; then
+		STATE=$(losetup -f --show "$U/state.img" 2>/dev/null) || log "losetup $U/state.img failed"
+	fi
+	[ "$ZT_HOST_RW" = 1 ] && [ -f "$U/swap.img" ] && SWAPFILE=$U/swap.img
+	log "slot file $ZT_FILE on $ZT_HOST_DEV ($ZT_HOST_FS) slot=$SLOT state=${STATE:-none}"
+else
+	# The slot this kernel was started from (loader substitutes it in the cmdline).
+	SLOT=$(sed -n 's/.*dm-mod\.waitfor=PARTLABEL=\([^ ]*\).*/\1/p' /proc/cmdline)
+	i=0
+	while [ $i -lt 10 ]; do
+		if [ -n "$SLOT" ] && S=$(part_dev "$SLOT"); then
+			DISK=$(disk_of "${S#/dev/}")
+			STATE=$(part_dev ut-state "$DISK") && break
+		fi
+		sleep 1; i=$((i+1))
+	done
+	log "slot=${SLOT:-?} disk=${DISK:-?} state=${STATE:-none}"
+fi
+
+state_ok=0
+if [ -n "$STATE" ]; then
+	if empty "$STATE"; then
+		log "ut-state empty, mkfs.ext4 on $STATE"
+		mkfs.ext4 -q -L ut-state -E lazy_itable_init=1,lazy_journal_init=1 "$STATE" \
+			>/dev/null 2>&1 || log "mkfs.ext4 failed"
+	fi
+	t=$(blkid -p -o value -s TYPE "$STATE" 2>/dev/null)
+	if [ "$t" = ext4 ]; then
+		e2fsck -p "$STATE" >/dev/null 2>&1; r=$?
+		if [ $r -le 1 ]; then
+			mount -t ext4 -o rw,noatime "$STATE" /state && state_ok=1 ||
+				log "mount $STATE failed"
+		else
+			log "e2fsck $STATE rc=$r, not mounted"
+		fi
+	else
+		log "ut-state type '${t:-?}' is not ext4, left untouched"
+	fi
+fi
+[ $state_ok = 1 ] || { mount -t tmpfs -o mode=755 tmpfs /state; log "state VOLATILE (tmpfs)"; }
+
+ov_ok=1
+for d in etc var; do
+	mkdir -p "/state/$d.upper" "/state/$d.work"
+	mount -t overlay overlay -o "lowerdir=/$d,upperdir=/state/$d.upper,workdir=/state/$d.work" "/$d" ||
+		{ log "overlay /$d failed"; ov_ok=0; }
+done
+if [ $ov_ok = 0 ] && [ $state_ok = 1 ]; then
+	# overlay on the persistent state failed: retry volatile, never boot ro
+	for d in var etc; do mountpoint -q "/$d" && umount "/$d"; done
+	umount /state; mount -t tmpfs -o mode=755 tmpfs /state; state_ok=0
+	log "state VOLATILE (overlay on ut-state failed)"
+	for d in etc var; do
+		mkdir -p "/state/$d.upper" "/state/$d.work"
+		mount -t overlay overlay -o "lowerdir=/$d,upperdir=/state/$d.upper,workdir=/state/$d.work" "/$d"
+	done
+fi
+[ $state_ok = 1 ] && log "state PERSISTENT $STATE"
+
+# Stock MAC addresses (os/install/partnerkey: device.env of the install run;
+# the installer copies it to /.untrash/device.env (ways B/C) or block 1 of
+# ut-bootstate (way A); the installer stick reads it from the stick) ->
+# .link files, applied by udev when pfe registers eth0/eth1.  Without them
+# pfe uses its built-in default, the same on every NAS.
+devenv=
+if [ "$ZT_BOOT" = file ]; then
+	if [ -f "$ZT_HOST/.untrash/device.env" ]; then devenv=$(cat "$ZT_HOST/.untrash/device.env")
+	else
+		for f in "$ZT_HOST"/UNTRASH/install-*/device.env; do
+			[ -f "$f" ] && grep -q 'RESULT DONE' "${f%/device.env}/install.log" 2>/dev/null && devenv=$(cat "$f")
+		done
+	fi
+elif [ -n "$DISK" ] && BS=$(part_dev ut-bootstate "$DISK"); then
+	devenv=$(dd if="$BS" bs=4096 skip=1 count=1 2>/dev/null | tr -d '\000')
+fi
+for n in 0 1; do
+	mac=$(echo "$devenv" | sed -n "s/^ETH${n}_MAC=\([0-9A-Fa-f:]\{17\}\)\$/\1/p" | head -1)
+	[ -n "$mac" ] || continue
+	mkdir -p /etc/systemd/network
+	printf '# from the stock env (untrash-init)\n[Match]\nOriginalName=eth%s\n\n[Link]\nMACAddressPolicy=none\nMACAddress=%s\n' \
+		$n "$mac" >/etc/systemd/network/10-untrash-mac-eth$n.link
+	log "eth$n MAC from the stock env"
+done
+
+# PFE PE firmware from the NAS's own stock kernel (NAND kernel1), cached on
+# the state; must happen before udev loads pfe.ko (untrash-pfe-firmware)
+/usr/lib/untrash/untrash-pfe-firmware /state/firmware/pfe || log "no PFE firmware: no network"
+
+if [ -n "$DISK" ] && SWAP=$(part_dev ut-swap "$DISK"); then
+	if empty "$SWAP"; then
+		mkswap -L ut-swap "$SWAP" >/dev/null 2>&1 && log "mkswap $SWAP" || log "mkswap $SWAP failed"
+	fi
+fi
+# swap file (slot file boot): the installer created it with mkswap
+if [ -n "$SWAPFILE" ]; then
+	swapon "$SWAPFILE" 2>/dev/null && log "swap file $SWAPFILE" || log "swapon $SWAPFILE failed"
+fi
+
+if [ -n "$WDT_PID" ]; then
+	kill "$WDT_PID"; wait "$WDT_PID" 2>/dev/null
+	printf x >/dev/watchdog 2>/dev/null	# last ping: systemd has the full timeout
+fi
+log "exec systemd"
+exec /usr/lib/systemd/systemd "$@"

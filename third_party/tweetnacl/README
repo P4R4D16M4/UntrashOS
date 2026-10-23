@@ -1,0 +1,4 @@
+TweetNaCl, a compact implementation of the NaCl crypto library
+(https://tweetnacl.cr.yp.to/), by Daniel J. Bernstein, Bernard van Gastel,
+Wesley Janssen, Tanja Lange, Peter Schwabe and Sjaak Smetsers.
+Public domain.  Used by slot/zt-sig.c for Ed25519 signatures.

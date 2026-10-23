@@ -1,0 +1,16 @@
+[Unit]
+Description=UntrashOS: DynDNS client (inadyn; config from untrash-config)
+# native unit instead of Debian's /etc/init.d/inadyn: no sysv-generator run on
+# every daemon-reload (each reload costs seconds on this NAS)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/inadyn.conf
+
+[Service]
+ExecStart=/usr/bin/inadyn --foreground --config /etc/inadyn.conf --cache-dir=/var/cache/inadyn
+CacheDirectory=inadyn
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

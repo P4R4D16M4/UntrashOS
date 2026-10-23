@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+"""PAM helper (pam_exec.so expose_authtok): user in PAM_USER, the password on
+stdin (NUL-terminated).  Exit 0 = SMB or Unix password matches
+(pylib/untrash_auth.py)."""
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "pylib"))
+import untrash_auth  # noqa: E402
+
+pw = sys.stdin.buffer.read(4096).split(b"\0")[0].decode("utf-8", "replace")
+sys.exit(0 if untrash_auth.check(os.environ.get("PAM_USER", ""), pw) else 1)

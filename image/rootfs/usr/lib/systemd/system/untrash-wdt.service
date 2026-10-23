@@ -1,0 +1,17 @@
+[Unit]
+Description=UntrashOS: hardware watchdog keeper (real-time, independent of systemd reloads)
+Documentation=file:/usr/share/doc/untrash/untrash-wdt.c
+# early: untrash-init's last ping before "exec systemd" leaves 17 s.
+# No Conflicts=shutdown.target: it keeps feeding until the final kill of the
+# shutdown; then systemd-shutdown takes over (RebootWatchdogSec).
+DefaultDependencies=no
+Before=sysinit.target
+ConditionPathExists=/dev/watchdog
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-wdt /dev/watchdog
+Restart=always
+RestartSec=1
+# the keeper sets SCHED_FIFO itself; it needs CAP_SYS_NICE and IPC_LOCK (root)
+LimitMEMLOCK=infinity
+LimitRTPRIO=99

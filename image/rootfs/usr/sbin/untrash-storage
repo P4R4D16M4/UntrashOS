@@ -1,0 +1,1119 @@
+#!/usr/bin/python3
+"""untrash-storage - RAID and volume management in the stock Zyxel format.
+
+Every layout this tool creates is the one the stock firmware 5.21(ABAG.15)
+creates (decompiled storage_func/storage_submain, docs/architecture/
+stock-takeover.md §1), so the Zyxel firmware reads it again after way D:
+GPT p1 0%-2048MB (md0, firmware, RAID1 over 4 bays), p2 2048-4096MB (md1,
+swap), p3 4096MB-100% data array (metadata 1.2, chunk 64 KiB), ext4 with the
+stock flags, mount /i-data/<md-uuid8> or LVM vg_<uuid8>/lv_<rand8>.
+
+  status                         JSON: bays, arrays, volumes, possible actions
+  run OP JSON                    one job, log on stdout (untrash-desk runs it
+                                 in the background):
+    create        {"level", "disks":[bay], "name", "type":"md"|"lvm",
+                   "volume", "size":"max"|"<n>G"}
+    repair        {"md", "disks":[bay]}         degraded array, new disks
+    add-disks     {"md", "disks":[bay]}         grow jbod/raid1/raid5/raid6
+    change-level  {"md", "level", "disks":[bay]} basic->raid1->raid5->raid6
+    add-spare     {"md", "disks":[bay]}
+    remove-spare  {"md", "disks":[bay]}
+    expand        {"md"}                        array/fs to the disk size
+    delete        {"md"}                        whole volume / disk group
+    lv-create     {"md", "volume", "size"}
+    lv-extend     {"md", "lv", "size"}
+    lv-delete     {"md", "lv"}
+    rename        {"md", "lv"?, "name"}
+
+Never touches: USB disks, disks with UntrashOS partitions (ut-*), the array
+holding the running system (/.untrash slot file boot), anything mounted that
+is not a volume of the array being changed.  One job at a time (lock file).
+
+Test environment (os/image/tests/test-storage-host.sh): ZT_STORAGE_DISKS
+"disk1=/dev/loop5,..." fixes the bays, ZT_STORAGE_MDNAMES / _MDFW / _MDSWAP
+the md names, ZT_STORAGE_IDATA, _STATE, _DB, _MAC, _RUN, ZT_STORAGE_NOSWAPON.
+"""
+import fcntl
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid as uuidlib
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "untrash", "pylib"))
+import untrash_bays  # noqa: E402
+E = os.environ.get
+IDATA = E("ZT_STORAGE_IDATA", "/i-data")
+STATE_FILE = E("ZT_STORAGE_STATE", "/etc/untrash/zyxel/takeover.json")
+STOCK_CONFIG = os.path.dirname(STATE_FILE) + "/stock-config"
+DB = E("ZT_STORAGE_DB", STOCK_CONFIG + "/ugs_conf.db")
+RUN = E("ZT_STORAGE_RUN", "/run/untrash")
+LOCK = RUN + "/storage.lock"
+BACKUP_DIR = E("ZT_STORAGE_BACKUPDIR", "/var/lib/untrash")      # stock: /home/raid_backup
+VG_INFO_MNT = RUN + "/vg_info_area"                             # importer: same place
+IMPORT = E("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
+MD_NAMES = E("ZT_STORAGE_MDNAMES", "md2 md3 md4 md5").split()
+MDX_FW = E("ZT_STORAGE_MDFW", "md0")
+MDX_SWAP = E("ZT_STORAGE_MDSWAP", "md1")
+
+# storage_def
+BAY_NUM = 4
+LEGAL_FW_SIZ = 3997696
+LEGAL_SWAP_SIZ = 3999744
+CHUNK_SIZ = 64
+BLK_SIZ = 4096
+STRIPE_CACHE_SIZE = 2048
+VG_INFO_SIZ = "100M"
+VG_INFO_AREA = "vg_info_area"
+MAX_VOL_GB = 2 ** (32 - 30) * 4096 - 1        # GetMaxVolSizGB: 32 bit, 4 KiB pages
+MIN_DISKS = {"jbod": 2, "raid0": 2, "basic": 1, "raid1": 2, "raid5": 3, "raid6": 4, "raid10": 4}
+MD_LEVEL = {"jbod": "linear", "raid0": "raid0", "basic": "raid1", "raid1": "raid1",
+            "raid5": "raid5", "raid6": "raid6", "raid10": "raid10"}
+NEXT_LEVEL = {"basic": "raid1", "raid1": "raid5", "raid5": "raid6"}    # CheckChangeRaidLevelRule
+
+
+class Fail(Exception):
+    pass
+
+
+def load_module(path, name):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, path))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+IMP = load_module(IMPORT, "untrash_import_zyxel")
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S ") + msg, flush=True)
+
+
+def run(cmd, check=True, input=None, quiet=False):
+    if not quiet:
+        log("$ " + " ".join(cmd))
+    r = subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out = r.stdout.strip()
+    if out and not quiet:
+        for line in out.splitlines()[-12:]:
+            log("  " + line)
+    if check and r.returncode:
+        raise Fail("%s fehlgeschlagen (%d)" % (cmd[0], r.returncode))
+    return r
+
+
+def rd(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def again(cmd, tries=10):
+    """md/dm stop and umount race with udev opening new devices: retry."""
+    for i in range(tries):
+        if run(cmd, check=False, quiet=i > 0).returncode == 0:
+            return True
+        time.sleep(1)
+    raise Fail("%s fehlgeschlagen" % " ".join(cmd))
+
+
+# ------------------------------------------------------------------ bays
+
+def part(dev, n):
+    return "%s%s%d" % (dev, "p" if dev[-1].isdigit() else "", n)
+
+
+def bays():
+    """{"disk1": "/dev/sda", ...}: internal SATA disks per bay
+    (pylib/untrash_bays.py: ata2 = bay 1 on hardware, detect GPIOs)."""
+    fixed = E("ZT_STORAGE_DISKS")
+    if fixed:
+        return dict(x.split("=", 1) for x in fixed.split(",") if "=" in x)
+    return untrash_bays.bays()
+
+
+def leds():
+    """Stock bay LEDs: green = disk present, red = its data partition is
+    faulty in an array or missing from a degraded one; off = empty bay."""
+    b = bays()
+    arrays = active_arrays()
+    for i in range(1, BAY_NUM + 1):
+        bay = "disk%d" % i
+        dev = b.get(bay)
+        bad = False
+        if dev:
+            p3 = part(dev, 3)
+            bad = any("faulty" in a["members"].get(p3, "") for a in arrays.values())
+        for color, on in (("green", bool(dev) and not bad), ("red", bad)):
+            try:
+                with open("%s/hdd%d-%s/brightness" % (E("ZT_STORAGE_LEDS", "/sys/class/leds"), i, color), "w") as f:
+                    f.write("1" if on else "0")
+            except OSError:
+                pass
+
+
+def sysname(dev):
+    return os.path.basename(os.path.realpath(dev))
+
+
+def sectors(dev):
+    return int(rd("/sys/class/block/%s/size" % sysname(dev), "0") or 0)
+
+
+def partitions(dev):
+    n = sysname(dev)
+    return sorted(("/dev/" + os.path.basename(p) for p in glob.glob("/sys/block/%s/%s*" % (n, n))),
+                  key=lambda p: int(re.sub(r".*?(\d+)$", r"\1", p)))
+
+
+def parent(p):
+    """Whole disk of a partition."""
+    return "/dev/" + os.path.basename(os.path.dirname(os.path.realpath("/sys/class/block/" + sysname(p))))
+
+
+def holders(dev):
+    return [os.path.basename(h) for h in glob.glob("/sys/class/block/%s/holders/*" % sysname(dev))]
+
+
+def mounted_devs():
+    out = {}
+    for line in rd("/proc/mounts").splitlines():
+        p = line.split()
+        if len(p) > 1 and p[0].startswith("/dev/"):
+            out.setdefault(os.path.realpath(p[0]), []).append(p[1].replace("\\040", " "))
+    for line in rd("/proc/swaps").splitlines()[1:]:
+        p = line.split()
+        if p:
+            out.setdefault(os.path.realpath(p[0]), []).append("[swap]")
+    return out
+
+
+def partlabel(dev):
+    return IMP.blkid(dev).get("PART_ENTRY_NAME", "")
+
+
+# --------------------------------------------------------------- arrays
+
+def md_detail(md):
+    r = run(["mdadm", "--detail", "--export", "/dev/" + md], check=False, quiet=True)
+    return dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+
+
+def active_arrays():
+    """{md: {"uuid", "level" (stock name), "members": {partition: state}}}"""
+    out = {}
+    for sysd in sorted(glob.glob("/sys/block/md*")):
+        md = os.path.basename(sysd)
+        level = rd(sysd + "/md/level")
+        if not level:
+            continue
+        d = md_detail(md)
+        mem = {}
+        for dd in glob.glob(sysd + "/md/dev-*"):
+            mem["/dev/" + os.path.basename(dd)[4:]] = rd(dd + "/state")
+        raid_disks = int(rd(sysd + "/md/raid_disks", "0") or 0)
+        out[md] = {"md": md, "dev": "/dev/" + md, "uuid": d.get("MD_UUID", ""),
+                   "uuid8": d.get("MD_UUID", "").replace(":", "")[:8], "level": stock_level(level, raid_disks),
+                   "raid_disks": raid_disks, "members": mem, "state_raw": rd(sysd + "/md/array_state")}
+    return out
+
+
+def stock_level(level, raid_disks):
+    # GetRaidLevel
+    if level == "linear":
+        return "jbod"
+    if level == "raid1" and raid_disks <= 1:
+        return "basic"
+    return level
+
+
+def mdstat_block(md):
+    stat = rd("/proc/mdstat")
+    m = re.search(r"^%s : .*?(?=^\S|\Z)" % re.escape(md), stat, re.M | re.S)
+    return m.group(0) if m else ""
+
+
+def raid_stat(md):
+    """GetRaidStat: Crashed / Resyncing / Degraded / Normal."""
+    b = mdstat_block(md)
+    if not b or "inactive" in b:
+        return "Crashed"
+    if "%" in b or "DELAYED" in b or "resync=PENDING" in b:
+        return "Resyncing"
+    if re.search(r"\[[U_]*_[U_]*\]", b):
+        return "Degraded"
+    return "Normal"
+
+
+def sync_progress(md):
+    b = mdstat_block(md)
+    m = re.search(r"(resync|recovery|reshape|check)\s*=\s*([\d.]+%).*?finish=([\d.]+min)?", b, re.S)
+    if not m:
+        return None
+    return {"action": m.group(1), "percent": m.group(2), "finish": m.group(3) or ""}
+
+
+def wait_sync(md, what):
+    """Wait while md resyncs/reshapes (stock polls every 5 s)."""
+    time.sleep(1)
+    last = ""
+    while True:
+        act = rd("/sys/block/%s/md/sync_action" % md, "idle")
+        if act in ("idle", "frozen") and raid_stat(md) != "Resyncing":
+            break
+        p = sync_progress(md)
+        line = "%s: %s %s" % (what, act, p["percent"] if p else "")
+        if line != last:
+            log(line)
+            last = line
+        time.sleep(2 if os.environ.get("ZT_STORAGE_FAST") else 5)
+    log("%s: fertig (%s)" % (what, raid_stat(md)))
+
+
+# ---------------------------------------------------------------- volumes
+
+def volumes_of(a):
+    """[(kind, id, device, mountpoint)] of a stock data array."""
+    t = IMP.blkid(a["dev"]).get("TYPE", "")
+    if t == "ext4":
+        return [("md", "md", a["dev"], os.path.join(IDATA, a["uuid8"]))]
+    if t != "LVM2_member":
+        return []
+    out = []
+    vg = vg_of(a)
+    if not vg:
+        return out
+    r = run(["lvs", "--noheadings", "--units", "b", "--nosuffix", "-o", "lv_name,lv_size", vg], check=False, quiet=True)
+    for line in r.stdout.splitlines():
+        p = line.split()
+        if not p:
+            continue
+        lv = p[0]
+        if lv == VG_INFO_AREA:
+            out.append(("info", lv, "/dev/%s/%s" % (vg, lv), "%s/%s" % (VG_INFO_MNT, vg)))
+        elif lv.startswith("lv_"):
+            out.append(("lv", lv, "/dev/%s/%s" % (vg, lv), os.path.join(IDATA, lv[3:])))
+    return out
+
+
+def vg_of(a):
+    r = run(["pvs", "--noheadings", "-o", "vg_name", a["dev"]], check=False, quiet=True)
+    v = r.stdout.split()
+    return v[0] if v else ""
+
+
+def label_of(mnt):
+    return rd(mnt + "/.system/name_label")
+
+
+def sysvol_target():
+    p = os.path.join(IDATA, "sysvol")
+    return os.path.realpath(p) if os.path.islink(p) and os.path.exists(p) else ""
+
+
+def df(mnt):
+    try:
+        st = os.statvfs(mnt)
+        return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+    except OSError:
+        return 0, 0
+
+
+def is_mounted(mnt):
+    return any(mnt in v for v in mounted_devs().values())
+
+
+# ------------------------------------------------------------------ status
+
+def disk_role(dev, arrays, mounts):
+    """free / member / system / foreign / busy (+ detail)."""
+    parts = partitions(dev)
+    for p in parts:
+        if partlabel(p).startswith("ut-"):
+            return "system", "UntrashOS-Partitionen"
+    for p in [dev] + parts:
+        for md, a in arrays.items():
+            if p in a["members"]:
+                if md in (MDX_FW, MDX_SWAP) and p != part(dev, 3):
+                    continue
+                st = a["members"][p]
+                return "member", "%s (%s)" % (md, "Reserve" if "spare" in st else ("defekt" if "faulty" in st else "aktiv"))
+        if os.path.realpath(p) in mounts:
+            return "busy", "eingehängt: " + ", ".join(mounts[os.path.realpath(p)])
+        for h in holders(p):
+            if not (h in (MDX_FW, MDX_SWAP)):
+                return "busy", "benutzt von " + h
+    if parts:
+        p3 = part(dev, 3)
+        info = IMP.examine(p3) if os.path.exists(p3) else None
+        if info and info.get("MD_UUID"):
+            return "foreign", "Daten eines anderen Arrays (%s, %s)" % (info.get("MD_LEVEL", "?"), info.get("MD_UUID", "")[:8])
+        if any(IMP.blkid(p).get("TYPE") for p in parts):
+            return "foreign", "enthält Dateisysteme"
+    return "free", "leer" if not parts else "partitioniert, ohne Daten"
+
+
+def host_md():
+    for md, a in active_arrays().items():
+        if IMP.holds_host(a["dev"]):
+            return md
+    return None
+
+
+def status():
+    arrays = active_arrays()
+    mounts = mounted_devs()
+    b = bays()
+    part2bay = {}
+    disks = []
+    for bay, dev in b.items():
+        if not os.path.exists(dev):
+            continue
+        role, detail = disk_role(dev, arrays, mounts)
+        for p in partitions(dev):
+            part2bay[p] = bay
+        disks.append({"bay": bay, "dev": dev, "size": sectors(dev) * 512,
+                      "model": rd("/sys/block/%s/device/model" % sysname(dev)), "role": role, "detail": detail})
+    free = [d["bay"] for d in disks if d["role"] in ("free", "foreign")]
+    hmd = host_md()
+    out = []
+    for md, a in arrays.items():
+        if md in (MDX_FW, MDX_SWAP):
+            continue
+        mem = a["members"]
+        if not mem or not all(re.search(r"\d+$", p) and p.endswith("3") for p in mem):
+            continue
+        st = raid_stat(md)
+        vols, vg, vg_free, name = [], "", 0, ""
+        kind = "md"
+        for k, vid, vdev, mnt in volumes_of(a):
+            if k == "info":
+                kind, vg = "lvm", vdev.split("/")[2]
+                name = label_of(mnt)
+                continue
+            size, avail = df(mnt) if is_mounted(mnt) else (0, 0)
+            vols.append({"id": vid, "dev": vdev, "mnt": mnt, "name": label_of(mnt) or os.path.basename(mnt),
+                         "mounted": is_mounted(mnt), "size": size, "free": avail,
+                         "sysvol": sysvol_target() == os.path.realpath(mnt)})
+            if k == "lv":
+                kind, vg = "lvm", vdev.split("/")[2]
+        if kind == "md" and vols:
+            name = vols[0]["name"]
+        if vg:
+            r = run(["vgs", "--noheadings", "--units", "b", "--nosuffix", "-o", "vg_free", vg], check=False, quiet=True)
+            vg_free = int(float(r.stdout.split()[0])) if r.stdout.split() else 0
+        level = a["level"]
+        acts = []
+        if md != hmd:
+            acts.append("delete")
+        if st == "Degraded" and free and level in ("raid1", "raid5", "raid6", "raid10"):
+            acts.append("repair")
+        if st == "Normal" and free:
+            if level in ("jbod", "raid1", "raid5", "raid6") and a["raid_disks"] < BAY_NUM:
+                acts.append("add-disks")
+            if level in NEXT_LEVEL and a["raid_disks"] < BAY_NUM:
+                acts.append("change-level")
+            if level in ("raid1", "raid5", "raid6", "raid10"):
+                acts.append("add-spare")
+        if st == "Normal":
+            acts.append("expand")
+        if any("spare" in s for s in mem.values()):
+            acts.append("remove-spare")
+        if kind == "lvm":
+            acts += ["lv-create", "lv-extend", "lv-delete"]
+        out.append({"md": md, "dev": a["dev"], "uuid": a["uuid"], "uuid8": a["uuid8"], "level": level,
+                    "state": st, "progress": sync_progress(md), "raid_disks": a["raid_disks"],
+                    "size": sectors(a["dev"]) * 512, "type": kind, "vg": vg, "vg_free": vg_free, "name": name,
+                    "members": [{"bay": part2bay.get(p, sysname(p)), "part": p,
+                                 "state": "spare" if "spare" in s else ("faulty" if "faulty" in s else "active")}
+                                for p, s in sorted(mem.items())],
+                    "host": md == hmd, "volumes": vols, "actions": acts,
+                    "next_level": NEXT_LEVEL.get(level, "")})
+    return {"disks": disks, "arrays": out, "free": free, "levels": MIN_DISKS, "max_gb": MAX_VOL_GB,
+            "busy": job_running()}
+
+
+def job_running():
+    try:
+        fd = os.open(LOCK, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------ checks/helpers
+
+def need_md(req, arrays=None):
+    md = req.get("md", "")
+    arrays = arrays if arrays is not None else active_arrays()
+    if md not in arrays or md in (MDX_FW, MDX_SWAP):
+        raise Fail("Unbekanntes Daten-Array: %s" % md)
+    if IMP.holds_host(arrays[md]["dev"]) and req.get("_op") in ("delete",):
+        raise Fail("%s trägt das laufende System (/.untrash) und kann nicht gelöscht werden." % md)
+    return arrays[md]
+
+
+def need_free_disks(req):
+    b = bays()
+    names = req.get("disks") or []
+    if not names or len(set(names)) != len(names):
+        raise Fail("Platten angeben (Schächte, ohne Doppelte).")
+    arrays, mounts = active_arrays(), mounted_devs()
+    out = []
+    for n in names:
+        if n not in b or not os.path.exists(b[n]):
+            raise Fail("Kein Schacht %s." % n)
+        role, detail = disk_role(b[n], arrays, mounts)
+        if role not in ("free", "foreign"):
+            raise Fail("%s ist nicht frei: %s" % (n, detail))
+        out.append(b[n])
+    return out
+
+
+def check_vol_size(devs, level):
+    """CheckLegalVolSiz."""
+    gb = [sectors(d) / 2048.0 / 1024.0 for d in devs]
+    n = len(devs)
+    size = {"basic": min(gb), "raid1": min(gb), "raid0": sum(gb), "jbod": sum(gb), "raid5": min(gb) * (n - 1),
+            "raid6": min(gb) * (n - 2), "raid10": min(gb) * (n // 2)}[level]
+    if size > MAX_VOL_GB:
+        raise Fail("Volume wäre %d GB, mehr als %d GB (ext4-Grenze der Stock-Firmware)." % (size, MAX_VOL_GB))
+
+
+def check_count(level, n):
+    if level not in MIN_DISKS:
+        raise Fail("Unbekannter RAID-Typ %s." % level)
+    if level == "basic" and n != 1:
+        raise Fail("Basic = genau eine Platte.")
+    if n < MIN_DISKS[level]:
+        raise Fail("%s braucht mindestens %d Platten." % (level, MIN_DISKS[level]))
+    if level == "raid10" and n % 2:
+        raise Fail("RAID 10 braucht eine gerade Plattenzahl.")
+
+
+def fw_sw_member(dev):
+    """IsDevsdxUsedByFWSwap: p1 in md0 and p2 in md1, both not faulty."""
+    a = active_arrays()
+    ok = 0
+    for md, n in ((MDX_FW, 1), (MDX_SWAP, 2)):
+        st = a.get(md, {}).get("members", {}).get(part(dev, n))
+        if st is not None and "faulty" not in st:
+            ok += 1
+    return ok == 2
+
+
+def settle(dev):
+    run(["partprobe", dev], check=False, quiet=True)
+    run(["udevadm", "settle"], check=False, quiet=True)
+    time.sleep(0.5)
+
+
+def parted_disk(dev):
+    """PartedInternalDisk."""
+    if not fw_sw_member(dev):
+        for md, n in ((MDX_FW, 1), (MDX_SWAP, 2)):
+            if part(dev, n) in active_arrays().get(md, {}).get("members", {}):
+                run(["mdadm", "--manage", "/dev/" + md, "--fail", part(dev, n)], check=False)
+                run(["mdadm", "--manage", "/dev/" + md, "--remove", part(dev, n)], check=False)
+        for p in partitions(dev):
+            run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+        run(["dd", "if=/dev/zero", "of=" + dev, "count=1", "bs=2M", "conv=fsync"], quiet=True)
+        run(["parted", "-s", dev, "mklabel", "gpt"])
+        run(["parted", "-s", dev, "mkpart", "primary", "0%", "2048MB"])
+        run(["parted", "-s", dev, "toggle", "1", "raid"])
+        run(["parted", "-s", dev, "mkpart", "primary", "2048MB", "4096MB"])
+        run(["parted", "-s", dev, "toggle", "2", "raid"])
+    else:
+        settle(dev)
+        for p in partitions(dev)[2:]:
+            run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+            run(["parted", "-s", dev, "rm", re.sub(r".*?(\d+)$", r"\1", p)])
+    run(["parted", "-s", dev, "mkpart", "extended", "4096MB", "100%"])
+    run(["parted", "-s", dev, "toggle", "3", "raid"])
+    settle(dev)
+    # CheckInternalDiskFormat
+    if len(partitions(dev)) != 3 or sectors(part(dev, 1)) != LEGAL_FW_SIZ or sectors(part(dev, 2)) != LEGAL_SWAP_SIZ:
+        raise Fail("Partitionierung von %s weicht vom Stock-Format ab (p1 %d, p2 %d Sektoren)."
+                   % (dev, sectors(part(dev, 1)), sectors(part(dev, 2))))
+
+
+def find_sys_array(role):
+    """Stock md0/md1 found on the disks (assembled under UntrashOS only now)."""
+    cands = [a for a in IMP.find_arrays() if a["role"] == role]
+    if not cands:
+        return None
+    if len(cands) > 1:
+        log("WARN mehrere %s-Arrays, nehme das mit den meisten Mitgliedern" % role)
+    return max(cands, key=lambda a: len(a["members"]))
+
+
+def ensure_sys_md(md, role):
+    """True if /dev/md is running (assembled from the disks if needed)."""
+    if md in active_arrays():
+        return True
+    a = find_sys_array(role)
+    if not a:
+        return False
+    run(["mdadm", "--assemble", "--run", "/dev/" + md] + a["members"])
+    return md in active_arrays()
+
+
+def create_sys_mds(devs):
+    """CreateSwapMdx + CreateFwMdx (in that order, like stock)."""
+    for md, n, role in ((MDX_SWAP, 2, "stock-swap"), (MDX_FW, 1, "stock-firmware")):
+        ps = [part(d, n) for d in devs]
+        a = active_arrays().get(md)
+        if a and all(p in a["members"] for p in ps):
+            continue
+        ps = [p for p in ps if not a or p not in a["members"]]
+        for p in ps:
+            run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+        if ensure_sys_md(md, role):
+            for p in ps:
+                run(["mdadm", "--manage", "/dev/" + md, "--add", p], check=False)
+            run(["mdadm", "--grow", "/dev/" + md, "--force", "--raid-devices=%d" % BAY_NUM], check=False)
+        else:
+            missing = ["missing"] * (BAY_NUM - len(ps))
+            run(["mdadm", "--create", "/dev/" + md, "--run", "--metadata=1.2", "--level=raid1", "--assume-clean",
+                 "--force", "--raid-devices=%d" % BAY_NUM] + ps + missing, input="y\n")
+            if n == 1:
+                run(["mkfs.ext4", "-q", "-O", "uninit_bg", "/dev/" + md])
+            else:
+                run(["mkswap", "/dev/" + md])
+        if n == 2 and not E("ZT_STORAGE_NOSWAPON"):
+            run(["swapon", "/dev/" + md], check=False)
+
+
+def free_md():
+    act = active_arrays()
+    for n in MD_NAMES:
+        if n not in act and not os.path.exists("/sys/block/%s/md/level" % n):
+            return n
+    raise Fail("Keine freie md-Nummer (höchstens %d Daten-Arrays)." % len(MD_NAMES))
+
+
+def stride(md):
+    """GetStride_StripeWidth."""
+    n = int(rd("/sys/block/%s/md/raid_disks" % md, "1"))
+    level = stock_level(rd("/sys/block/%s/md/level" % md), n)
+    data = {"raid5": n - 1, "raid6": n - 2, "raid10": n // 2, "raid0": n}.get(level, 1)
+    s = CHUNK_SIZ * 1024 // BLK_SIZ
+    return s, s * data
+
+
+def mkfs(dev, md):
+    s, w = stride(md)
+    run(["mkfs.ext4", "-E", "discard,stride=%d,stripe-width=%d" % (s, w), "-b", str(BLK_SIZ), "-q", "-j", "-m", "0",
+         "-O", "large_file,extents,uninit_bg", dev])
+
+
+def mkdir777(p):
+    if not os.path.isdir(p):
+        os.makedirs(p, exist_ok=True)
+        os.chmod(p, 0o777)
+
+
+def mount_vol(dev, mnt):
+    """MntInternalVol + QuotaCheckOn."""
+    mkdir777(mnt)
+    run(["mount", "-t", "ext4", "-o", "rw,usrquota,noatime,data=ordered,barrier=1", dev, mnt])
+    os.chmod(mnt, 0o777)
+    if not os.path.exists(mnt + "/aquota.user"):
+        run(["quotacheck", "-u", mnt], check=False)
+    run(["quotaon", "-uv", mnt], check=False)
+
+
+def write_label(mnt, name):
+    mkdir777(mnt + "/.system")
+    with open(mnt + "/.system/name_label", "w") as f:
+        f.write(name)
+
+
+def mac():
+    m = E("ZT_STORAGE_MAC") or rd("/sys/class/net/eth0/address")
+    return m.replace(":", "").lower()
+
+
+def link_sysvol(target=None):
+    """LinkSysVol: the system volume carries .system/sysvol_<MAC>; /i-data/
+    sysvol, .system, .media point to it; default folders on it."""
+    cur = sysvol_target()
+    if cur and os.path.isdir(cur):
+        return
+    for n in ("sysvol", ".system", ".media"):
+        p = os.path.join(IDATA, n)
+        if os.path.islink(p):
+            os.unlink(p)
+    if not target:
+        vols = sorted((label_of(m) or os.path.basename(m), m) for m in glob.glob(IDATA + "/*")
+                      if re.fullmatch(r"[0-9a-f]{8}", os.path.basename(m)) and is_mounted(m))
+        marked = [m for _n, m in vols if glob.glob(m + "/.system/sysvol_*")]
+        target = marked[0] if marked else (vols[0][1] if vols else None)
+    if not target:
+        log("kein internes Volume mehr: kein Systemvolume")
+        return
+    for n, sub in (("sysvol", ""), (".system", "/.system"), (".media", "/.media")):
+        os.symlink(target + sub, os.path.join(IDATA, n))
+    mkdir777(target + "/.media/playlist")
+    mkdir777(target + "/.system")
+    if not glob.glob(target + "/.system/sysvol_*") and mac():
+        p = target + "/.system/sysvol_" + mac()
+        open(p, "w").close()
+        os.chmod(p, 0o666)
+    for d in ("admin", "admin/download", "admin/download/torrent", "music", "photo", "video"):
+        mkdir777(os.path.join(target, d))
+    log("Systemvolume: " + target)
+
+
+def new_volume(dev, md, mnt, name):
+    mkfs(dev, md)
+    mount_vol(dev, mnt)
+    write_label(mnt, name)
+    mkdir777(mnt + "/.system")
+    mkdir777(mnt + "/.media")
+    link_sysvol(mnt if not sysvol_target() else None)
+
+
+def umount_vol(mnt):
+    """UnmountVol(force): processes holding the volume are killed."""
+    if not is_mounted(mnt):
+        return
+    if run(["umount", mnt], check=False).returncode:
+        run(["fuser", "-km", mnt], check=False)
+        time.sleep(2)
+        again(["umount", mnt])
+    try:
+        os.rmdir(mnt)
+    except OSError:
+        pass
+
+
+def drop_shares(mnt):
+    """DeleteShareOnVol: shares below the volume leave the stock database."""
+    if not os.path.isfile(DB):
+        return
+    c = sqlite3.connect(DB)
+    try:
+        names = [r[0] for r in c.execute("SELECT s_name FROM smb_share WHERE s_path=? OR s_path LIKE ?",
+                                         (mnt, mnt + "/%"))]
+        for n in names:
+            for t in ("smb_share", "share_user_privilege", "share_group_privilege"):
+                c.execute("DELETE FROM %s WHERE s_name=?" % t, (n,))
+            log("Freigabe %s entfernt (lag auf dem Volume)" % n)
+        c.commit()
+    finally:
+        c.close()
+
+
+def mark_takeover():
+    """Volumes created here are mounted rw at boot by untrash-zyxel.service."""
+    try:
+        st = json.load(open(STATE_FILE))
+    except (OSError, ValueError):
+        st = {}
+    if not st.get("rw"):
+        st.setdefault("config", STOCK_CONFIG)
+        st["rw"] = True
+        st.setdefault("source", "untrash-storage")
+        os.makedirs(os.path.dirname(STATE_FILE), mode=0o700, exist_ok=True)
+        with open(STATE_FILE + ".tmp", "w") as f:
+            json.dump(st, f)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+        if not E("ZT_STORAGE_DISKS"):
+            run(["systemctl", "enable", "untrash-zyxel.service"], check=False)
+
+
+def grow_fs(a):
+    """ExpandMdByFreeSpace."""
+    run(["mdadm", "--grow", a["dev"], "--size=max"], check=False)
+    wait_sync(a["md"], a["md"])
+    if IMP.blkid(a["dev"]).get("TYPE") == "LVM2_member":
+        run(["pvresize", a["dev"]])
+    else:
+        r = run(["resize2fs", "-fF", a["dev"]], check=False)
+        if r.returncode and "already" not in r.stdout:
+            raise Fail("resize2fs fehlgeschlagen")
+
+
+def tune_stride(a):
+    """AlignmentInternVolFs."""
+    s, w = stride(a["md"])
+    for k, _vid, vdev, _m in volumes_of(a):
+        if k != "info":
+            run(["tune2fs", "-E", "stride=%d,stripe-width=%d" % (s, w), vdev], check=False)
+
+
+def stripe_cache(md):
+    try:
+        with open("/sys/block/%s/md/stripe_cache_size" % md, "w") as f:
+            f.write(str(STRIPE_CACHE_SIZE))
+    except OSError:
+        pass
+
+
+def lv_size_arg(size):
+    size = (size or "max").strip()
+    if size.lower() == "max":
+        return None
+    m = re.fullmatch(r"(\d+)G", size)
+    if not m or not 0 < int(m.group(1)) <= MAX_VOL_GB:
+        raise Fail("Größe: max oder <n>G (bis %dG)." % MAX_VOL_GB)
+    return size
+
+
+def name_ok(name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,31}", name or ""):
+        raise Fail("Name: Buchstaben, Ziffern, Leerzeichen . _ - (bis 32 Zeichen).")
+    return name
+
+
+def wait_ok(md):
+    for _ in range(20):
+        if md in active_arrays():
+            return
+        time.sleep(0.5)
+    raise Fail("%s ist nicht aktiv geworden." % md)
+
+
+# -------------------------------------------------------------------- jobs
+
+def op_create(req):
+    level, vtype = req.get("level", ""), req.get("type", "md")
+    name = name_ok(req.get("name", ""))
+    if vtype not in ("md", "lvm"):
+        raise Fail("Typ md oder lvm.")
+    devs = need_free_disks(req)
+    check_count(level, len(devs))
+    if vtype == "md":
+        check_vol_size(devs, level)
+    vname = name_ok(req.get("volume") or name) if vtype == "lvm" else name
+    size = lv_size_arg(req.get("size")) if vtype == "lvm" else None
+    md = free_md()
+    log("Neues %s-Array %s aus %s (%s)" % (level, md, ", ".join(devs), "Volume" if vtype == "md" else "Disk Group"))
+    for d in devs:
+        parted_disk(d)
+    create_sys_mds(devs)
+    ps = [part(d, 3) for d in devs]
+    for p in ps:
+        run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+    # stock passes --chunk=64 always; newer mdadm refuses it for raid1
+    chunk = ["--chunk=%d" % CHUNK_SIZ] if MD_LEVEL[level] in ("raid0", "raid5", "raid6", "raid10", "linear") else []
+    run(["mdadm", "--create", "/dev/" + md, "--run", "--metadata=1.2", "--level=" + MD_LEVEL[level]] + chunk
+        + ["--assume-clean", "--force", "--raid-devices=%d" % len(ps)] + ps, input="y\n")
+    wait_ok(md)
+    if level in ("raid5", "raid6"):
+        stripe_cache(md)
+    a = active_arrays()[md]
+    mark_takeover()
+    if vtype == "md":
+        new_volume(a["dev"], md, os.path.join(IDATA, a["uuid8"]), name)
+    else:
+        vg = "vg_" + a["uuid8"]
+        run(["pvcreate", "-y", "-ff", a["dev"]])
+        run(["vgcreate", vg, a["dev"]])
+        run(["lvcreate", "-y", "--addtag", "ext4", "-L" + VG_INFO_SIZ, "-n", VG_INFO_AREA, vg])
+        info = "/dev/%s/%s" % (vg, VG_INFO_AREA)
+        mkfs(info, md)
+        mnt = "%s/%s" % (VG_INFO_MNT, vg)
+        mkdir777(mnt)
+        run(["mount", "-o", "rw", info, mnt])
+        write_label(mnt, name)
+        lv_new(a, vg, vname, size)
+    log("RESULT OK %s" % md)
+
+
+def lv_new(a, vg, name, size):
+    """CreateLVOnVG."""
+    lv = "lv_" + uuidlib.uuid4().hex[:8]
+    if size:
+        r = run(["lvcreate", "-y", "--addtag", "ext4", "-L" + size, "-n", lv, vg], check=False)
+        if r.returncode and "insufficient free space" in r.stdout.lower():
+            size = None
+        elif r.returncode:
+            raise Fail("lvcreate fehlgeschlagen")
+    if not size:
+        r = run(["lvcreate", "-y", "--addtag", "ext4", "-L%dG" % MAX_VOL_GB, "-n", lv, vg], check=False)
+        if r.returncode:
+            run(["lvcreate", "-y", "--addtag", "ext4", "--extents", "100%FREE", "-n", lv, vg])
+    new_volume("/dev/%s/%s" % (vg, lv), a["md"], os.path.join(IDATA, lv[3:]), name)
+
+
+def op_repair(req):
+    a = need_md(req)
+    md = a["md"]
+    if a["level"] in ("jbod", "basic", "raid0"):
+        raise Fail("%s (%s) lässt sich nicht reparieren." % (md, a["level"]))
+    if raid_stat(md) != "Degraded":
+        raise Fail("%s ist nicht beeinträchtigt (%s)." % (md, raid_stat(md)))
+    devs = need_free_disks(req)
+    active = sum(1 for s in a["members"].values() if "in_sync" in s)
+    new_n = active + len(devs)
+    if new_n > BAY_NUM:
+        raise Fail("Zu viele Platten.")
+    base = sectors(a["dev"]) // max(1, {"raid5": active, "raid6": active, "raid1": 1}.get(a["level"], 1)) \
+        if a["level"] in ("raid1", "raid5", "raid6") else 0
+    for d in devs:
+        if a["level"] != "raid10" and sectors(d) - 8388608 < base:
+            raise Fail("%s ist zu klein für %s." % (d, md))
+    run(["mdadm", "--manage", a["dev"], "--remove", "failed"], check=False)
+    run(["mdadm", "--manage", a["dev"], "--remove", "detached"], check=False)
+    for d in devs:
+        parted_disk(d)
+    create_sys_mds(devs)
+    for d in devs:
+        run(["mdadm", "--zero-superblock", part(d, 3)], check=False, quiet=True)
+    run(["mdadm", "--manage", a["dev"], "--add"] + [part(d, 3) for d in devs])
+    wait_sync(md, "Wiederherstellung " + md)
+    if a["raid_disks"] < new_n:
+        run(["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n], check=False)
+        wait_sync(md, md)
+    grow_fs(active_arrays()[md])
+    log("RESULT OK %s %s" % (md, raid_stat(md)))
+
+
+def op_add_disks(req):
+    a = need_md(req)
+    md, level = a["md"], a["level"]
+    if raid_stat(md) != "Normal":
+        raise Fail("%s ist nicht im Normalzustand." % md)
+    if level not in ("jbod", "raid1", "raid5", "raid6"):
+        raise Fail("%s (%s) lässt sich nicht um Platten erweitern." % (md, level))
+    devs = need_free_disks(req)
+    new_n = a["raid_disks"] + len(devs)
+    if new_n > BAY_NUM:
+        raise Fail("Höchstens %d Platten." % BAY_NUM)
+    if a["level"] != "raid1":
+        check_vol_size(devs + [parent(p) for p in a["members"]], level)
+    for d in devs:
+        parted_disk(d)
+    create_sys_mds(devs)
+    ps = [part(d, 3) for d in devs]
+    for p in ps:
+        run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+    if level == "jbod":
+        for p in ps:
+            run(["mdadm", "--grow", a["dev"], "--add", p])
+    else:
+        run(["mdadm", "--manage", a["dev"], "--add"] + ps)
+        cmd = ["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n]
+        if level in ("raid5", "raid6"):
+            cmd.append("--backup-file=%s/raid_backup-%s" % (BACKUP_DIR, md))
+        run(cmd)
+    wait_sync(md, "Umbau " + md)
+    tune_stride(active_arrays()[md])
+    grow_fs(active_arrays()[md])
+    log("RESULT OK %s" % md)
+
+
+def op_change_level(req):
+    a = need_md(req)
+    md, old, new = a["md"], a["level"], req.get("level", "")
+    if NEXT_LEVEL.get(old) != new:
+        raise Fail("Wechsel %s -> %s gibt es nicht (nur basic->raid1->raid5->raid6)." % (old, new))
+    if raid_stat(md) != "Normal":
+        raise Fail("%s ist nicht im Normalzustand." % md)
+    devs = need_free_disks(req)
+    new_n = a["raid_disks"] + len(devs)
+    if new_n > BAY_NUM or new_n < MIN_DISKS[new]:
+        raise Fail("%s braucht %d bis %d Platten." % (new, MIN_DISKS[new], BAY_NUM))
+    for d in devs:
+        parted_disk(d)
+    create_sys_mds(devs)
+    ps = [part(d, 3) for d in devs]
+    for p in ps:
+        run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+    run(["mdadm", "--manage", a["dev"], "--add"] + ps)
+    if new == "raid1":
+        run(["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n])
+    else:
+        bk = "--backup-file=%s/raid_backup-%s" % (BACKUP_DIR, md)
+        r = run(["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n, "--level=" + new]
+                + ([bk] if new == "raid6" else []), check=False)
+        if r.returncode:
+            # newer mdadm: level first (same disk count), then the disk count
+            log("Level und Plattenzahl getrennt ändern")
+            wait_sync(md, md)
+            run(["mdadm", "--grow", a["dev"], "--level=" + new] + ([bk] if new == "raid6" else []))
+            wait_sync(md, "Levelwechsel " + md)
+            if int(rd("/sys/block/%s/md/raid_disks" % md, "0")) < new_n:
+                run(["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n] + [bk])
+    wait_sync(md, "Umbau %s -> %s" % (md, new))
+    if new in ("raid5", "raid6"):
+        stripe_cache(md)
+    tune_stride(active_arrays()[md])
+    grow_fs(active_arrays()[md])
+    log("RESULT OK %s %s" % (md, active_arrays()[md]["level"]))
+
+
+def op_add_spare(req):
+    a = need_md(req)
+    if raid_stat(a["md"]) != "Normal" or a["level"] not in ("raid1", "raid5", "raid6", "raid10"):
+        raise Fail("Reserveplatten nur für ein intaktes RAID 1/5/6/10.")
+    devs = need_free_disks(req)
+    for d in devs:
+        parted_disk(d)
+    create_sys_mds(devs)
+    ps = [part(d, 3) for d in devs]
+    for p in ps:
+        run(["mdadm", "--zero-superblock", p], check=False, quiet=True)
+    run(["mdadm", "--manage", a["dev"], "--add"] + ps)
+    log("RESULT OK %s" % a["md"])
+
+
+def op_remove_spare(req):
+    a = need_md(req)
+    b = bays()
+    ps = []
+    for n in req.get("disks") or []:
+        p = part(b.get(n, "/nonexistent"), 3)
+        if "spare" not in a["members"].get(p, ""):
+            raise Fail("%s ist keine Reserveplatte von %s." % (n, a["md"]))
+        ps.append(p)
+    if not ps:
+        raise Fail("Platten angeben.")
+    run(["mdadm", "--manage", a["dev"], "--fail"] + ps)
+    run(["mdadm", "--manage", a["dev"], "--remove"] + ps)
+    run(["mdadm", "--zero-superblock"] + ps)
+    log("RESULT OK %s" % a["md"])
+
+
+def op_expand(req):
+    a = need_md(req)
+    if raid_stat(a["md"]) != "Normal":
+        raise Fail("%s ist nicht im Normalzustand." % a["md"])
+    grow_fs(a)
+    log("RESULT OK %s" % a["md"])
+
+
+def op_delete(req):
+    req["_op"] = "delete"
+    a = need_md(req)
+    for k, _vid, vdev, mnt in volumes_of(a):
+        umount_vol(mnt)
+        if k != "info":
+            drop_shares(mnt)
+    vg = vg_of(a) if IMP.blkid(a["dev"]).get("TYPE") == "LVM2_member" else ""
+    if vg:
+        again(["vgchange", "-an", vg])
+        run(["vgremove", "-ff", "-y", vg], check=False)
+        run(["pvremove", "-ff", "-y", a["dev"]], check=False)
+    mem = list(a["members"])
+    again(["mdadm", "--stop", a["dev"]])
+    run(["mdadm", "--zero-superblock"] + mem, check=False)
+    link_sysvol()
+    log("RESULT OK %s gelöscht" % a["md"])
+
+
+def lvm_target(req):
+    a = need_md(req)
+    vg = vg_of(a)
+    if not vg:
+        raise Fail("%s ist keine Disk Group (LVM)." % a["md"])
+    return a, vg
+
+
+def op_lv_create(req):
+    a, vg = lvm_target(req)
+    lv_new(a, vg, name_ok(req.get("volume", "")), lv_size_arg(req.get("size")))
+    log("RESULT OK")
+
+
+def op_lv_extend(req):
+    a, vg = lvm_target(req)
+    lv = req.get("lv", "")
+    if not re.fullmatch(r"lv_[0-9a-f]{8}", lv):
+        raise Fail("Unbekanntes Volume.")
+    dev = "/dev/%s/%s" % (vg, lv)
+    if not is_mounted(os.path.join(IDATA, lv[3:])):
+        raise Fail("Volume ist nicht eingehängt (beschädigt?).")
+    size = lv_size_arg(req.get("size"))
+    if size:
+        r = run(["lvextend", "-L", size, dev], check=False)
+        if r.returncode and "insufficient free space" in r.stdout.lower():
+            run(["lvextend", "--extents", "+100%FREE", dev])
+        elif r.returncode:
+            raise Fail("lvextend fehlgeschlagen")
+    else:
+        run(["lvextend", "--extents", "+100%FREE", dev])
+    run(["resize2fs", "-fF", dev])
+    log("RESULT OK")
+
+
+def op_lv_delete(req):
+    a, vg = lvm_target(req)
+    lv = req.get("lv", "")
+    if not re.fullmatch(r"lv_[0-9a-f]{8}", lv):
+        raise Fail("Unbekanntes Volume.")
+    mnt = os.path.join(IDATA, lv[3:])
+    if IMP.holds_host("/dev/%s/%s" % (vg, lv)):
+        raise Fail("Das Volume trägt das laufende System.")
+    umount_vol(mnt)
+    drop_shares(mnt)
+    again(["lvremove", "-f", "/dev/%s/%s" % (vg, lv)])
+    link_sysvol()
+    log("RESULT OK")
+
+
+def op_rename(req):
+    a = need_md(req)
+    name = name_ok(req.get("name", ""))
+    for k, vid, _vdev, mnt in volumes_of(a):
+        if (req.get("lv") and vid == req["lv"]) or (not req.get("lv") and k in ("md", "info")):
+            write_label(mnt, name)
+            log("RESULT OK")
+            return
+    raise Fail("Volume nicht gefunden.")
+
+
+OPS = {"create": op_create, "repair": op_repair, "add-disks": op_add_disks, "change-level": op_change_level,
+       "add-spare": op_add_spare, "remove-spare": op_remove_spare, "expand": op_expand, "delete": op_delete,
+       "lv-create": op_lv_create, "lv-extend": op_lv_extend, "lv-delete": op_lv_delete, "rename": op_rename}
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["status"]:
+        print(json.dumps(status(), indent=1))
+        return 0
+    if a[:1] == ["leds"]:
+        leds()
+        return 0
+    if len(a) == 3 and a[0] == "run" and a[1] in OPS:
+        req = json.loads(a[2])
+        os.makedirs(RUN, exist_ok=True)
+        fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("FEHLER: ein anderer Speicherauftrag läuft", flush=True)
+            return 2
+        run(["modprobe", "-a", "md_mod", "raid1", "raid456", "raid0", "raid10", "linear"], check=False, quiet=True)
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        try:
+            OPS[a[1]](req)
+            return 0
+        except Fail as e:
+            log("RESULT FAIL %s" % e)
+            return 1
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

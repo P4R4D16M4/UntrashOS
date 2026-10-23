@@ -1,0 +1,8 @@
+[Unit]
+Description=UntrashOS: log report by mail
+ConditionPathExists=/etc/untrash/notify.json
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/untrash/untrash-notify report

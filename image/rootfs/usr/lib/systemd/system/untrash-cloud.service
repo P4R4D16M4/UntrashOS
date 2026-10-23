@@ -1,0 +1,10 @@
+[Unit]
+Description=UntrashOS: cloud sync jobs (stock Dropbox/Google Drive clients, Upload Manager)
+After=network-online.target untrash-zyxel.service untrash-data.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/lib/untrash/untrash-cloud run

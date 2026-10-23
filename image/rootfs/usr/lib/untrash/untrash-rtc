@@ -1,0 +1,9 @@
+#!/bin/sh
+# Set the system clock from rtc0 (kept in UTC) if it holds a plausible time
+# (after 2026-01-01); otherwise leave the clock alone.
+t=$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null) || exit 0
+if [ "${t:-0}" -ge 1767225600 ]; then
+	date -u -s "@$t" >/dev/null && echo "UNTRASH-RTC: clock set from rtc0 ($t)" >/dev/kmsg
+else
+	echo "UNTRASH-RTC: rtc0 implausible (${t:-?}), clock not set" >/dev/kmsg
+fi

@@ -1,0 +1,9 @@
+[Unit]
+Description=UntrashOS: renew the UPnP port forwardings
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

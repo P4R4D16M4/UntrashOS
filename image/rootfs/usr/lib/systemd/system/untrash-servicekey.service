@@ -1,0 +1,12 @@
+[Unit]
+Description=UntrashOS: service SSH key from the UntrashOS stick (only while plugged in at boot)
+ConditionKernelCommandLine=!untrash.installer=1
+After=local-fs.target systemd-udev-settle.service untrash-settings.service untrash-ssh-hostkeys.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/untrash/untrash-servicekey
+
+[Install]
+WantedBy=multi-user.target

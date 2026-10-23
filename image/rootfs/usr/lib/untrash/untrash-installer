@@ -1,0 +1,1097 @@
+#!/usr/bin/python3
+"""untrash-installer - first-time setup of UntrashOS in the browser.
+
+docs/architecture/installer-plan.md.  Serves http://zyxel-untrash/ (port 80,
+or ZT_INSTALLER_PORT).  Four ways:
+  A  new install, wipe the selected disk          (COPY key confirmation)
+  B  keep the data, take over stock users/shares  (COPY key confirmation)
+  C  keep the data, new users/configuration       (COPY key confirmation)
+  D  back to the stock firmware from the stick's backup (COPY key; reboot,
+     loader RAM mark, stock PartnerKey restores and powers off)
+
+Every destructive run first backs up the partition table and the RAID/LVM
+metadata of the affected disk to the stick.  B/C never
+repartition: UntrashOS goes as files into /.untrash/ of a stock volume
+(slot-a/b.utslot, state.img, swap.img, bootstate); the loader boots from there.  ZT_INSTALLER_DRYRUN=1 only logs
+the commands; ZT_INSTALLER_TEST=1 also lists loop devices (self-tests).
+"""
+import datetime
+import glob
+import hashlib
+import html
+import json
+import os
+import re
+import select
+import shlex
+import struct
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DRYRUN = os.environ.get("ZT_INSTALLER_DRYRUN") == "1"
+TEST = os.environ.get("ZT_INSTALLER_TEST") == "1"
+PORT = int(os.environ.get("ZT_INSTALLER_PORT", "80"))
+STICK_MNT = "/run/untrash/stick"
+RUNDIR = os.environ.get("ZT_INSTALLER_RUNDIR", "/run/untrash/installer")   # tmpfs scratch
+if TEST:  # self-tests: stock disks are partitioned loop devices (every importer call)
+    os.environ.setdefault("ZT_IMPORT_DEVGLOB", "/dev/loop*p[0-9]")
+IMPORT = os.environ.get("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
+KEY_PROG1 = 148          # NAS542 COPY button (gpio-keys-polled, DT label "copy")
+COPY_WAIT = 60
+BOOTSTATE = b"ZTBS1 pref=a a=3 b=3 good=- booting=-\n"
+LAYOUT = [  # sgdisk, os/loader/mkgpt.sh
+    ["-a", "2048", "-n", "1:0:+1G", "-t", "1:8300", "-c", "1:ut-sys-a",
+     "-n", "2:0:+1G", "-t", "2:8300", "-c", "2:ut-sys-b",
+     "-n", "3:0:+4G", "-t", "3:8300", "-c", "3:ut-state",
+     "-n", "4:0:+1G", "-t", "4:8200", "-c", "4:ut-swap",
+     "-n", "5:0:0", "-t", "5:fd00", "-c", "5:ut-data"],
+    ["-a", "8", "-n", "6:40:2047", "-t", "6:8300", "-c", "6:ut-bootstate"],
+]
+MIN_DISK = 16 * 1024 ** 3
+# ways B/C: UntrashOS as files in /.untrash/ of a stock volume
+STATE_IMG = 4 * 1024 ** 3
+SWAP_IMG = 1024 ** 3
+TARGET_MNT = "/run/untrash/target"
+
+
+def sh(cmd, check=True, input=None):
+    r = subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = r.stdout.decode("utf-8", "replace")
+    if check and r.returncode:
+        raise RuntimeError("%s -> %d: %s" % (" ".join(cmd), r.returncode, out.strip()[-400:]))
+    return out
+
+
+# ------------------------------------------------------------------ discovery
+
+def lsblk():
+    cols = "NAME,PATH,SIZE,TYPE,TRAN,MODEL,SERIAL,PARTLABEL,FSTYPE,PTTYPE,MOUNTPOINT,RO"
+    return json.loads(sh(["lsblk", "-J", "-b", "-o", cols]))["blockdevices"]
+
+
+def root_disk():
+    """Disk that holds the running root (never offered for wiping)."""
+    src = sh(["findmnt", "-no", "SOURCE", "/"], check=False).strip()
+    dev = os.path.realpath(src) if src.startswith("/dev/") else ""
+    name = os.path.basename(dev)
+    slaves = glob.glob("/sys/class/block/%s/slaves/*" % name) if name else []
+    for s in slaves or ([dev] if dev else []):
+        part = os.path.basename(s)
+        parent = os.path.basename(os.path.dirname(os.path.realpath("/sys/class/block/" + part)))
+        if parent != "block":
+            return parent
+    return None
+
+
+def find_stick():
+    if TEST and os.environ.get("ZT_INSTALLER_STICKDIR"):
+        d = os.environ["ZT_INSTALLER_STICKDIR"]
+        return {"disk": "test", "dev": d, "mnt": d, "size": 0, "model": "Testverzeichnis", "fake": True}
+    for d in lsblk():
+        if d.get("tran") != "usb":
+            continue
+        for p in d.get("children") or []:
+            if p.get("fstype") != "vfat":
+                continue
+            mnt = p.get("mountpoint") or STICK_MNT
+            if not p.get("mountpoint"):
+                os.makedirs(STICK_MNT, exist_ok=True)
+                if subprocess.run(["mount", "-o", "ro", p["path"], STICK_MNT]).returncode:
+                    continue
+            if os.path.isdir(os.path.join(mnt, "UNTRASH")):
+                return {"disk": d["name"], "dev": p["path"], "mnt": mnt,
+                        "size": d["size"], "model": (d.get("model") or "").strip()}
+            if not p.get("mountpoint"):
+                subprocess.run(["umount", STICK_MNT])
+    return None
+
+
+def stick_rw(stick, rw):
+    if not DRYRUN and not stick.get("fake"):
+        sh(["mount", "-o", "remount," + ("rw" if rw else "ro"), stick["mnt"]])
+
+
+def stick_backups(stick):
+    """install-*/update-*/rollback-* runs of the PartnerKey with a flash backup.
+    "stock": an install run that completed (device.env + RESULT DONE): its
+    backup is the stock state way D returns to.  "verified": the PartnerKey
+    re-read the backup from the stick against SHA256SUMS (flash/VERIFIED)."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(stick["mnt"], "UNTRASH", "*-2*"))):
+        flash = os.path.join(d, "flash")
+        sums = os.path.join(flash, "SHA256SUMS")
+        if not os.path.isfile(sums):
+            continue
+        name = os.path.basename(d)
+        dev = {}
+        try:
+            for line in open(os.path.join(d, "device.env")):
+                k, _, v = line.strip().partition("=")
+                dev[k] = v
+        except OSError:
+            pass
+        try:
+            done = "RESULT DONE" in open(os.path.join(d, "install.log"), errors="replace").read()
+        except OSError:
+            done = False
+        out.append({"name": name, "dir": d, "flash": flash, "device": dev,
+                    "files": len([l for l in open(sums) if l.strip()]),
+                    "verified": os.path.isfile(os.path.join(flash, "VERIFIED")),
+                    "stock": name.startswith("install-") and done and bool(dev)})
+    return out
+
+
+def stick_markers(stick):
+    u = os.path.join(stick["mnt"], "UNTRASH")
+    return {m: open(os.path.join(u, m), errors="replace").read().strip()
+            for m in ("INSTALL_DONE", "INSTALL_FAILED", "ROLLBACK", "ROLLBACK_DONE", "ROLLBACK_FAILED")
+            if os.path.isfile(os.path.join(u, m))} if stick else {}
+
+
+def stock_config_dir(stick):
+    """Stock /etc/zyxel saved on the stick, newest run first:
+    UNTRASH/<install|update>-<stamp>/etc-zyxel.tar (+ .sha256, written by the
+    PartnerKey script under stock; unpacked once to RUNDIR) or an unpacked
+    UNTRASH/*/etc-zyxel/ directory."""
+    if not stick:
+        return None
+    runs = glob.glob(os.path.join(stick["mnt"], "UNTRASH", "*-2*", "etc-zyxel.tar")) + \
+        glob.glob(os.path.join(stick["mnt"], "UNTRASH", "*", "etc-zyxel"))
+    for src in sorted(runs, key=lambda p: os.path.basename(os.path.dirname(p)).split("-", 1)[-1], reverse=True):
+        if os.path.isdir(src):
+            if os.path.isfile(os.path.join(src, "ugs_conf.db")):
+                return src
+            continue
+        try:
+            want = open(src + ".sha256").read().split()[0]
+        except (OSError, IndexError):
+            continue
+        dst = os.path.join(RUNDIR, "stock-config", os.path.basename(os.path.dirname(src)))
+        if os.path.isfile(os.path.join(dst, "ugs_conf.db")):
+            return dst
+        h = hashlib.sha256()
+        with open(src, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        if h.hexdigest() != want:
+            print("stock config %s: sha256 mismatch, ignored" % src, flush=True)
+            continue
+        tmp = dst + ".tmp"
+        sh(["rm", "-rf", tmp])
+        os.makedirs(tmp, mode=0o700)
+        sh(["tar", "-xf", src, "-C", tmp])
+        if os.path.isfile(os.path.join(tmp, "ugs_conf.db")):
+            os.replace(tmp, dst)
+            return dst
+        sh(["rm", "-rf", tmp])
+    return None
+
+
+def classify(d):
+    parts = d.get("children") or []
+    labels = {p.get("partlabel") or "" for p in parts}
+    if {"ut-sys-a", "ut-state"} <= labels:
+        return "untrash"
+    if any(p.get("fstype") == "linux_raid_member" for p in parts):
+        return "stock" if len(parts) >= 3 else "raid"
+    if not parts and not d.get("pttype") and not d.get("fstype"):
+        return "empty"
+    return "foreign"
+
+
+def scan():
+    stick = find_stick()
+    rootd = root_disk()
+    disks = []
+    for d in lsblk():
+        if d.get("type") not in (("disk", "loop") if TEST else ("disk",)) or d.get("tran") == "usb" or d["name"].startswith(("mtd", "ram", "zram")):
+            continue
+        if d["name"].startswith("loop") and not TEST:
+            continue
+        if d["name"].startswith("loop") and not int(d.get("size") or 0):
+            continue
+        disks.append({"name": d["name"], "path": d["path"], "size": d["size"],
+                      "model": (d.get("model") or "").strip(), "serial": (d.get("serial") or "").strip(),
+                      "kind": classify(d), "system": d["name"] == rootd,
+                      "parts": [{"name": p["name"], "size": p["size"], "label": p.get("partlabel"),
+                                 "fs": p.get("fstype")} for p in d.get("children") or []]})
+    arrays = []
+    r = subprocess.run([IMPORT, "volumes"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode == 0:
+        try:
+            arrays = json.loads(r.stdout or "[]")
+        except ValueError:
+            arrays = []
+    cfg = stock_config_dir(stick)
+    return {"stick": stick, "backups": stick_backups(stick) if stick else [], "markers": stick_markers(stick),
+            "slot": slot_source(stick), "disks": disks, "stock_arrays": arrays,
+            "stock_config": cfg, "import_plan": import_plan(cfg)}
+
+
+def import_plan(cfg):
+    if not cfg:
+        return None
+    r = subprocess.run([IMPORT, "plan", cfg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return r.stdout.decode("utf-8", "replace")
+
+
+def slot_source(stick):
+    """System slot on the stick, UNTRASH/system/ (os/install/mk-stick-system.sh):
+    slot.utslot (head + trailer) or the older slot.head.gz + slot.trailer;
+    slot.sha256 lines "<sha256> <name>", "<bytes> slot.head.length"."""
+    if not stick:
+        return None
+    d = os.path.join(stick["mnt"], "UNTRASH", "system")
+    sums_f = os.path.join(d, "slot.sha256")
+    if not os.path.isfile(sums_f):
+        return None
+    sums = dict(l.split()[::-1] for l in open(sums_f) if l.strip())
+    src = {"dir": d, "sums": sums,
+           "version": open(os.path.join(d, "version")).read().strip()
+           if os.path.isfile(os.path.join(d, "version")) else "?"}
+    if os.path.isfile(os.path.join(d, "slot.utslot")):
+        src["utslot"] = os.path.join(d, "slot.utslot")
+        src["size"] = os.path.getsize(src["utslot"])
+        return src
+    need = [os.path.join(d, n) for n in ("slot.head.gz", "slot.trailer")]
+    if not all(os.path.isfile(n) for n in need):
+        return None
+    src["head"], src["trailer"] = need
+    return src
+
+
+# ------------------------------------------------------------------- runner
+
+class Job:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = "idle"     # idle | waiting-copy | running | done | failed
+        self.mode = None
+        self.log = []
+        self.copy_deadline = 0
+
+    def add(self, line):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        with self.lock:
+            self.log.append("%s %s" % (stamp, line))
+        print(line, flush=True)
+
+    def snapshot(self):
+        with self.lock:
+            return {"state": self.state, "mode": self.mode, "log": self.log[-400:],
+                    "copy_left": max(0, int(self.copy_deadline - time.time()))
+                    if self.state == "waiting-copy" else 0, "dryrun": DRYRUN}
+
+
+JOB = Job()
+
+
+def run(cmd, input=None):
+    JOB.add("$ " + " ".join(shlex.quote(c) for c in cmd))
+    if DRYRUN:
+        return ""
+    out = sh(cmd, input=input)
+    for line in out.strip().splitlines()[-6:]:
+        JOB.add("  " + line)
+    return out
+
+
+def wait_copy_key():
+    """True when the COPY button is pressed within COPY_WAIT seconds."""
+    if DRYRUN or os.environ.get("ZT_INSTALLER_NOKEY") == "1" and TEST:
+        JOB.add("(Probelauf: COPY-Taste als gedrückt angenommen)")
+        return True
+    devs = []
+    for ev in glob.glob("/dev/input/event*"):
+        try:
+            devs.append(open(ev, "rb", buffering=0))
+        except OSError:
+            pass
+    fmt = "llHHi"
+    size = struct.calcsize(fmt)
+    try:
+        while time.time() < JOB.copy_deadline:
+            r, _, _ = select.select(devs, [], [], 1)
+            for f in r:
+                data = f.read(size * 64)
+                for i in range(0, len(data) - size + 1, size):
+                    _s, _u, typ, code, val = struct.unpack(fmt, data[i:i + size])
+                    if typ == 1 and code == KEY_PROG1 and val == 1:
+                        return True
+        return False
+    finally:
+        for f in devs:
+            f.close()
+
+
+def backup_disk_meta(stick, disk, tag):
+    """Partition table, md superblock areas and LVM metadata -> stick (Ebene E)."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = os.path.join(stick["mnt"], "UNTRASH", "disk-backup-%s-%s-%s" % (tag, disk["name"], stamp))
+    run(["mkdir", "-p", out])
+    run(["dd", "if=" + disk["path"], "of=%s/head-1MiB.bin" % out, "bs=1M", "count=1", "status=none"])
+    # the exact last MiB: the backup GPT sits in the last 33 sectors, and disk
+    # sizes are rarely a multiple of 1 MiB
+    run(["dd", "if=" + disk["path"], "of=%s/tail-1MiB.bin" % out, "bs=1M", "iflag=skip_bytes",
+         "skip=%d" % (disk["size"] - 1024 * 1024), "count=1", "status=none"])
+    for p in disk["parts"]:
+        # md 1.2 superblock at 4 KiB, LVM label/metadata in the first MiB
+        run(["dd", "if=/dev/" + p["name"], "of=%s/%s-head-1MiB.bin" % (out, p["name"]), "bs=1M", "count=1",
+             "status=none"])
+    if not DRYRUN:
+        with open(os.path.join(out, "lsblk.json"), "w") as f:
+            json.dump(disk, f, indent=1)
+        with open(os.path.join(out, "sgdisk-backup.txt"), "w") as f:
+            f.write(sh(["sgdisk", "-p", disk["path"]], check=False))
+        sh(["sh", "-c", "cd %s && sha256sum *.bin > SHA256SUMS" % shlex.quote(out)])
+    JOB.add("Sicherung der Plattenmetadaten: %s" % out)
+
+
+def write_slot(slot, part):
+    hlen = int(slot["sums"]["slot.head.length"])
+    if "utslot" in slot:
+        run(["dd", "if=" + slot["utslot"], "of=" + part, "bs=4096", "count=%d" % (hlen // 4096),
+             "conv=fsync", "status=none"])
+    else:
+        run(["sh", "-c", "zcat %s | dd of=%s bs=1M conv=fsync status=none" % (shlex.quote(slot["head"]), part)])
+    blocks = int(sh(["blockdev", "--getsize64", part]).strip()) // 4096 if not DRYRUN else 262144
+    if "utslot" in slot:
+        run(["dd", "if=" + slot["utslot"], "of=" + part, "bs=4096", "skip=%d" % (hlen // 4096),
+             "seek=%d" % (blocks - 2), "count=2", "conv=fsync", "status=none"])
+    else:
+        run(["dd", "if=" + slot["trailer"], "of=" + part, "bs=4096", "seek=%d" % (blocks - 2), "conv=fsync",
+             "status=none"])
+    if DRYRUN:
+        return
+    want_head = slot["sums"]["slot.head"]
+    h = hashlib.sha256()
+    with open(part, "rb") as f:
+        left = hlen
+        while left:
+            b = f.read(min(left, 1 << 20))
+            h.update(b)
+            left -= len(b)
+        f.seek((blocks - 2) * 4096)
+        t = hashlib.sha256(f.read(8192)).hexdigest()
+    if h.hexdigest() != want_head or t != slot["sums"]["slot.trailer"]:
+        raise RuntimeError("Rücklesen von %s stimmt nicht (Kopf %s, Trailer %s)" % (part, h.hexdigest()[:12], t[:12]))
+    JOB.add("Slot %s zurückgelesen: identisch (%d MB)" % (part, hlen // 1000000))
+
+
+def clear_install_marker(stick):
+    """The loader boots the installer while UNTRASH/INSTALL is on the stick."""
+    marker = os.path.join(stick["mnt"], "UNTRASH", "INSTALL")
+    if not os.path.exists(marker):
+        return
+    stick_rw(stick, True)
+    try:
+        run(["rm", "-f", marker])
+    finally:
+        stick_rw(stick, False)
+    JOB.add("Marker UNTRASH/INSTALL entfernt: der nächste Start bootet das installierte System")
+
+
+def part_of(disk_path, n):
+    base = disk_path + ("p%d" % n if disk_path[-1].isdigit() else "%d" % n)
+    return base
+
+
+def do_wipe_install(req, info):
+    disk = next(d for d in info["disks"] if d["name"] == req["disk"])
+    stick, slot = info["stick"], info["slot"]
+    stick_rw(stick, True)
+    try:
+        backup_disk_meta(stick, disk, "A")
+    finally:
+        stick_rw(stick, False)
+    run([IMPORT, "release"])
+    for md in sorted(glob.glob("/sys/class/block/md*")):
+        slaves = [os.path.basename(s) for s in glob.glob(md + "/slaves/*")]
+        if any(s.startswith(disk["name"]) for s in slaves):
+            run(["mdadm", "--stop", "/dev/" + os.path.basename(md)])
+    for p in disk["parts"]:
+        run(["wipefs", "-a", "/dev/" + p["name"]])
+    run(["sgdisk", "-Z", disk["path"]])
+    for args in LAYOUT:
+        run(["sgdisk"] + args + [disk["path"]])
+    run(["partprobe", disk["path"]])
+    run(["udevadm", "settle"])
+    for n in (1, 2):
+        write_slot(slot, part_of(disk["path"], n))
+    run(["dd", "of=" + part_of(disk["path"], 6), "bs=512", "count=1", "conv=fsync,sync", "status=none"],
+        input=BOOTSTATE)
+    rec = device_record(info)
+    if rec:
+        run(["dd", "of=" + part_of(disk["path"], 6), "bs=4096", "seek=1", "count=1", "conv=fsync,sync",
+             "status=none"], input=rec)
+        JOB.add("Stock-MAC-Adressen übernommen")
+    else:
+        JOB.add("Keine Stock-MAC-Adressen auf dem Stick: UntrashOS nimmt die des Treibers")
+    run(["mkfs.btrfs", "-f", "-L", "ut-data", part_of(disk["path"], 5)])
+    clear_install_marker(stick)
+    JOB.add("Fertig: Neustart startet UntrashOS %s von %s" % (slot["version"], disk["name"]))
+
+
+MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+
+def device_record(info):
+    """Stock MACs of this NAS (PartnerKey device.env of the newest completed
+    install run) as the text UntrashOS reads at boot (untrash-init: way A in
+    block 1 of ut-bootstate, ways B/C in /.untrash/device.env)."""
+    for b in reversed(info["backups"]):
+        if b["stock"]:
+            lines = ["%s=%s" % (k, b["device"].get(k, "")) for k in ("ETH0_MAC", "ETH1_MAC")
+                     if MAC_RE.match(b["device"].get(k, ""))]
+            if lines:
+                return ("\n".join(lines) + "\n").encode()
+    return None
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def do_stock_restore(req, info):
+    """Way D with stick + browser only (os/loader/zt-loader "way D"): check the
+    install run's backup, set UNTRASH/ROLLBACK, reboot.  The loader leaves a
+    RAM mark and resets, Barebox then starts the stock firmware, whose
+    PartnerKey writes env + kernel<X> back from this backup and powers off."""
+    stick = info["stick"]
+    b = next(x for x in info["backups"] if x["name"] == req["backup"])
+    dev = b["device"]
+    JOB.add("Prüfe Sicherung %s ..." % b["name"])
+    run(["sh", "-c", "cd %s && sha256sum -c --quiet SHA256SUMS" % shlex.quote(b["flash"])])
+    for f, key in (("mtd2-before-a.bin", "ENV_OLD_SHA256"), ("mtd%s-before-a.bin" % dev["LOADER_MTD"], "KX_OLD_SHA256")):
+        got = sha256_file(os.path.join(b["dir"], f)) if not DRYRUN else dev[key]
+        if got != dev[key]:
+            raise RuntimeError("%s/%s passt nicht zur Prüfsumme der Installation" % (b["name"], f))
+    JOB.add("Sicherung geprüft: Env und kernel%s (Stock-Zustand vor der Installation)" % dev["LOADER_SLOT"])
+    u = os.path.join(stick["mnt"], "UNTRASH")
+    stick_rw(stick, True)
+    try:
+        for m in ("ROLLBACK_FAILED", "ROLLBACK_DONE", "ROLLBACK_BUSY", "rollback-stage1.log"):
+            if os.path.exists(os.path.join(u, m)):
+                run(["mv", os.path.join(u, m), os.path.join(u, "%s.old-%s" % (m, time.strftime("%Y%m%d-%H%M%S")))])
+        run(["touch", os.path.join(u, "ROLLBACK")])
+        run(["sync"])
+    finally:
+        stick_rw(stick, False)
+    JOB.add("Marker UNTRASH/ROLLBACK gesetzt. Die NAS startet jetzt neu, startet einmal die Stock-Firmware, "
+            "schreibt Env und kernel%s aus der Sicherung zurück und schaltet sich dann aus (einige Minuten; "
+            "der Stick muss stecken bleiben). Danach einschalten: die NAS startet die Stock-Firmware wie vor "
+            "der Installation." % dev["LOADER_SLOT"])
+    if not DRYRUN and not TEST:
+        threading.Timer(8.0, lambda: subprocess.run(["systemctl", "reboot"])).start()
+
+
+def stock_volumes():
+    """Stock data volumes, mounted read-only under /i-data by the importer:
+    ({id, dev, mnt, name, kind, array, members, sysvol, free, untrash}, error).
+
+    The installer used to turn every importer failure into an empty list.  That
+    made an md/LVM/ext4 failure indistinguishable from a NAS with no data
+    volume at all.  This call is still read-only: the importer assembles md
+    with --readonly and mounts ext4 ro,noload.
+    """
+    r = subprocess.run([IMPORT, "volumes", "--mount"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        arrays = json.loads(r.stdout or "[]") if r.returncode == 0 else None
+    except ValueError:
+        arrays = None
+    if arrays is None:
+        detail = r.stderr.decode("utf-8", "replace").strip()
+        if not detail:
+            detail = r.stdout.decode("utf-8", "replace").strip()
+        # Keep the web response readable and never turn arbitrary command
+        # output into markup (the client escapes every problem string).
+        detail = " ".join(detail.split())[-600:] or "keine Detailmeldung erhalten"
+        print("importer volumes --mount failed (rc %d): %s" % (r.returncode, detail), flush=True)
+        return [], "Read-only-Prüfung von RAID/LVM/Dateisystem fehlgeschlagen: " + detail
+    out = []
+    for a in arrays:
+        for v in a.get("volumes") or []:
+            mnt = v.get("mnt")
+            if not mnt or v.get("id") == "vg_info_area" or not v.get("mounted"):
+                continue
+            st = os.statvfs(mnt)
+            out.append({"key": a["uuid"].replace(":", "")[:8] + "/" + v["id"], "id": v["id"], "dev": v["dev"], "mnt": mnt, "name": v.get("name") or v["id"],
+                        "kind": "lvm" if v["id"] != "md" else "md", "array": a["uuid"], "level": a.get("level"),
+                        "members": a["members"], "degraded": len(a["members"]) < int(a.get("devices") or 0),
+                        "sysvol": bool(glob.glob(mnt + "/.system/sysvol_*")),
+                        "free": st.f_bavail * st.f_frsize,
+                        "untrash": os.path.isfile(os.path.join(mnt, ".untrash", "bootstate"))})
+    if not out:
+        unknown = []
+        for a in arrays:
+            for v in a.get("volumes") or []:
+                if not v.get("mounted"):
+                    unknown.append("%s (%s)" % (v.get("dev", "?"), v.get("type", "unbekannt")))
+        if unknown:
+            return [], "Kein einhängbares ext4-Stock-Volume: " + ", ".join(unknown[:4])
+    return sorted(out, key=lambda v: (not v["sysvol"], v["name"])), None
+
+
+def need_bytes(slot, vol=None):
+    """Free space needed on the volume; files of an earlier installation in
+    /.untrash are replaced (slots) or kept (state, swap) and count as free."""
+    need = 2 * slot.get("size", 0) + STATE_IMG + SWAP_IMG + 256 * 1024 ** 2
+    for n in ("slot-a.utslot", "slot-b.utslot", "state.img", "swap.img"):
+        try:
+            need -= os.stat(os.path.join(vol["mnt"], ".untrash", n)).st_blocks * 512 if vol else 0
+        except OSError:
+            pass
+    return max(need, 256 * 1024 ** 2)
+
+
+def disks_of(members, info):
+    names = {os.path.basename(m) for m in members}
+    return [d for d in info["disks"] if any(p["name"] in names for p in d["parts"])]
+
+
+def copy_verified(src, dst, want):
+    """Copy src to dst (via dst.tmp + rename), then re-read dst from disk."""
+    tmp = dst + ".tmp"
+    run(["dd", "if=" + src, "of=" + tmp, "bs=1M", "conv=fsync", "status=none"])
+    if DRYRUN:
+        return
+    os.replace(tmp, dst)
+    with open("/proc/sys/vm/drop_caches", "w") as f:
+        f.write("3\n")
+    h = hashlib.sha256()
+    with open(dst, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    if h.hexdigest() != want:
+        raise RuntimeError("Rücklesen von %s stimmt nicht (%s)" % (dst, h.hexdigest()[:12]))
+    JOB.add("%s zurückgelesen: identisch" % dst)
+
+
+# ------------------------------------------------- way C: new configuration
+# Way C writes a minimal configuration in the stock format (ugs_conf.db +
+# py_conf) and stages it exactly like way B, so the installed system applies
+# it with the same tested importer: user admin (uid 501, group everyone 500)
+# with the password chosen here, guest pc-guest, one share per existing
+# top-level folder of the volume, admin read/write.  Only hashes are stored.
+
+SMB_BAD = re.compile(r'[\\/\[\]:|<>+=;,*?"\x00-\x1f]')
+STOCK_SCHEMA = """
+CREATE TABLE smb_user (uid integer PRIMARY KEY NOT NULL, uname TEXT NOT NULL, create_type TEXT, utype TEXT, passwd TEXT, description TEXT, UNIQUE (uname COLLATE NOCASE));
+CREATE TABLE smb_group (gid integer PRIMARY KEY NOT NULL, gname TEXT NOT NULL, gtype TEXT, description TEXT, UNIQUE (gname COLLATE NOCASE));
+CREATE TABLE group_member (gid integer, gname TEXT, uid integer, uname TEXT);
+CREATE TABLE ugs_misc (key TEXT PRIMARY KEY NOT NULL, value TEXT);
+CREATE TABLE smb_share (s_name TEXT primary key NOT NULL, s_path TEXT NOT NULL, create_type TEXT, s_desc TEXT, s_enable TEXT, browseable TEXT, recycle TEXT, mdaserv_public_type INT, web_public TEXT, UNIQUE (s_name COLLATE NOCASE));
+CREATE TABLE share_user_privilege (s_name TEXT, uid INT, uname TEXT, privilege TEXT);
+CREATE TABLE share_group_privilege (s_name TEXT, gid INT, gname TEXT, privilege TEXT);
+"""
+
+
+def md4(data):
+    """RFC 1320 (hashlib has no MD4 with OpenSSL 3)."""
+    def rol(x, n):
+        x &= 0xffffffff
+        return ((x << n) | (x >> (32 - n))) & 0xffffffff
+    msg = bytearray(data) + b"\x80"
+    msg += b"\x00" * ((56 - len(msg) % 64) % 64) + struct.pack("<Q", 8 * len(data))
+    h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]
+    for off in range(0, len(msg), 64):
+        X = struct.unpack("<16I", msg[off:off + 64])
+        a, b, c, d = h
+        for i in range(16):
+            k, r = i, (3, 7, 11, 19)[i % 4]
+            a, b, c, d = d, rol(a + ((b & c) | (~b & d)) + X[k], r), b, c
+        for i in range(16):
+            k, r = (i % 4) * 4 + i // 4, (3, 5, 9, 13)[i % 4]
+            a, b, c, d = d, rol(a + ((b & c) | (b & d) | (c & d)) + X[k] + 0x5a827999, r), b, c
+        for i in range(16):
+            k, r = (0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15)[i], (3, 9, 11, 15)[i % 4]
+            a, b, c, d = d, rol(a + (b ^ c ^ d) + X[k] + 0x6ed9eba1, r), b, c
+        h = [(x + y) & 0xffffffff for x, y in zip(h, (a, b, c, d))]
+    return struct.pack("<4I", *h)
+
+
+def new_shares(vol, root=None):
+    """[(name, path)] = existing top-level folders of the volume, read at root
+    (default: its read-only mount); path as the installed system sees it."""
+    out, root = [], root or vol["mnt"]
+    try:
+        names = sorted(os.listdir(root), key=str.lower)
+    except OSError:
+        return out
+    for n in names:
+        if n.startswith(".") or n == "lost+found" or SMB_BAD.search(n) or len(n) > 80:
+            continue
+        if os.path.isdir(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n)):
+            out.append((n, os.path.join(vol["mnt"], n)))
+    return out
+
+
+def new_config_problems(req):
+    pw, pw2 = req.get("password") or "", req.get("password2") or ""
+    name = (req.get("netname") or "").strip()
+    p = []
+    if len(pw) < 8:
+        p.append("Das Passwort für admin braucht mindestens 8 Zeichen.")
+    elif pw != pw2:
+        p.append("Die beiden Passwörter stimmen nicht überein.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,14}", name):
+        p.append("Name im Netz: 1–15 Zeichen, Buchstaben, Ziffern und Bindestrich.")
+    return p
+
+
+def write_new_config(req, vol, dst, root):
+    """ugs_conf.db + py_conf for way C into dst (a new directory)."""
+    import sqlite3
+    pw = req["password"]
+    nt = md4(pw.encode("utf-16-le")).hex().upper()
+    shadow = sh(["openssl", "passwd", "-6", "-stdin"], input=pw.encode()).strip()
+    if not shadow.startswith("$6$"):
+        raise RuntimeError("openssl passwd lieferte keinen SHA-512-Hash")
+    os.makedirs(dst, mode=0o700)
+    c = sqlite3.connect(os.path.join(dst, "ugs_conf.db"))
+    c.executescript(STOCK_SCHEMA)
+    c.executemany("INSERT INTO smb_user VALUES (?,?,?,?,?,?)",
+                  [(501, "admin", "bulit-in", "admin", "X" * 32 + ":" + nt, ""),
+                   (502, "pc-guest", "bulit-in", "guest", "", "")])
+    c.execute("INSERT INTO smb_group VALUES (500, 'everyone', 'local', 'System default group')")
+    c.execute("INSERT INTO ugs_misc VALUES ('admin_shadow_passwd', ?)", (shadow,))
+    shares = new_shares(vol, root)
+    for name, path in shares:
+        c.execute("INSERT INTO smb_share VALUES (?,?,'user-create','','y','y','n',0,'n')", (name, path))
+        c.execute("INSERT INTO share_user_privilege VALUES (?,501,'admin','rw')", (name,))
+    c.commit()
+    c.close()
+    with open(os.path.join(dst, "py_conf"), "w") as f:
+        f.write("[system]\n    hostname = %s\n    [[servername]]\n        servername = %s\n"
+                "        description = UntrashOS\n        workgroupname = WORKGROUP\n        nomaster = false\n" % (
+                    req["netname"].strip().lower(), req["netname"].strip()))
+    JOB.add("Neue Konfiguration: Benutzer admin, %d Freigabe(n), Name %s" % (
+        len(shares), req["netname"].strip()))
+
+
+def do_keep_install(req, info, takeover):
+    """Ways B/C: system as files in /.untrash/ of a stock volume, nothing repartitioned."""
+    vol = next(v for v in info["volumes"] if v["key"] == req["volume"])
+    stick, slot = info["stick"], info["slot"]
+    stick_rw(stick, True)
+    try:
+        for d in disks_of(vol["members"], info):
+            backup_disk_meta(stick, d, "B" if takeover else "C")
+    finally:
+        stick_rw(stick, False)
+    run([IMPORT, "release"])
+    uuid8 = vol["array"].replace(":", "")[:8]
+    md = "/dev/md/zyx-" + uuid8
+    run(["mdadm", "--assemble", "--run", md] + vol["members"])
+    vg = None
+    try:
+        dev = md
+        if vol["kind"] == "lvm":
+            vg = os.path.basename(os.path.dirname(vol["dev"]))
+            run(["vgchange", "-ay", vg])
+            dev = vol["dev"]
+        r = subprocess.run(["e2fsck", "-p", dev]) if not DRYRUN else None
+        if r is not None and r.returncode >= 4:
+            raise RuntimeError("e2fsck %s meldet Fehler (rc %d); bitte zuerst prüfen" % (dev, r.returncode))
+        run(["mkdir", "-p", TARGET_MNT])
+        run(["mount", "-t", "ext4", "-o", "rw,noatime", dev, TARGET_MNT])
+        try:
+            u = os.path.join(TARGET_MNT, ".untrash")
+            run(["mkdir", "-p", "-m", "700", u])
+            for x in ("a", "b"):
+                copy_verified(slot["utslot"], os.path.join(u, "slot-%s.utslot" % x), slot["sums"]["slot.utslot"])
+            if DRYRUN or not os.path.exists(os.path.join(u, "state.img")):
+                run(["fallocate", "-l", str(STATE_IMG), os.path.join(u, "state.img")])
+            else:
+                JOB.add("state.img vorhanden: bleibt erhalten")
+            if DRYRUN or not os.path.exists(os.path.join(u, "swap.img")):
+                run(["fallocate", "-l", str(SWAP_IMG), os.path.join(u, "swap.img")])
+                run(["chmod", "600", os.path.join(u, "swap.img")])
+                run(["mkswap", "-L", "ut-swap", os.path.join(u, "swap.img")])
+            run(["dd", "of=" + os.path.join(u, "bootstate"), "bs=512", "count=1", "conv=fsync,sync",
+                 "status=none"], input=BOOTSTATE)
+            rec = device_record(info)
+            if rec:
+                run(["dd", "of=" + os.path.join(u, "device.env"), "conv=fsync", "status=none"], input=rec)
+                JOB.add("Stock-MAC-Adressen übernommen")
+            # B: the stock config from the stick; C: a new one (same format)
+            cfg = info["stock_config"]
+            if not takeover:
+                cfg = os.path.join(RUNDIR, "new-config-%d" % os.getpid())
+                if not DRYRUN:
+                    sh(["rm", "-rf", cfg])
+                    write_new_config(req, vol, cfg, TARGET_MNT)
+            run(["rm", "-rf", os.path.join(u, "stock-config")])
+            run(["cp", "-a", cfg, os.path.join(u, "stock-config")])
+            run(["chmod", "700", os.path.join(u, "stock-config")])
+            run(["touch", os.path.join(u, "takeover-pending")])
+            # language chosen on this page: the installed system starts with it
+            lang = req.get("lang") if req.get("lang") in ("de", "en", "fr") else "de"
+            run(["sh", "-c", 'printf "%s\\n" "$1" >"$2"', "-", lang, os.path.join(u, "language")])
+            run(["sync"])
+        finally:
+            run(["umount", TARGET_MNT])
+    finally:
+        if vg:
+            run(["vgchange", "-an", vg])
+        run(["mdadm", "--stop", md])
+    clear_install_marker(stick)
+    # two whole sentences, so the EN/FR catalogs can translate each (i18n.js patterns)
+    JOB.add(("Fertig: Neustart startet UntrashOS %s aus /.untrash auf „%s“ und richtet beim ersten Start die alten "
+             "Benutzer und Freigaben ein" if takeover else
+             "Fertig: Neustart startet UntrashOS %s aus /.untrash auf „%s“ und richtet beim ersten Start admin und "
+             "die Freigaben ein") % (slot["version"], vol["name"]))
+
+
+MODES = {
+    "A": {"title": "Neuinstallation – Platte löschen", "fn": do_wipe_install, "copy": True},
+    "B": {"title": "Neuinstallation – Daten behalten, alte Benutzer und Freigaben übernehmen",
+          "fn": lambda req, info: do_keep_install(req, info, True), "copy": True},
+    "C": {"title": "Neuinstallation – Daten behalten, neue Benutzer und Einstellungen",
+          "fn": lambda req, info: do_keep_install(req, info, False), "copy": True},
+    "D": {"title": "Stock-Firmware aus der Sicherung auf dem Stick wiederherstellen", "fn": do_stock_restore,
+          "copy": True},
+}
+
+
+def plan(req, info):
+    """(steps, problems, phrase) for a request; nothing is executed."""
+    m = req.get("mode")
+    steps, problems = [], []
+    if m == "A":
+        disk = next((d for d in info["disks"] if d["name"] == req.get("disk")), None)
+        if not disk:
+            problems.append("Keine Platte gewählt.")
+            return steps, problems, None
+        if disk["system"]:
+            problems.append("%s trägt das laufende System und kann von hier nicht gelöscht werden." % disk["name"])
+        if disk["size"] < MIN_DISK:
+            problems.append("%s ist kleiner als 16 GiB." % disk["name"])
+        if not info["stick"]:
+            problems.append("Kein UntrashOS-Stick gefunden (Sicherung der Plattenmetadaten nötig).")
+        if not info["slot"]:
+            problems.append("Auf dem Stick fehlt UNTRASH/system/ (Systemabbild).")
+        steps = ["Partitionstabelle und RAID/LVM-Metadaten von %s auf den Stick sichern" % disk["name"],
+                 "Stock-Volumes freigeben, RAID-Verbände der Platte stoppen",
+                 "ALLE Partitionen und Daten auf %s (%s, %.0f GB) löschen" % (
+                     disk["name"], disk["model"] or "?", disk["size"] / 1e9),
+                 "UntrashOS-Layout anlegen: ut-sys-a/b, ut-state, ut-swap, ut-data, ut-bootstate",
+                 "Systemabbild %s nach ut-sys-a und ut-sys-b schreiben und zurücklesen" % (
+                     info["slot"] or {}).get("version", "?"),
+                 "Datenbereich ut-data mit btrfs formatieren",
+                 "Bestätigung an der NAS: COPY-Taste drücken"]
+        for a in info["stock_arrays"]:
+            names = {os.path.basename(m) for m in a.get("members") or []}
+            others = {p["name"] for p in disk["parts"]}
+            if a.get("role") == "stock-data" and names & others and names - others:
+                steps.insert(2, "Achtung: Der Stock-Verband %s (%s) verliert damit eine Platte und ist danach "
+                                "unvollständig" % (a.get("level"), a["uuid"][:8]))
+        phrase = "LÖSCHEN %s" % disk["name"]
+    elif m == "D":
+        b = next((x for x in info["backups"] if x["name"] == req.get("backup")), None)
+        if not b:
+            problems.append("Keine Stock-Sicherung auf dem Stick gewählt.")
+            return steps, problems, None
+        if not b["stock"]:
+            problems.append("%s ist keine abgeschlossene Installations-Sicherung; der Stock-Zustand steht in der "
+                            "install-*-Sicherung mit device.env." % b["name"])
+        # two whole sentences, so the EN/FR catalogs can translate each (i18n.js patterns)
+        steps = [("Prüfsummen der Sicherung %s prüfen (%d Dateien, beim Anlegen zurückgelesen)" if b["verified"]
+                  else "Prüfsummen der Sicherung %s prüfen (%d Dateien)") % (b["name"], b["files"]),
+                 "Marker UNTRASH/ROLLBACK auf den Stick schreiben und neu starten",
+                 "Die NAS startet einmal die Stock-Firmware; diese schreibt Env und kernel%s aus der Sicherung "
+                 "zurück und schaltet aus (Stick stecken lassen)" % b["device"].get("LOADER_SLOT", "?"),
+                 "Danach einschalten: Stock-Firmware wie vor der Installation; Daten auf den Platten bleiben, "
+                 "UntrashOS-Dateien in /.untrash bzw. die UntrashOS-Platte bleiben liegen",
+                 "Bestätigung an der NAS: COPY-Taste drücken"]
+        phrase = "STOCK"
+    elif m in ("B", "C"):
+        vols, volume_error = stock_volumes()
+        info["volumes"] = vols
+        slot = info["slot"] or {}
+        if not vols:
+            problems.append("Kein Stock-Volume gefunden.")
+            if volume_error:
+                problems.append(volume_error)
+            return steps, problems, None
+        # the first plan call has no choice yet; a choice that vanished is an
+        # error, never silently another volume
+        vol = next((v for v in vols if v["key"] == req.get("volume")), None if req.get("volume") else vols[0])
+        if not vol:
+            problems.append("Das gewählte Volume ist nicht mehr vorhanden; bitte neu wählen.")
+            return steps, problems, None
+        req["volume"] = vol["key"]
+        if not info["stick"]:
+            problems.append("Kein UntrashOS-Stick gefunden (Sicherung der Plattenmetadaten nötig).")
+        if "utslot" not in slot:
+            problems.append("Auf dem Stick fehlt UNTRASH/system/slot.utslot (Systemabbild für Wege B/C).")
+        if vol["free"] < need_bytes(slot, vol):
+            problems.append("Auf „%s“ sind nur %.1f GB frei, nötig sind %.1f GB." % (
+                vol["name"], vol["free"] / 1e9, need_bytes(slot, vol) / 1e9))
+        if m == "B" and not info["stock_config"]:
+            problems.append("Stock-Konfiguration fehlt auf dem Stick (UNTRASH/*/etc-zyxel).")
+        if vol["degraded"]:
+            problems.append("Der Verband von „%s“ ist unvollständig (%d Platte(n) gefunden); erst alle Platten "
+                            "einsetzen – der Loader schreibt auf unvollständige Verbände nie." % (
+                                vol["name"], len(vol["members"])))
+        if any(d["kind"] == "untrash" for d in info["disks"]):
+            problems.append("Eine Platte trägt UntrashOS-Partitionen (Weg A); der Loader startet diese vor "
+                            "/.untrash. Diese Platte zuerst entfernen.")
+        if any(v["untrash"] for v in vols if v["key"] != vol["key"]):
+            problems.append("Ein anderes Volume trägt schon UntrashOS (/.untrash); der Loader nähme das erste.")
+        steps = ["Partitionstabellen und RAID/LVM-Metadaten der Platten von „%s“ auf den Stick sichern" % vol["name"],
+                 "Volume „%s“ (%s, %s) beschreibbar einbinden; keine Partition und kein Verband wird verändert" % (
+                     vol["name"], vol["kind"], vol["level"]),
+                 "Systemabbild %s zweimal als /.untrash/slot-a/b.utslot ablegen und zurücklesen (%.1f GB)" % (
+                     slot.get("version", "?"), 2 * slot.get("size", 0) / 1e9),
+                 "Zustand (/.untrash/state.img, 4 GiB) und Auslagerung (/.untrash/swap.img, 1 GiB) anlegen"
+                 + (" – vorhandener Zustand bleibt" if vol["untrash"] else ""),
+                 "Boot-Zähler /.untrash/bootstate schreiben, Marker UNTRASH/INSTALL vom Stick entfernen"]
+        if m == "B":
+            steps.append("Stock-Konfiguration nach /.untrash/stock-config; beim ersten Start übernimmt UntrashOS "
+                         "Benutzer, Gruppen, Freigaben und SMB-Passwörter")
+        else:
+            shares = new_shares(vol)
+            steps.append("Neue Konfiguration: Benutzer admin mit dem Passwort von unten (SMB, SSH), Name im Netz "
+                         "wie unten, %d Freigabe(n) für admin (lesen/schreiben): %s" % (
+                             len(shares), ", ".join(n for n, _p in shares) or "keine"))
+            steps.append("Die alten Stock-Benutzer und -Rechte werden nicht übernommen")
+        steps.append("Bestätigung an der NAS: COPY-Taste drücken")
+        phrase = "BEHALTEN"
+    else:
+        problems.append("Unbekannter Weg.")
+        phrase = None
+    return steps, problems, phrase
+
+
+def start(req):
+    info = scan()
+    steps, problems, phrase = plan(req, info)
+    if req.get("mode") == "C":
+        problems += new_config_problems(req)
+    if problems:
+        return 409, {"problems": problems}
+    if req.get("phrase", "").strip() != phrase:
+        return 403, {"problems": ["Bestätigungstext stimmt nicht (erwartet: %s)." % phrase]}
+    with JOB.lock:
+        if JOB.state in ("waiting-copy", "running"):
+            return 409, {"problems": ["Es läuft bereits ein Vorgang."]}
+        JOB.state, JOB.mode, JOB.log = "waiting-copy", req["mode"], []
+        JOB.copy_deadline = time.time() + COPY_WAIT
+
+    def worker():
+        mode = MODES[req["mode"]]
+        JOB.add("Weg %s: %s%s" % (req["mode"], mode["title"], " (PROBELAUF)" if DRYRUN else ""))
+        if mode.get("copy"):
+            JOB.add("Warte auf die COPY-Taste an der NAS (%d s) ..." % COPY_WAIT)
+            if not wait_copy_key():
+                JOB.add("Keine COPY-Taste: abgebrochen, nichts verändert.")
+                JOB.state = "failed"
+                return
+            JOB.add("COPY-Taste erkannt.")
+        JOB.state = "running"
+        try:
+            mode["fn"](req, info)
+            JOB.state = "done"
+        except Exception as e:  # report, never retry automatically
+            JOB.add("FEHLER: %s" % e)
+            JOB.state = "failed"
+    threading.Thread(target=worker, daemon=True).start()
+    return 202, {"ok": True}
+
+
+# ---------------------------------------------------------------------- web
+
+PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UntrashOS einrichten</title>
+<link rel="icon" href="ut/assets/favicon.ico"><link rel="stylesheet" href="ut/untrash.css">
+<script src="ut/i18n/i18n.js"></script>
+<style>
+/* fallback when the design files are missing: still dark and readable */
+body{margin:0;background:#0d1115;color:#e9eef2;font:15px/1.5 system-ui,sans-serif}
+.ut-page__main{max-width:880px;margin:0 auto;padding:20px 16px 48px}
+#ways{display:grid;gap:8px}#ways .ut-choice{margin:0}
+.found-meta{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+#detail .ut-field{max-width:520px}#planout ol{margin-top:4px}
+.confirm{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}.confirm .ut-input{width:min(100%,280px)}
+.confirm[hidden]{display:none}
+.statebar{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+details summary{cursor:pointer;color:var(--ut-fg-2);margin-top:10px}
+</style></head><body class="ut"><div class="ut-page">
+<header class="ut-page__head"><span class="ut-brand"><img src="ut/assets/logo-mark-96.png" alt=""><b>Untrash<span>OS</span></b></span>
+<span class="ut-faint" id="sub">Zyxel NAS542 · Erstkonfiguration</span>
+<a href="manual/" target="_blank" rel="noopener" style="margin-left:auto">Bedienungsanleitung</a>
+<select class="ut-select" id="lang" translate="no" style="width:auto;margin-left:12px" aria-label="Sprache"><option value="de">Deutsch</option><option value="en">English</option><option value="fr">Français</option></select></header>
+<main class="ut-page__main">
+<h1>UntrashOS einrichten</h1>
+<p class="ut-muted">Bestehende Daten bleiben unangetastet, solange Sie nicht ausdrücklich Weg A wählen. Jeder Weg wird zusätzlich an der NAS mit der COPY-Taste bestätigt.</p>
+<div id="dry"></div>
+<div class="ut-section-title">Gefunden</div><div class="ut-card" id="found"><span class="ut-spinner"></span> Suche …</div>
+<div class="ut-section-title">Was soll passieren?</div><div id="ways"></div>
+<div class="ut-card" id="detail" hidden style="margin-top:12px"></div>
+<div class="ut-section-title">Ablauf</div><div class="ut-card"><div class="statebar"><span class="ut-pill" id="pill">bereit</span><span id="state" class="ut-muted">Kein Vorgang.</span></div><pre class="ut-log" id="log" translate="no" hidden></pre><div class=confirm id=after hidden><button class="ut-btn ut-btn--primary" onclick="reboot()">Neu starten</button></div></div>
+</main></div><script>
+const $=s=>document.querySelector(s);let INFO=null;
+UTI18N.ready.then(()=>{const l=$('#lang');l.value=UTI18N.lang;l.onchange=()=>UTI18N.set(l.value);});
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const gb=b=>(b/1e9).toFixed(b>1e11?0:1)+' GB';
+const KIND={untrash:'UntrashOS',stock:'Zyxel-Stock',empty:'leer',raid:'RAID-Mitglied',foreign:'unbekannt'};
+const KPILL={untrash:'ok',stock:'info',empty:'',raid:'info',foreign:'warn'};
+async function load(){INFO=await (await fetch('api/scan')).json();render()}
+function render(){const i=INFO;let h='<div class=found-meta>';
+ h+=i.stick?`<span class="ut-pill ut-pill--ok">Stick: ${esc(i.stick.model)} · ${gb(i.stick.size)}</span>`+(i.slot?`<span class="ut-pill ut-pill--ok">Systemabbild ${esc(i.slot.version)}</span>`:'<span class="ut-pill ut-pill--danger">Systemabbild fehlt</span>')+(i.backups.some(b=>b.stock&&b.verified)?'<span class="ut-pill ut-pill--ok">Stock-Sicherung vorhanden, geprüft</span>':(i.backups.some(b=>b.stock)?'<span class="ut-pill ut-pill--warn">Stock-Sicherung vorhanden (ungeprüft)</span>':'<span class="ut-pill ut-pill--danger">Keine Stock-Sicherung</span>')):'<span class="ut-pill ut-pill--danger">Kein UntrashOS-Stick gefunden</span>';
+ if(i.stock_config)h+='<span class="ut-pill ut-pill--info">Stock-Konfiguration auf dem Stick</span>';
+ h+='</div><div class=ut-table-wrap><table class=ut-table><thead><tr><th>Platte</th><th class=num>Größe</th><th>Modell</th><th>Inhalt</th></tr></thead><tbody>';
+ for(const d of i.disks)h+=`<tr><td>${esc(d.name)}${d.system?' <span class=ut-faint>(läuft gerade)</span>':''}</td><td class=num>${gb(d.size)}</td><td>${esc(d.model)}</td><td><span class="ut-pill ${KPILL[d.kind]?'ut-pill--'+KPILL[d.kind]:''}">${KIND[d.kind]||esc(d.kind)}</span></td></tr>`;
+ h+='</tbody></table></div>';const vols=i.stock_arrays.filter(a=>a.role==='stock-data');
+ if(vols.length)h+=`<p class=ut-muted style="margin:10px 0 0">Stock-Datenverbände: ${vols.map(a=>esc(a.level)+' ('+a.members.length+' Platte(n))').join(', ')}</p>`;
+ $('#found').innerHTML=h;
+ const W={B:['Behalten und übernehmen','Neuinstallation ohne Löschen: alte Einstellungen, Benutzer und Freigaben übernehmen.'],
+  C:['Behalten, neu einrichten','Neuinstallation ohne Löschen: Daten bleiben, neue Benutzer und Einstellungen.'],
+  A:['Platte löschen und neu installieren','Die gewählte Platte wird vollständig gelöscht.'],
+  D:['Zurück zur Stock-Firmware','Den gesicherten Zustand vor der Installation zurückschreiben (nur Stick und Browser).']};
+ $('#ways').innerHTML=Object.entries(W).map(([k,t])=>`<label class="ut-choice${k==='A'?' ut-choice--danger':''}"><span class=ut-choice__key>${k}</span><input type=radio name=way value=${k} hidden><span><b>${t[0]}</b><small>${t[1]}</small></span></label>`).join('');
+ document.querySelectorAll('input[name=way]').forEach(r=>r.onchange=()=>detail(r.value));}
+async function detail(m,extra={}){const box=$('#detail');box.hidden=false;let sel='';
+ if(m==='A')sel=`<div class=ut-field><label for=disk>Platte</label><select class=ut-select id=disk>${INFO.disks.map(d=>`<option value="${esc(d.name)}">${esc(d.name)} – ${gb(d.size)} ${esc(d.model)} (${KIND[d.kind]})</option>`).join('')}</select></div>`;
+ if(m==='C')sel=`<div class=ut-field><label for=netname>Name im Netz</label><input class=ut-input id=netname value="zyxel-untrash" maxlength=15 autocomplete=off></div><div class=ut-field><label for=pw1>Neues Passwort für admin (mind. 8 Zeichen)</label><input class=ut-input type=password id=pw1 autocomplete=new-password></div><div class=ut-field><label for=pw2>Passwort wiederholen</label><input class=ut-input type=password id=pw2 autocomplete=new-password></div>`;
+ if(m==='D')sel=`<div class=ut-field><label for=backup>Sicherung</label><select class=ut-select id=backup>${INFO.backups.filter(b=>b.stock).reverse().map(b=>`<option>${esc(b.name)}</option>`).join('')}</select></div>`;
+ box.innerHTML='<div class=ut-card__head><h3>Weg '+m+'</h3></div>'+sel+'<div id=planout class=ut-muted><span class=ut-spinner></span></div>';
+ const upd=async()=>{const req={mode:m,disk:$('#disk')?.value,backup:$('#backup')?.value};
+  if($('#volume'))req.volume=$('#volume').value;
+  const p=await (await fetch('api/plan',{method:'POST',body:JSON.stringify(req)})).json();
+  if(p.volumes&&p.volumes.length&&!$('#volume')){const v=document.createElement('div');v.className='ut-field';
+   v.innerHTML='<label for=volume>Volume</label><select class=ut-select id=volume>'+p.volumes.map(x=>`<option value="${esc(x.key)}">${esc(x.name)} – ${gb(x.free)} frei${x.sysvol?' (Systemvolume)':''}${x.untrash?' · UntrashOS vorhanden':''}</option>`).join('')+'</select>';
+   box.insertBefore(v,$('#planout'));}
+  let h='<ol class=ut-steps>'+p.steps.map(s=>`<li>${esc(s)}</li>`).join('')+'</ol>';
+  if(p.problems.length)h+=p.problems.map(x=>`<div class="ut-callout ut-callout--danger" style="margin-top:8px">${esc(x)}</div>`).join('');
+  else if(p.phrase)h+=`<div class="ut-callout ${m==='A'?'ut-callout--danger':'ut-callout--warn'}" style="margin-top:8px"><div>Zum Bestätigen eintippen: <b translate=no>${esc(p.phrase)}</b></div></div><div class=confirm><input class=ut-input type=text id=phrase autocomplete=off translate=no placeholder="${esc(p.phrase)}"><button class="ut-btn ${m==='A'?'ut-btn--danger':'ut-btn--primary'}" id=go>Starten</button></div>`;
+  if(m==='B'&&INFO.import_plan)h+=`<details><summary>Stock-Konfiguration</summary><pre class=ut-log>${esc(INFO.import_plan)}</pre></details>`;
+  $('#planout').innerHTML=h;const go=$('#go');if(go)go.onclick=async()=>{req.phrase=$('#phrase').value;
+   if(m==='C'){req.netname=$('#netname').value;req.password=$('#pw1').value;req.password2=$('#pw2').value;}
+   req.lang=UTI18N.lang;
+   const r=await fetch('api/start',{method:'POST',body:JSON.stringify(req)});const j=await r.json();if(!r.ok)alert((j.problems||[]).map(UTI18N.tr).join('\\n'));};};
+ box.onchange=e=>{if(!e.target.matches('input[type=password],#netname,#phrase'))upd();};upd();}
+async function reboot(){if(!confirm('NAS jetzt neu starten?'))return;await fetch('api/reboot',{method:'POST',body:'{}'});
+ $('#state').textContent='Neustart läuft – die NAS startet jetzt das installierte System.';}
+async function poll(){try{const j=await (await fetch('api/job')).json();
+ $('#dry').innerHTML=j.dryrun?'<div class="ut-callout ut-callout--warn" style="margin-bottom:12px"><div><b>Probelauf:</b> Befehle werden nur angezeigt, nicht ausgeführt.</div></div>':'';
+ const T={idle:'Kein Vorgang.','waiting-copy':`Jetzt die COPY-Taste an der NAS drücken (noch ${j.copy_left} s).`,running:'Läuft …',done:'Fertig.',failed:'Abgebrochen – siehe Protokoll.'};
+ const P={idle:['','bereit'],'waiting-copy':['warn ut-pill--live','COPY-Taste'],running:['info ut-pill--live','läuft'],done:['ok','fertig'],failed:['danger','Fehler']}[j.state]||['',j.state];
+ $('#pill').className='ut-pill'+(P[0]?' ut-pill--'+P[0]:'');$('#pill').textContent=P[1];
+ $('#state').textContent=(j.mode?'Weg '+j.mode+': ':'')+T[j.state];$('#log').hidden=!j.log.length;
+ // log lines "HH:MM:SS text": messages are translated whole, commands ("$ ...", output) never
+ $('#log').textContent=j.log.map(l=>{const m=/^(\\d\\d:\\d\\d:\\d\\d )(.*)$/s.exec(l);return m&&!/^(\\$ |  )/.test(m[2])?m[1]+UTI18N.tr(m[2]):l}).join('\\n');$('#after').hidden=j.state!=='done'||j.dryrun;}catch(e){}
+ setTimeout(poll,1500);}
+load();poll();
+</script></body></html>"""
+
+# design system (os/design, copied to /usr/share/untrash/design by mkslot-erofs.sh)
+DESIGN = os.environ.get("ZT_DESIGN_DIR") or next(
+    (d for d in ("/usr/share/untrash/design",
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../../design"))
+     if os.path.isfile(os.path.join(d, "untrash.css"))), "/usr/share/untrash/design")
+# user manual (docs/user-guide; in the image /usr/share/untrash/manual with index.html)
+MANUAL = os.environ.get("ZT_MANUAL_DIR") or next(
+    (d for d in ("/usr/share/untrash/manual",
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../../../docs/user-guide"))
+     if os.path.isfile(os.path.join(d, "index.html")) or os.path.isfile(os.path.join(d, "manual.html"))),
+    "/usr/share/untrash/manual")
+STATIC_TYPES = {".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml",
+                ".jpg": "image/jpeg", ".ico": "image/x-icon", ".js": "text/javascript; charset=utf-8",
+                ".json": "application/json; charset=utf-8", ".html": "text/html; charset=utf-8",
+                ".webp": "image/webp", ".pdf": "application/pdf"}
+
+
+def static_file(path, prefix="/ut/", root=None):
+    """/ut/<rel> -> (bytes, type) inside DESIGN (or prefix/root), or None (no traversal)."""
+    rel = path[len(prefix):].split("?", 1)[0]
+    base = os.path.realpath(root or DESIGN)
+    full = os.path.realpath(os.path.join(base, rel))
+    ctype = STATIC_TYPES.get(os.path.splitext(full)[1])
+    if not ctype or not full.startswith(base + os.sep) or not os.path.isfile(full):
+        return None
+    with open(full, "rb") as f:
+        return f.read(), ctype
+
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, code, obj, ctype="application/json"):
+        if isinstance(obj, bytes):
+            body = obj
+        else:
+            body = obj.encode() if isinstance(obj, str) else json.dumps(obj).encode()
+            ctype += "; charset=utf-8"
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "max-age=3600" if isinstance(obj, bytes) else "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            return self.reply(200, PAGE, "text/html")
+        if self.path.startswith("/ut/"):
+            f = static_file(self.path)
+            return self.reply(200, *f) if f else self.reply(404, {"error": "not found"})
+        if self.path in ("/manual", "/manual/"):
+            f = static_file("/manual/index.html", "/manual/", MANUAL) or static_file("/manual/manual.html", "/manual/", MANUAL)
+            return self.reply(200, *f) if f else self.reply(404, {"error": "not found"})
+        if self.path.startswith("/manual/"):
+            f = static_file(self.path, "/manual/", MANUAL)
+            return self.reply(200, *f) if f else self.reply(404, {"error": "not found"})
+        if self.path == "/api/scan":
+            return self.reply(200, scan())
+        if self.path == "/api/job":
+            return self.reply(200, JOB.snapshot())
+        self.reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        req = self.body()
+        if self.path == "/api/reboot":
+            with JOB.lock:
+                if JOB.state in ("waiting-copy", "running"):
+                    return self.reply(409, {"problems": ["Es läuft noch ein Vorgang."]})
+            if DRYRUN or TEST:
+                return self.reply(409, {"problems": ["Probelauf: kein Neustart."]})
+            threading.Timer(1.0, lambda: subprocess.run(["systemctl", "reboot"])).start()
+            return self.reply(202, {"ok": True})
+        if req.get("mode") not in MODES:
+            return self.reply(400, {"problems": ["Unbekannter Weg."]})
+        if self.path == "/api/plan":
+            info = scan()
+            steps, problems, phrase = plan(req, info)
+            return self.reply(200, {"steps": steps, "problems": problems, "phrase": phrase,
+                                    "volumes": info.get("volumes")})
+        if self.path == "/api/start":
+            code, obj = start(req)
+            return self.reply(code, obj)
+        self.reply(404, {"error": "not found"})
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "scan":
+        print(json.dumps(scan(), indent=1))
+        return
+    print("untrash-installer on port %d%s" % (PORT, " (dry run)" if DRYRUN else ""), flush=True)
+    ThreadingHTTPServer((os.environ.get("ZT_INSTALLER_BIND", ""), PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

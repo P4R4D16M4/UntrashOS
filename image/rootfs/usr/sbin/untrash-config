@@ -1,0 +1,1120 @@
+#!/usr/bin/python3
+"""untrash-config - UntrashOS system settings (one JSON file) and their files.
+
+  untrash-config import-stock CONFIG [--force|--once]
+                       stock /etc/zyxel copy -> /etc/untrash/settings.json
+                       (way B: every setting the stock web UI had; a service
+                       is on only if it was on under stock)
+  untrash-config show | get KEY | set KEY JSON_VALUE
+  untrash-config render [--root DIR]
+                       write the system files for the settings (DIR for tests)
+  untrash-config apply render to / and enable/disable/restart the services
+  untrash-config shares-changed
+                       shares/rights changed: regenerate the WebDAV rights
+  untrash-config reset-network | factory-reset [--no-apply]
+                       RESET button (stock): 2 s = network DHCP + admin
+                       password settable at the Desk; 7 s = factory defaults
+  untrash-config boot  (untrash-settings.service) defaults if there are no
+                       settings yet (way A), then render
+
+Settings (docs/architecture/stock-takeover.md section 8):
+  hostname, netbios {name, description, workgroup, nomaster}
+  time {timezone, ntp, ntp_server}
+  network {eth0/eth1 {mode dhcp|static, address a.b.c.d/n, gateway, mtu},
+           dns {auto, servers}}
+  services {smb, ssh {active, port, sftp}, ftp {active, anonymous, tls, port,
+           conn_limit, idle_min, pasv_min, pasv_max, up_kbs, down_kbs,
+           anon_up_kbs, anon_down_kbs}, nfs {active, exports [{path, clients,
+           options}]}, mediaserver {active, shares {name: mask}},
+           time_machine {active, share}, webdav {active, anonymous},
+           dyndns {active, provider, username, password, hostname},
+           ups {active, min_capacity}, syslog_server {active, path, format,
+           months}, webpublish {active, port}, printer {active, names
+           {serial: name}}, itunes, https}
+  network.bond {active, mode 0-6, slaves [eth0, eth1], mode dhcp|static,
+           address, gateway, mtu}  (stock bond0 = link aggregation)
+  notify {mail {active, server, port, auth, username, password, from,
+          alerts_to, log_to, subject, alerts, report_all, schedule, day, hour,
+          minute}, syslog {active, server, port}}
+  power {spindown_min, wol}, recycle {expire_days}, usb {names {uuid: name}}
+  unsupported [stock features that were on and UntrashOS does not offer]
+Shares, users and rights stay in the stock database (untrash-import-zyxel).
+"""
+import copy
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+STOCK_CONFIG = "/etc/untrash/zyxel/stock-config"
+DEV_PROFILE = "/usr/lib/untrash/dev-profile"      # dev images: recovery address
+RUN_DIR = os.environ.get("ZT_RUN_DIR", "/run/untrash")
+# keys of untrash-servicekey (UntrashOS stick plugged in at boot): SSH stays on
+SERVICE_KEYS = os.environ.get("ZT_SERVICE_KEYS", "/run/untrash/servicekey/authorized_keys")
+STATE_LIB = os.environ.get("ZT_STATE_LIB", "/var/lib/untrash")
+ZONEINFO = os.environ.get("ZT_ZONEINFO", "/usr/share/zoneinfo")
+MEDIA_VIDEO, MEDIA_PHOTO, MEDIA_MUSIC = 1, 2, 4     # stock ugs_comm_def MEDIA_SERV_PUBLIC_*
+IMPORT_TOOL = os.environ.get("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
+# stock dydns_main_model providers (inadyn there too) + current free services;
+# stock "dhs" and "myzyxelth" no longer exist
+DYNDNS = {"dyndns": "default@dyndns.org", "noip": "default@no-ip.com", "3322": "dyndns@3322.org",
+          "zoneedit": "default@zoneedit.com", "duckdns": "default@duckdns.org",
+          "freedns": "default@freedns.afraid.org", "dynv6": "default@dynv6.com"}
+WEBDAV_PORT, WEBDAV_TLS_PORT = 5002, 5003            # stock httpd_dav.conf
+BOND_MODES = ("balance-rr", "active-backup", "balance-xor", "broadcast", "802.3ad", "balance-tlb", "balance-alb")
+WEEKDAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+
+LANGUAGES = ("de", "en", "fr")
+DEFAULTS = {
+    "hostname": "zyxel-untrash",
+    "language": "de",          # Desk default; a browser may choose its own (i18n.js)
+    "netbios": {"name": "ZYXEL-UNTRASH", "description": "UntrashOS", "workgroup": "WORKGROUP", "nomaster": False},
+    "time": {"timezone": "Europe/Berlin", "ntp": True, "ntp_server": "pool.ntp.org"},
+    "network": {"eth0": {"mode": "dhcp", "address": "", "gateway": "", "mtu": 1500},
+                "eth1": {"mode": "dhcp", "address": "", "gateway": "", "mtu": 1500},
+                "dns": {"auto": True, "servers": []},
+                "bond": {"active": False, "mode": 1, "slaves": ["eth0", "eth1"], "mode_ip": "dhcp", "address": "",
+                         "gateway": "", "mtu": 1500}},
+    "services": {"smb": True,
+                 "ssh": {"active": False, "port": 22, "sftp": False},
+                 "ftp": {"active": False, "anonymous": False, "tls": True, "port": 21, "conn_limit": 10,
+                         "idle_min": 15, "pasv_min": 1024, "pasv_max": 65535, "up_kbs": 0, "down_kbs": 0,
+                         "anon_up_kbs": 0, "anon_down_kbs": 0},
+                 "nfs": {"active": False, "exports": []},
+                 "mediaserver": {"active": False, "shares": {}},
+                 "time_machine": {"active": False, "share": ""},
+                 "webdav": {"active": False, "anonymous": False},
+                 "dyndns": {"active": False, "provider": "dyndns", "username": "", "password": "", "hostname": ""},
+                 "ups": {"active": False, "min_capacity": 5},
+                 "syslog_server": {"active": False, "path": "", "format": "simple", "months": 6},
+                 "webpublish": {"active": False, "port": 80},
+                 "download": {"active": False, "share": "admin", "folder": "download", "incoming": "download/torrent",
+                              "bt_port": 6881, "dht": True, "dl_kbs": 0, "up_kbs": 0, "slots": 3, "max_conn": 55,
+                              "ratio": 100, "seed_min": -1, "period": "", "notify": False},
+                 "printer": {"active": True, "names": {}},
+                 "itunes": False, "https": {"active": False, "port": 443, "force": False}},
+    "notify": {"mail": {"active": False, "server": "", "port": 0, "auth": False, "username": "", "password": "",
+                        "from": "", "alerts_to": "", "log_to": "", "subject": "", "alerts": True,
+                        "report_all": False, "schedule": "daily", "day": 0, "hour": 0, "minute": 0},
+               "syslog": {"active": False, "server": "", "port": 514}},
+    "power": {"spindown_min": 0, "wol": False, "pwron": "former", "schedule_active": False, "schedule": []},
+    "recycle": {"expire_days": 0},
+    "usb": {"names": {}},
+    "cloud": {"jobs": []},
+    "upnp": {"services": {}},
+    "iscsi": {"luns": [], "targets": []},
+    "copybtn": {"copy": {"share_path": "", "bak_path": "", "direction": "cp2Vol", "newdir": True},
+                "sync": {"share_path": "", "bak_path": "", "direction": "twoWay"}},
+    "unsupported": [],
+}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def die(msg):
+    print("untrash-config: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def merged(base, over):
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        out[k] = merged(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def load():
+    try:
+        with open(SETTINGS) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return copy.deepcopy(DEFAULTS)
+    wd = (raw.get("services") or {}).get("webdav")
+    if isinstance(wd, bool):            # older settings: webdav and https were flags
+        raw["services"]["webdav"] = {"active": wd, "anonymous": False}
+    hs = (raw.get("services") or {}).get("https")
+    if isinstance(hs, bool):
+        raw["services"]["https"] = {"active": hs, "port": 443, "force": False}
+    return merged(DEFAULTS, raw)
+
+
+def save(s):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    tmp = SETTINGS + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:   # mail/DynDNS passwords
+        json.dump(s, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, SETTINGS)
+
+
+# ------------------------------------------------------------- stock import
+
+def read_pyconf(path):
+    """Minimal ConfigObj reader (same as untrash-import-zyxel)."""
+    vals, stack = {}, []
+    try:
+        f = open(path, errors="replace")
+    except OSError:
+        return vals
+    with f:
+        for line in f:
+            s = line.strip()
+            m = re.fullmatch(r"(\[+)\s*([^\]]+?)\s*\]+", s)
+            if m:
+                stack = stack[:len(m.group(1)) - 1] + [m.group(2)]
+                continue
+            m = re.fullmatch(r"([^=]+?)\s*=\s*(.*)", s)
+            if m and stack:
+                vals[".".join(stack + [m.group(1)])] = m.group(2).strip().strip('"')
+    return vals
+
+
+def stock_timezone(value):
+    """Stock timezoneCountry "+01:00/Amsterdam" -> IANA "Europe/Amsterdam"."""
+    if not value:
+        return None
+    if os.path.isfile(os.path.join(ZONEINFO, value)) and "/" in value and not value[0] in "+-":
+        return value
+    city = value.split("/", 1)[-1].strip().replace(" ", "_")
+    for region in ("Europe", "America", "Asia", "Africa", "Australia", "Pacific", "Atlantic", "Indian",
+                   "Antarctica", "America/Argentina", "America/Indiana"):
+        if os.path.isfile(os.path.join(ZONEINFO, region, city)):
+            return "%s/%s" % (region, city)
+    m = re.match(r"([+-])(\d\d):(\d\d)", value)
+    if m and m.group(3) == "00":
+        h = int(m.group(2))     # Etc/GMT has the inverted sign
+        return "Etc/GMT%s%d" % ("-" if m.group(1) == "+" else "+", h) if h else "Etc/UTC"
+    return None
+
+
+def yes(v):
+    return str(v).strip().lower() in ("true", "yes", "y", "1", "on", "enable")
+
+
+def num(v, default):
+    try:
+        return int(str(v).strip())
+    except ValueError:
+        return default
+
+
+def stock_to_settings(cfg):
+    py = read_pyconf(os.path.join(cfg, "py_conf"))
+    s = copy.deepcopy(DEFAULTS)
+    g = py.get
+    unsupported = []
+    hn = g("system.hostname") or re.sub(r"[^a-z0-9-]", "-", (g("system.servername.servername") or "").lower()).strip("-")
+    if hn and HOSTNAME_RE.match(hn):
+        s["hostname"] = hn
+    s["netbios"] = {"name": g("system.servername.servername") or s["hostname"].upper(),
+                    "description": g("system.servername.description") or "",
+                    "workgroup": g("system.servername.workgroupname") or "WORKGROUP",
+                    "nomaster": yes(g("system.servername.nomaster", "false"))}
+    tz = stock_timezone(g("system.date_time.timezoneCountry"))
+    if tz:
+        s["time"]["timezone"] = tz
+    elif g("system.date_time.timezoneCountry"):
+        unsupported.append("Zeitzone %r nicht zugeordnet (Europe/Berlin)" % g("system.date_time.timezoneCountry"))
+    s["time"]["ntp"] = yes(g("system.date_time.timeServerActive", "true"))
+    if g("system.date_time.timeServerAddr"):
+        s["time"]["ntp_server"] = g("system.date_time.timeServerAddr")
+    # network: stock egiga0/egiga1 = eth0/eth1 (MACs: Barebox ethaddr/eth2addr)
+    for stock_if, ifn in (("egiga0", "eth0"), ("egiga1", "eth1")):
+        p = "network.interface.%s." % stock_if
+        if g(p + "type") is None:
+            continue
+        mode = "static" if g(p + "type") == "static" else "dhcp"
+        addr = g(p + "address") or ""
+        s["network"][ifn] = {"mode": mode, "address": addr if mode == "static" else "",
+                             "gateway": (g(p + "gateway") or "") if mode == "static" else "",
+                             "mtu": num(g(p + "mtu", 1500), 1500)}
+    s["network"]["dns"] = {"auto": g("network.interface.nameserver.fetch", "auto") != "manual",
+                           "servers": [x for x in (g("network.interface.nameserver.name_server_1"),
+                                                   g("network.interface.nameserver.name_server_2")) if x]}
+    b = "network.interface.bond0."
+    if yes(g(b + "activate", "no")):
+        slaves = [{"egiga0": "eth0", "egiga1": "eth1"}.get(x) for x in (g(b + "slave") or "egiga0 egiga1").split()]
+        st = g(b + "type") == "static"
+        s["network"]["bond"] = {"active": True, "mode": num(g(b + "mode", 1), 1) % 7,
+                                "slaves": sorted(x for x in slaves if x) or ["eth0", "eth1"],
+                                "mode_ip": "static" if st else "dhcp", "address": (g(b + "address") or "") if st else "",
+                                "gateway": (g(b + "gateway") or "") if st else "", "mtu": num(g(b + "mtu", 1500), 1500)}
+    if yes(g("network.interface.bond1.activate", "no")):
+        unsupported.append("zweite Link-Aggregation bond1")
+    sv = s["services"]
+    sv["ssh"] = {"active": yes(g("system.service.ssh.active", "false")),
+                 "port": num(g("system.service.ssh.port", 22), 22),
+                 "sftp": yes(g("system.service.ssh.sftp_active", "false"))}
+    f = "system.service.ftp."
+    sv["ftp"] = {"active": yes(g(f + "active", "false")), "anonymous": yes(g(f + "allow_anonymous", "n")),
+                 "tls": yes(g(f + "with_encrypt", "true")), "port": num(g(f + "cmd_port", 21), 21),
+                 "conn_limit": num(g(f + "conn_limit", 10), 10), "idle_min": num(g(f + "idle_timeout", 15), 15),
+                 "pasv_min": 1024, "pasv_max": 65535,
+                 "up_kbs": num(g(f + "normal_up_speed", 0), 0), "down_kbs": num(g(f + "normal_dl_speed", 0), 0),
+                 "anon_up_kbs": num(g(f + "anonymous_up_speed", 0), 0),
+                 "anon_down_kbs": num(g(f + "anonymous_dl_speed", 0), 0)}
+    if g(f + "data_port_range_set") == "manual":
+        sv["ftp"]["pasv_min"] = num(g(f + "data_port_min", 1024), 1024)
+        sv["ftp"]["pasv_max"] = num(g(f + "data_port_max", 65535), 65535)
+    hp = num(g("system.service.https.port", 443), 443)
+    sv["https"] = {"active": yes(g("system.service.https.active", "false")), "port": hp if 0 < hp < 65536 else 443,
+                   "force": yes(g("system.service.https.force_https", "false"))}
+    # stock cloud apps (/etc/zyxel/<app>.conf ENABLED); their account tokens cannot be taken over
+    for f, app, ok in (("dropbox-sync.conf", "Dropbox", True), ("gdrive-sync.conf", "Google Drive", True),
+                       ("ftp-ul.conf", "Upload Manager FTP", True), ("flickr-ul.conf", "Upload Manager Flickr", False),
+                       ("youtube-ul.conf", "Upload Manager YouTube", False)):
+        try:
+            on = re.search(r"^ENABLED\s*=\s*(\S+)", open(os.path.join(cfg, f), errors="replace").read(), re.M)
+        except OSError:
+            on = None
+        if on and yes(on.group(1)):
+            unsupported.append("%s war an: %s" % (app, "unter Cloud das Konto neu verbinden und den Auftrag anlegen"
+                                                  if ok else "in UntrashOS bewusst weggelassen"))
+    sv["itunes"] = yes(g("system.service.itune.active", "false"))
+    if sv["itunes"]:
+        unsupported.append("iTunes-Server (DAAP, in UntrashOS bewusst weggelassen)")
+    wp = num(g("system.service.webpublish.port", 80), 80)
+    sv["webpublish"] = {"active": yes(g("system.service.webpublish.active", "false")), "port": wp if 0 < wp < 65536 else 80}
+    names = {}
+    for k, v in py.items():
+        m = re.fullmatch(r"system\.service\.printer\.([^.]+)\.prt_name", k)
+        if m and re.fullmatch(r"[A-Za-z0-9_-]{1,15}", v):
+            names[m.group(1)] = v
+    sv["printer"] = {"active": True, "names": names}
+    # stock download service (dservice): on unless /etc/zyxel/dservice.disable; its other values live
+    # inside the daemon, defaults like stock (admin/download, watch folder admin/download/torrent)
+    sv["download"] = dict(DEFAULTS["services"]["download"], active=not os.path.exists(os.path.join(cfg, "dservice.disable")))
+    if yes(g("system.service.telnet.active", "false")):
+        unsupported.append("Telnet (bewusst nicht angeboten)")
+    d = "system.service.dydns."
+    sv["dyndns"] = {"active": yes(g(d + "active", "false")), "provider": g(d + "provider") or "dyndns",
+                    "username": g(d + "username") or "", "password": g(d + "password") or "",
+                    "hostname": g(d + "hostname") or ""}
+    if sv["dyndns"]["provider"] not in DYNDNS:
+        if sv["dyndns"]["active"]:
+            unsupported.append("DynDNS-Anbieter %s gibt es nicht mehr (DynDNS aus)" % sv["dyndns"]["provider"])
+        sv["dyndns"].update(active=False, provider="dyndns")
+    m = "maintenance.log.mail."
+    sched = g(m + "schedule") or "hourly"
+    s["notify"]["mail"] = {
+        "active": yes(g(m + "enable", "no")), "server": g(m + "address") or "", "port": 0,
+        "auth": yes(g(m + "authentication", "no")), "username": g(m + "username") or "",
+        "password": g(m + "password") or "", "from": g(m + "from") or "",
+        "alerts_to": g(m + "send-alerts-to") or "", "log_to": g(m + "send-log-to") or "",
+        "subject": g(m + "subject") or "", "alerts": bool(g(m + "alert")), "report_all": bool(g(m + "levelall")),
+        "schedule": sched if sched in ("hourly", "daily", "weekly") else "hourly",
+        "day": num(g(m + "day", 0), 0) % 7, "hour": num(g(m + "hour", 0), 0) % 24, "minute": num(g(m + "miniute", 0), 0) % 60}
+    if ":" in s["notify"]["mail"]["server"]:
+        host, _, port = s["notify"]["mail"]["server"].rpartition(":")
+        if port.isdigit():
+            s["notify"]["mail"].update(server=host, port=int(port))
+    s["notify"]["syslog"] = {"active": yes(g("maintenance.log.syslog.enable", "no")),
+                             "server": g("maintenance.log.syslog.address") or "", "port": 514}
+    try:
+        path, fmt, months = (open(os.path.join(cfg, "syslog-ng", "syslog.table")).read().strip().split("|") + ["", "", ""])[:3]
+    except OSError:
+        path, fmt, months = "", "simple", "6"
+    sv["syslog_server"] = {"active": os.path.exists(os.path.join(cfg, "syslog-ng", "enable_syslog.flag")) and bool(path),
+                           "path": path, "format": fmt or "simple", "months": num(months, 6)}
+    sv["mediaserver"] = {"active": yes(g("system.service.mediaserver.active", "false")), "shares": {}}
+    db = os.path.join(cfg, "ugs_conf.db")
+    if os.path.isfile(db):
+        c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        for name, mask, enable in c.execute("SELECT s_name, mdaserv_public_type, s_enable FROM smb_share"):
+            if enable == "y" and num(mask, 0):
+                sv["mediaserver"]["shares"][name] = num(mask, 0) & 7
+        r = c.execute("SELECT value FROM ugs_misc WHERE key='rbm_expire_day'").fetchone()
+        if r:
+            s["recycle"]["expire_days"] = num(r[0], 0)
+        c.close()
+    sv["time_machine"] = {"active": yes(g("backup.time_machine.active", "false")),
+                          "share": g("backup.time_machine.target_share") or ""}
+    sv["webdav"] = {"active": os.path.exists(os.path.join(cfg, "webdav", "dav.flag")),
+                    "anonymous": os.path.exists(os.path.join(cfg, "webdav", "dav_anonymous.flag"))}
+    nfs_on = os.path.exists(os.path.join(cfg, "storage", "enable_nfs.flag"))
+    exports = []
+    for ex in [os.path.join(cfg, "exports")] + glob.glob(os.path.join(cfg, "zy-pkgs", "*", "exports")):
+        if os.path.isfile(ex):
+            for line in open(ex, errors="replace"):
+                m = re.match(r"\s*(/\S+)\s+(\S+?)\((\S*)\)", line)
+                if m:
+                    exports.append({"path": m.group(1), "clients": m.group(2), "options": m.group(3)})
+    sv["nfs"] = {"active": nfs_on, "exports": exports}
+    if nfs_on and not exports:
+        unsupported.append("NFS war an, aber keine Exportliste in der Stock-Konfiguration gefunden")
+    try:
+        mins = num(open(os.path.join(cfg, "hd-idle.conf")).read(), 0)
+    except OSError:
+        mins = 0
+    pw = {}
+    if os.path.isfile(os.path.join(cfg, "pwrmg.db")):
+        c = sqlite3.connect("file:%s?mode=ro" % os.path.join(cfg, "pwrmg.db"), uri=True)
+        pw = dict(c.execute("SELECT id, value FROM pwrmg").fetchall())
+        c.close()
+    # pwrmg_DB_rd_pwron: 1 always, 2 disable, 3 former; rcS2 reads storage/pwron.status
+    pwron = {1: "always", 2: "never", 3: "former"}.get(num(pw.get("pwr_pwron", 3), 3), "former")
+    try:
+        pwron = {"always": "always", "disable": "never"}.get(open(os.path.join(cfg, "storage", "pwron.status")).read().strip(), pwron)
+    except OSError:
+        pass
+    s["power"] = {"spindown_min": mins or num(pw.get("pwr_turnOffHD", 0), 0),
+                  "wol": bool(pw.get("pwr_wol", 0)) or os.path.exists(os.path.join(cfg, "wol.status")),
+                  "pwron": pwron, "schedule_active": num(pw.get("pwrsch_default_onoff", 0), 0) == 1,
+                  "schedule": stock_power_schedule(cfg, unsupported)}
+    # stock: apcupsd always runs; BATTERYLEVEL = pwr_minimumUPSCapacity (percent)
+    cap = num(pw.get("pwr_minimumUPSCapacity", 5), 5)
+    sv["ups"] = {"active": True, "min_capacity": cap if 0 < cap <= 95 else 5}
+    try:
+        for line in open(os.path.join(cfg, "storage", "extuuid.table"), errors="replace"):
+            if "|" in line:
+                name, uuid = line.strip().rsplit("|", 1)
+                if name and uuid:
+                    s["usb"]["names"][uuid] = name
+    except OSError:
+        pass
+    # UPnP port forwarding (upnp.db upnpInfo: wan_port -1 = off)
+    if os.path.isfile(os.path.join(cfg, "upnp.db")):
+        c = sqlite3.connect("file:%s?mode=ro" % os.path.join(cfg, "upnp.db"), uri=True)
+        try:
+            for svc, wan in c.execute("SELECT service, wan_port FROM upnpInfo"):
+                if num(wan, -1) > 0:
+                    if svc in ("HTTP", "HTTPS", "FTP", "SSH", "WEBDAV_HTTP", "WEBDAV_HTTPS", "WEBPUBLISHING_HTTP", "MEDIASERVER"):
+                        s["upnp"]["services"][svc] = num(wan, -1)
+                    else:
+                        unsupported.append("UPnP-Weiterleitung %s (WAN %s) nicht übernommen" % (svc, wan))
+        except sqlite3.Error:
+            pass
+        c.close()
+    # COPY/SYNC button (copy_sync_btn_main_model): "share|backup|direction|newdir" and "share|backup|direction"
+    for kind, table in (("copy", "usbcopy.table"), ("sync", "usbzync.table")):
+        try:
+            f = (open(os.path.join(cfg, "storage", table), errors="replace").read().strip().split("|") + [""] * 4)[:4]
+        except OSError:
+            continue
+        c = s["copybtn"][kind]
+        c["share_path"], c["bak_path"] = f[0].strip(), f[1].strip()
+        if f[2].strip() in (("cp2Vol", "cp2USB") if kind == "copy" else ("sync2USB", "sync2Vol", "twoWay")):
+            c["direction"] = f[2].strip()
+        if kind == "copy" and f[3].strip() in ("y", "n"):
+            c["newdir"] = f[3].strip() == "y"
+    s["unsupported"] = unsupported
+    return s
+
+
+def stock_power_schedule(cfg, unsupported):
+    """Power on/off/reboot jobs (backupjob.db BackupJobScheduler type 6/7/8;
+    TimeType 0 daily, 1 weekly, 2 monthly by day, 3 monthly by week)."""
+    db = os.path.join(cfg, "backupjob.db")
+    out = []
+    if not os.path.isfile(db):
+        return out
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        rows = c.execute("SELECT type, TimeType, StartTime, DayOfWeek, DayOfMonth FROM BackupJobScheduler "
+                         "WHERE type IN ('6','7','8')").fetchall()
+    except sqlite3.Error:
+        rows = []
+    c.close()
+    import datetime
+    for typ, tt, start, dow, dom in rows:
+        action = {"6": "on", "7": "off", "8": "reboot"}[str(typ)]
+        try:
+            t = datetime.datetime.fromtimestamp(int(start))
+        except (TypeError, ValueError):
+            unsupported.append("Zeitplan-Eintrag ohne lesbare Startzeit")
+            continue
+        base = {"action": action, "hour": t.hour, "minute": t.minute}
+        if str(tt) == "0":
+            out.append(dict(base, kind="daily"))
+        elif str(tt) == "1":
+            days = [int(x) for x in str(dow or "").replace(";", ",").split(",") if x.strip().isdigit()]
+            for d in days or [t.isoweekday() % 7]:
+                out.append(dict(base, kind="weekly", day=(d + 6) % 7))       # stock 0 = Sunday
+        elif str(tt) == "2":
+            out.append(dict(base, kind="monthly", mday=num(dom, t.day)))
+        else:
+            unsupported.append("Zeitplan „monatlich nach Woche“ (%s) nicht übernommen" % action)
+    return out
+
+
+def cmd_import_stock(args):
+    if not args:
+        die("usage: import-stock CONFIG [--force]")
+    if "--once" in args and os.path.exists(SETTINGS):
+        cur = load()
+        # imported before (marker; older systems: the list of stock features
+        # not taken over only exists after an import): keep the Desk's changes
+        if cur.get("stock_imported") or cur.get("unsupported"):
+            log("settings were taken over from the stock configuration before: kept")
+            return
+    elif os.path.exists(SETTINGS) and "--force" not in args:
+        die("%s exists (use --force)" % SETTINGS)
+    s = stock_to_settings(args[0])
+    s["stock_imported"] = int(time.time())
+    save(s)
+    # stock HTTPS certificate (CA_main_model: /etc/zyxel/cert/default.cer + key/default_key.cer):
+    # keep it, browsers that trusted it keep trusting the NAS
+    crt, key = os.path.join(args[0], "cert", "default.cer"), os.path.join(args[0], "cert", "key", "default_key.cer")
+    tls = os.path.join(os.path.dirname(SETTINGS), "tls")
+    if os.path.isfile(crt) and os.path.isfile(key) and not os.path.exists(os.path.join(tls, "untrash.key")):
+        os.makedirs(tls, mode=0o700, exist_ok=True)
+        shutil.copyfile(crt, os.path.join(tls, "untrash.crt"))
+        with open(os.open(os.path.join(tls, "untrash.key"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            f.write(open(key, "rb").read())
+        log("stock certificate taken over: %s" % tls)
+    log("settings from the stock configuration: %s" % SETTINGS)
+    for u in s["unsupported"]:
+        log("  not taken over: " + u)
+
+
+# ----------------------------------------------------------------- render
+
+def w(root, path, text, mode=0o644):
+    p = root + path
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".untrash-tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, p)
+
+
+def rm(root, path):
+    try:
+        os.unlink(root + path)
+    except FileNotFoundError:
+        pass
+
+
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+ADDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def share_paths(root=""):
+    """{share: path} of the enabled stock shares (takeover database)."""
+    db = root + STOCK_CONFIG + "/ugs_conf.db"
+    if not os.path.isfile(db):
+        return {}
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        return {n: p for n, p, e in c.execute("SELECT s_name, s_path, s_enable FROM smb_share") if e == "y"}
+    finally:
+        c.close()
+
+
+def render(s, root=""):
+    out = []
+    hn = s["hostname"] if HOSTNAME_RE.match(s["hostname"]) else "zyxel-untrash"
+    w(root, "/etc/hostname", hn + "\n")
+    w(root, "/etc/hosts", "127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n" % hn)
+    out.append("hostname " + hn)
+
+    tz = s["time"]["timezone"]
+    if os.path.isfile(os.path.join(ZONEINFO, tz)):
+        rm(root, "/etc/localtime")
+        os.makedirs(root + "/etc", exist_ok=True)
+        os.symlink("/usr/share/zoneinfo/" + tz, root + "/etc/localtime")
+        w(root, "/etc/timezone", tz + "\n")
+        out.append("timezone " + tz)
+    srv = s["time"]["ntp_server"].strip()
+    if s["time"]["ntp"] and re.fullmatch(r"[A-Za-z0-9.-]+", srv):
+        kind = "pool" if "pool" in srv else "server"
+        w(root, "/etc/chrony/sources.d/untrash.sources", "%s %s iburst\n" % (kind, srv))
+    else:
+        w(root, "/etc/chrony/sources.d/untrash.sources", "# NTP off (UntrashOS settings)\n")
+    # Debian's default pool stays out: only the configured server
+    w(root, "/etc/chrony/conf.d/10-untrash.conf",
+      "# UntrashOS: time sources only from sources.d (untrash-config)\nsourcedir /etc/chrony/sources.d\n")
+
+    net = s["network"]
+    dev = os.path.exists(root + DEV_PROFILE)
+    for ifn in ("eth0", "eth1"):
+        c = net.get(ifn) or {}
+        lines = ["# untrash-config (UntrashOS settings); regenerated, do not edit", "[Match]", "Name=" + ifn, "",
+                 "[Link]", "MTUBytes=%d" % int(c.get("mtu") or 1500), "", "[Network]"]
+        if c.get("mode") == "static" and ADDR_RE.match(c.get("address", "")):
+            lines.append("Address=" + c["address"])
+            if IP_RE.match(c.get("gateway") or ""):
+                lines.append("Gateway=" + c["gateway"])
+        else:
+            lines.append("DHCP=ipv4")
+        if ifn == "eth0" and dev:
+            lines.append("Address=169.254.100.64/1")
+        lines += ["LinkLocalAddressing=ipv4", "IPv6AcceptRA=no", "MulticastDNS=no"]
+        dns = [x for x in net["dns"]["servers"] if IP_RE.match(x)]
+        if not net["dns"]["auto"]:
+            lines += ["DNS=" + x for x in dns]
+        if c.get("mode") != "static" or not ADDR_RE.match(c.get("address", "")):
+            lines += ["", "[DHCPv4]", "UseDomains=no", "UseDNS=%s" % ("yes" if net["dns"]["auto"] else "no"),
+                      "ClientIdentifier=mac"]
+        w(root, "/etc/systemd/network/05-untrash-%s.network" % ifn, "\n".join(lines) + "\n")
+    bond = net["bond"]
+    if bond["active"] and bond["slaves"]:
+        # stock bond_setting_apply: bonding mode=N miimon=100, IP on bond0
+        w(root, "/etc/systemd/network/04-untrash-bond0.netdev", "# untrash-config: link aggregation (stock bond0)\n"
+          "[NetDev]\nName=bond0\nKind=bond\n\n[Bond]\nMode=%s\nMIIMonitorSec=100ms\n" % BOND_MODES[int(bond["mode"]) % 7]
+          + ("TransmitHashPolicy=layer2+3\n" if int(bond["mode"]) in (2, 4) else ""))
+        for ifn in bond["slaves"]:
+            w(root, "/etc/systemd/network/05-untrash-%s.network" % ifn,
+              "# untrash-config: %s is a link of bond0\n[Match]\nName=%s\n\n[Network]\nBond=bond0\n" % (ifn, ifn))
+        c = {"mode": bond["mode_ip"], "address": bond["address"], "gateway": bond["gateway"], "mtu": bond["mtu"]}
+        lines = ["# untrash-config: bond0 address (stock bond0 settings)", "[Match]", "Name=bond0", "", "[Link]",
+                 "MTUBytes=%d" % int(c["mtu"] or 1500), "", "[Network]"]
+        if c["mode"] == "static" and ADDR_RE.match(c["address"]):
+            lines.append("Address=" + c["address"])
+            if IP_RE.match(c["gateway"] or ""):
+                lines.append("Gateway=" + c["gateway"])
+        else:
+            lines.append("DHCP=ipv4")
+        lines += ["LinkLocalAddressing=ipv4", "IPv6AcceptRA=no", "MulticastDNS=no"]
+        if not net["dns"]["auto"]:
+            lines += ["DNS=" + x for x in net["dns"]["servers"] if IP_RE.match(x)]
+        w(root, "/etc/systemd/network/05-untrash-bond0.network", "\n".join(lines) + "\n")
+        out.append("bond0 %s over %s" % (BOND_MODES[int(bond["mode"]) % 7], ",".join(bond["slaves"])))
+    else:
+        rm(root, "/etc/systemd/network/04-untrash-bond0.netdev")
+        rm(root, "/etc/systemd/network/05-untrash-bond0.network")
+    out.append("network eth0=%s eth1=%s" % (net["eth0"]["mode"], net["eth1"]["mode"]))
+
+    sv = s["services"]
+    ssh = sv["ssh"]
+    w(root, "/etc/ssh/sshd_config.d/20-untrash.conf",
+      "# untrash-config: stock SSH settings (admin logs in with his password, as under stock)\n"
+      "Port %d\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\n"
+      "AllowUsers root admin\nSubsystem sftp %s\n" % (int(ssh["port"]), "internal-sftp" if ssh["sftp"] else "/bin/false"))
+
+    f = sv["ftp"]
+    ftp = ["# untrash-config: stock FTP settings (pure-ftpd under stock)",
+           "listen=YES", "listen_ipv6=NO", "listen_port=%d" % int(f["port"]),
+           "anonymous_enable=%s" % ("YES" if f["anonymous"] else "NO"),
+           "local_enable=YES", "write_enable=YES", "local_umask=000", "anon_umask=000",
+           "anon_upload_enable=NO", "anon_mkdir_write_enable=NO",
+           "anon_root=/run/untrash/ftp/%s" % "pc-guest",
+           "chroot_local_user=YES", "allow_writeable_chroot=YES",
+           "user_sub_token=$USER", "local_root=/run/untrash/ftp/$USER",
+           "pam_service_name=untrash-ftp", "secure_chroot_dir=/run/vsftpd/empty",
+           "max_per_ip=%d" % max(1, int(f["conn_limit"])), "max_clients=%d" % max(10, int(f["conn_limit"]) * 10),
+           "idle_session_timeout=%d" % (int(f["idle_min"]) * 60),
+           "pasv_enable=YES", "pasv_min_port=%d" % int(f["pasv_min"]), "pasv_max_port=%d" % int(f["pasv_max"]),
+           "local_max_rate=%d" % (int(f["down_kbs"]) * 1024), "anon_max_rate=%d" % (int(f["anon_down_kbs"]) * 1024),
+           "utf8_filesystem=YES", "xferlog_enable=YES", "xferlog_std_format=NO", "vsftpd_log_file=/var/log/vsftpd.log"]
+    if f["tls"]:
+        ftp += ["ssl_enable=YES", "rsa_cert_file=/etc/untrash/tls/untrash.crt", "rsa_private_key_file=/etc/untrash/tls/untrash.key",
+                "allow_anon_ssl=YES", "force_local_logins_ssl=NO", "force_local_data_ssl=NO", "ssl_ciphers=HIGH"]
+    w(root, "/etc/vsftpd.conf", "\n".join(ftp) + "\n")
+    # FTP logins check the SMB password (stock users have no Unix password)
+    w(root, "/etc/pam.d/untrash-ftp",
+      "# untrash-config: FTP login with the user's SMB (NT hash) password\n"
+      "auth\trequired\tpam_exec.so quiet expose_authtok /usr/lib/untrash/untrash-checkpw\n"
+      "account\trequired\tpam_unix.so\n"
+      "session\trequired\tpam_exec.so quiet /usr/lib/untrash/untrash-ftp-view session\n")
+
+    nfs = sv["nfs"]
+    ex = ["# untrash-config: NFS exports (stock NFS package)"]
+    for e in nfs["exports"]:
+        if re.fullmatch(r"/[^\s]+", e.get("path", "")) and re.fullmatch(r"[\w.*/:-]+", e.get("clients", "*")):
+            opt = e.get("options") or "rw,sync,no_subtree_check"
+            if re.fullmatch(r"[\w,=-]+", opt):
+                ex.append("%s %s(%s)" % (e["path"], e.get("clients", "*"), opt))
+    w(root, "/etc/exports", "\n".join(ex) + "\n")
+
+    ms = sv["mediaserver"]
+    paths = share_paths(root)
+    dl = ["# untrash-config: media server (stock: shares published per media type)",
+          "port=8200", "friendly_name=%s" % hn, "db_dir=/var/cache/minidlna", "log_dir=/var/cache/minidlna",
+          "inotify=yes", "notify_interval=895", "serial=0", "model_number=1", "root_container=."]
+    for name, mask in sorted(ms["shares"].items()):
+        p = paths.get(name)
+        t = ("V" if mask & MEDIA_VIDEO else "") + ("P" if mask & MEDIA_PHOTO else "") + ("A" if mask & MEDIA_MUSIC else "")
+        if p and t and media_dir_used(root + p):
+            dl.append("media_dir=%s,%s" % (t, p))
+    w(root, "/etc/minidlna.conf", "\n".join(dl) + "\n")
+
+    sd = int(s["power"]["spindown_min"])
+    w(root, "/etc/default/hd-idle",
+      "# untrash-config: disk spin-down after %s (stock: hd-idle.conf)\nSTART_HD_IDLE=%s\nHD_IDLE_OPTS=\"-i %d\"\n" % (
+          "%d min" % sd if sd else "never", "true" if sd else "false", sd * 60))
+
+    render_extra(s, root, out)
+
+    w(root, "/etc/untrash/usb-names", "".join("%s|%s\n" % (n, u) for u, n in sorted(s["usb"]["names"].items())))
+    w(root, "/etc/untrash/recycle.env", "EXPIRE_DAYS=%d\n" % int(s["recycle"]["expire_days"]))
+    w(root, "/etc/untrash/smb-extra.json", json.dumps({
+        "time_machine": sv["time_machine"]["share"] if sv["time_machine"]["active"] else "",
+        "netbios": s["netbios"], "printers": bool(sv["printer"]["active"])}, indent=1) + "\n")
+    return out
+
+
+def q(v):
+    """Quoted value for inadyn/apcupsd-style config files."""
+    return '"%s"' % str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def render_extra(s, root, out):
+    """Services: DynDNS, mail, syslog, UPS, WebDAV."""
+    sv = s["services"]
+    d = sv["dyndns"]
+    if d["active"] and d["provider"] in DYNDNS and d["hostname"]:
+        w(root, "/etc/inadyn.conf", "# untrash-config: DynDNS (stock: inadyn)\nperiod = 600\n"
+          "provider %s {\n    username = %s\n    password = %s\n    hostname = %s\n}\n" % (
+              DYNDNS[d["provider"]], q(d["username"]), q(d["password"]), q(d["hostname"])), 0o600)
+        out.append("dyndns %s %s" % (d["provider"], d["hostname"]))
+    else:
+        w(root, "/etc/inadyn.conf", "# untrash-config: DynDNS off\n", 0o600)
+
+    m = s["notify"]["mail"]
+    w(root, "/etc/untrash/notify.json", json.dumps(dict(m, hostname=s["hostname"]), indent=1) + "\n", 0o600)
+    cal = {"hourly": "hourly", "daily": "*-*-* %02d:%02d:00" % (m["hour"], m["minute"]),
+           "weekly": "%s *-*-* %02d:%02d:00" % (WEEKDAYS[m["day"] % 7], m["hour"], m["minute"])}[m["schedule"]]
+    w(root, "/etc/systemd/system/untrash-log-report.timer",
+      "# untrash-config: log report by mail (stock maintenance.log.mail schedule)\n[Unit]\n"
+      "Description=UntrashOS: log report by mail\n\n[Timer]\nOnCalendar=%s\nPersistent=true\n\n"
+      "[Install]\nWantedBy=timers.target\n" % cal)
+    # alerts: md events and SMART go through untrash-notify
+    w(root, "/etc/mdadm/mdadm.conf", "# untrash-config: arrays are found by scanning; events -> untrash-notify\n"
+      "DEVICE partitions\nHOMEHOST <ignore>\nPROGRAM /usr/lib/untrash/untrash-notify\n")
+    w(root, "/etc/smartd.conf", "# untrash-config: SMART monitoring, warnings -> untrash-notify\n"
+      "DEVICESCAN -a -n standby,q -m <nomailer> -M exec /usr/lib/untrash/untrash-notify\n")
+
+    lg = s["notify"]["syslog"]
+    w(root, "/etc/untrash/syslog-forward.env", "SERVER=%s\nPORT=%d\n" % (
+        lg["server"] if re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", lg["server"] or "") else "", int(lg["port"] or 514)))
+    ss = sv["syslog_server"]
+    w(root, "/etc/untrash/syslog-server.json", json.dumps(ss, indent=1) + "\n")
+
+    u = sv["ups"]
+    w(root, "/etc/apcupsd/apcupsd.conf",
+      "# untrash-config: APC UPS over USB (stock apcupsd.conf; BATTERYLEVEL = minimum capacity)\n"
+      "UPSNAME untrash\nUPSCABLE usb\nUPSTYPE usb\nDEVICE\nLOCKFILE /var/lock\nSCRIPTDIR /etc/apcupsd\n"
+      "PWRFAILDIR /etc/apcupsd\nNOLOGINDIR /etc\nONBATTERYDELAY 6\nBATTERYLEVEL %d\nMINUTES 3\nTIMEOUT 0\n"
+      "ANNOY 0\nANNOYDELAY 0\nNOLOGON disable\nKILLDELAY 0\nNETSERVER on\nNISIP 127.0.0.1\nNISPORT 3551\n"
+      "EVENTSFILE /var/log/apcupsd.events\nEVENTSFILEMAX 10\n" % max(1, min(95, int(u["min_capacity"]))))
+    if u["active"]:
+        w(root, "/etc/untrash/ups.enabled", "")
+    else:
+        rm(root, "/etc/untrash/ups.enabled")
+
+    pr = sv["printer"]
+    w(root, "/etc/untrash/printers.json", json.dumps(pr, indent=1) + "\n")
+    if pr["active"]:
+        w(root, "/etc/untrash/printing.enabled", "")
+    else:
+        rm(root, "/etc/untrash/printing.enabled")
+    render_download(s, root, out)
+    render_webdav(s, root, out)
+
+
+def download_dirs(s, root=""):
+    """(download dir, watch dir) of the download service."""
+    d = s["services"]["download"]
+    base = share_paths(root).get(d["share"]) or "/i-data/sysvol/admin"
+    clean = lambda p: "/".join(x for x in str(p).split("/") if x not in ("", ".", ".."))  # noqa: E731
+    return (base.rstrip("/") + "/" + clean(d["folder"])).rstrip("/"), (base.rstrip("/") + "/" + clean(d["incoming"])).rstrip("/")
+
+
+def render_download(s, root, out):
+    """aria2 for the stock download service (HTTP/FTP/BitTorrent/magnet);
+    RPC only on localhost with a per-device secret (untrash-desk)."""
+    d = s["services"]["download"]
+    sec = root + "/etc/untrash/aria2.secret"
+    if not os.path.exists(sec):
+        w(root, "/etc/untrash/aria2.secret", os.urandom(16).hex() + "\n", 0o600)
+    secret = open(sec).read().strip()
+    ddir, _watch = download_dirs(s, root)
+    ratio = int(d["ratio"])
+    conf = ["# untrash-config: download service (stock dservice), aria2",
+            "dir=" + ddir, "continue=true", "file-allocation=none", "disk-cache=8M",
+            "enable-rpc=true", "rpc-listen-all=false", "rpc-listen-port=6800", "rpc-secret=" + secret,
+            "input-file=/var/lib/untrash/aria2.session", "save-session=/var/lib/untrash/aria2.session",
+            "save-session-interval=60", "force-save=false",
+            "max-concurrent-downloads=%d" % max(1, min(10, int(d["slots"]))),
+            "max-overall-download-limit=%dK" % max(0, int(d["dl_kbs"])),
+            "max-overall-upload-limit=%dK" % max(0, int(d["up_kbs"])),
+            "listen-port=%d" % int(d["bt_port"]), "dht-listen-port=%d" % int(d["bt_port"]),
+            "enable-dht=%s" % ("true" if d["dht"] else "false"), "bt-enable-lpd=true",
+            "bt-max-peers=%d" % max(2, min(450, int(d["max_conn"]))),
+            "seed-ratio=%s" % ("0.0" if ratio < 0 else "%.2f" % (ratio / 100.0)),
+            "on-download-complete=/usr/lib/untrash/untrash-downloads",
+            "log-level=warn", "console-log-level=warn"]
+    if int(d["seed_min"]) >= 0:
+        conf.append("seed-time=%d" % int(d["seed_min"]))
+    w(root, "/etc/untrash/aria2.conf", "\n".join(conf) + "\n", 0o600)
+    w(root, "/etc/untrash/downloads.json", json.dumps({"dir": ddir, "watch": download_dirs(s, root)[1],
+                                                        "period": d["period"], "notify": d["notify"]}) + "\n")
+    if d["active"]:
+        out.append("download service %s" % ddir)
+
+
+def share_rights(root=""):
+    """[(share, path, {user: rw|ro}, guest access)] with the stock/Samba rules
+    (untrash-import-zyxel user_access) for every user of the database."""
+    cfg = root + STOCK_CONFIG
+    if not os.path.isfile(cfg + "/ugs_conf.db"):
+        return []
+    spec = importlib.util.spec_from_loader("untrash_import_zyxel",
+                                           importlib.machinery.SourceFileLoader("untrash_import_zyxel", IMPORT_TOOL))
+    imp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(imp)
+    stock = imp.Stock(cfg)
+    access = {}
+    for _uid, uname, *_r in stock.users():
+        groups = [g for _gid, g, _t, _d in stock.groups() if uname in stock.members(g)]
+        if uname != imp.GUEST:
+            groups.append("everyone")
+        access[uname] = imp.user_access(stock, uname, groups)
+    out = []
+    for s_name, s_path, _ct, _d, enable, _b, _r in stock.shares():
+        if enable != "y":
+            continue
+        users = {u: a[s_name]["access"] for u, a in access.items()
+                 if u != imp.GUEST and s_name in a and a[s_name]["access"] in ("rw", "ro")}
+        guest = access.get(imp.GUEST, {}).get(s_name, {}).get("access", "deny")
+        out.append((s_name, s_path, users, guest))
+    return out
+
+
+def render_webdav(s, root, out):
+    """Apache mod_dav like stock (httpd_dav.conf + parse_smb_conf.py):
+    http://NAS:5002/webdav/<share>, https on 5003; read methods for users with
+    ro or rw, the others only for rw; anonymous WebDAV opens the shares the
+    guest may use under Samba."""
+    wd = s["services"]["webdav"]
+    read_m = "GET HEAD OPTIONS PROPFIND REPORT"
+    conf = ["# untrash-config: WebDAV (stock: Apache mod_dav, ports %d/%d); regenerated" % (WEBDAV_PORT, WEBDAV_TLS_PORT),
+            "ServerRoot /etc/apache2", "ServerName localhost", "ServerTokens ProductOnly", "ServerSignature Off",
+            "PidFile /run/untrash-webdav/httpd.pid", "Mutex file:/run/untrash-webdav default",
+            "DefaultRuntimeDir /run/untrash-webdav", "User www-data", "Group www-data",
+            "ErrorLog syslog:daemon", "LogLevel warn", "TraceEnable off", "Timeout 300", "KeepAlive On"]
+    for mod in ("mpm_event", "authz_core", "authz_user", "authn_core", "auth_basic", "authnz_external",
+                "alias", "mime", "dav", "dav_fs", "dav_lock", "setenvif", "ssl", "socache_shmcb", "dir", "autoindex"):
+        conf.append("LoadModule %s_module /usr/lib/apache2/modules/mod_%s.so" % (mod, mod))
+    conf += ["TypesConfig /etc/mime.types", "Listen %d" % WEBDAV_PORT, "Listen %d" % WEBDAV_TLS_PORT,
+             "<VirtualHost *:%d>" % WEBDAV_TLS_PORT, "  SSLEngine on",
+             "  SSLCertificateFile /etc/untrash/tls/untrash.crt", "  SSLCertificateKeyFile /etc/untrash/tls/untrash.key",
+             "  SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1", "</VirtualHost>",
+             "DavLockDB /run/untrash-webdav/DavLock", "DefineExternalAuth untrash pipe /usr/lib/untrash/untrash-webdav-auth",
+             "BrowserMatch \"Microsoft Data Access Internet Publishing Provider\" redirect-carefully",
+             "BrowserMatch \"^WebDrive\" redirect-carefully", "BrowserMatch \"^WebDAVFS/1.[012]\" redirect-carefully",
+             "BrowserMatch \"^gnome-vfs\" redirect-carefully",
+             "<Location />", "  Require all denied", "</Location>"]
+    n = 0
+    for name, path, users, guest in (share_rights(root) if wd["active"] else []):
+        rw = sorted(u for u, a in users.items() if a == "rw")
+        anyone = sorted(users)
+        loc = "/webdav/" + name
+        conf += ["", "# [%s]" % name, "Alias %s %s" % (q(loc), q(path)),
+                 "<Directory %s>" % q(path), "  Options Indexes FollowSymLinks", "  AllowOverride None",
+                 "  DirectorySlash Off",
+                 "  Require all granted", "</Directory>",
+                 "<Location %s>" % q(loc), "  Dav On", "  DavMinTimeout 600", "  DavDepthInfinity on",
+                 "  IndexOptions Charset=UTF-8"]
+        if wd["anonymous"] and guest in ("ro", "rw"):
+            conf += ["  Require all granted"] if guest == "rw" else [
+                "  <Limit %s>" % read_m, "    Require all granted", "  </Limit>",
+                "  <LimitExcept %s>" % read_m, "    Require all denied", "  </LimitExcept>"]
+        elif anyone:
+            conf += ["  AuthType Basic", "  AuthName %s" % q("DAV-" + name), "  AuthBasicProvider external",
+                     "  AuthExternal untrash",
+                     "  <Limit %s>" % read_m, "    Require user %s" % " ".join(q(u) for u in anyone), "  </Limit>",
+                     "  <LimitExcept %s>" % read_m,
+                     "    Require user %s" % " ".join(q(u) for u in rw) if rw else "    Require all denied",
+                     "  </LimitExcept>"]
+        else:
+            conf.append("  Require all denied")
+        conf.append("</Location>")
+        n += 1
+    wp = s["services"]["webpublish"]
+    port = int(wp["port"])
+    if wp["active"] and port not in (80, WEBDAV_PORT, WEBDAV_TLS_PORT):
+        # stock web_publish_main_model: own port -> /MyWeb/<share> (public, read-only)
+        conf += ["", "# Web Publishing (stock: web_public shares under /MyWeb)", "Listen %d" % port,
+                 "<VirtualHost *:%d>" % port, "  <Location />", "    Require all denied", "  </Location>"]
+        for name, path in published_shares(root):
+            conf += ["  Alias %s %s" % (q("/MyWeb/" + name), q(path)),
+                     "  <Location %s>" % q("/MyWeb/" + name), "    Require all granted",
+                     "    <LimitExcept GET HEAD>", "      Require all denied", "    </LimitExcept>",
+                     "    Header always set Content-Security-Policy \"sandbox allow-scripts allow-forms allow-popups\"",
+                     "  </Location>", "  <Directory %s>" % q(path), "    Options Indexes", "    AllowOverride None",
+                     "    Require all granted", "  </Directory>"]
+        conf.append("</VirtualHost>")
+        out.append("web publishing on port %d" % port)
+    conf.insert(conf.index("LoadModule ssl_module /usr/lib/apache2/modules/mod_ssl.so"),
+                "LoadModule headers_module /usr/lib/apache2/modules/mod_headers.so")
+    w(root, "/etc/untrash/webdav/httpd.conf", "\n".join(conf) + "\n")
+    if wd["active"]:
+        out.append("webdav %d shares" % n)
+
+
+def published_shares(root=""):
+    db = root + STOCK_CONFIG + "/ugs_conf.db"
+    if not os.path.isfile(db):
+        return []
+    c = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        return sorted(c.execute("SELECT s_name, s_path FROM smb_share WHERE s_enable='y' AND web_public='y'"))
+    finally:
+        c.close()
+
+
+UNITS = {  # setting -> systemd units
+    "ssh": ["ssh.service"],
+    "ftp": ["vsftpd.service"],
+    "nfs": ["nfs-server.service"],
+    "mediaserver": ["minidlna.service"],
+    "spindown": ["hd-idle.service"],
+    "ntp": ["chrony.service"],
+    "dyndns": ["inadyn.service"],
+    "webdav": ["untrash-webdav.service"],
+    "printer": ["cups.service"],
+    "cloud": ["untrash-cloud.timer"],
+    "download": ["untrash-aria2.service", "untrash-downloads.timer"],
+    "upnp": ["untrash-upnp.timer"],
+    "power_tick": ["untrash-power-tick.timer"],
+    "iscsi": ["untrash-iscsi.service"],
+    "syslog_server": ["untrash-syslogd.service"],
+    "syslog_forward": ["untrash-syslog-forward.service"],
+    "mail_report": ["untrash-log-report.timer"],
+    "mail_alerts": ["mdmonitor.service", "smartmontools.service", "untrash-notify-check.timer"],
+}
+
+
+def media_dir_used(path):
+    """A media share is published only if its folder exists and holds anything
+    besides hidden entries (recycle bin): stock lists every share with a media
+    type, also empty ones and ones on volumes that are gone."""
+    try:
+        with os.scandir(path) as it:
+            return any(not e.name.startswith((".", "@")) for e in it)
+    except OSError:
+        return False
+
+
+def _lines(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.splitlines()
+
+
+def sync_units(s, restart):
+    """Bring the service units in line with the settings.
+
+    One enable and one disable call (--no-reload) for the units whose state
+    differs, then at most one daemon-reload; with restart, the wanted units
+    are (re)started and the others stopped without blocking.  A
+    daemon-reload per unit costs ~4 s each on the NAS, and a blocking restart
+    inside the boot transaction (stock takeover) would wait for units ordered
+    after itself."""
+    want = {}
+    for key, on in wanted(s).items():
+        for u in UNITS[key]:
+            want[u] = want.get(u, False) or on
+    units = sorted(want)
+    known = {l.split()[0] for l in _lines(["systemctl", "list-unit-files", "--no-legend", "--plain"] + units) if l.strip()}
+    for u in units:
+        if u not in known and want[u]:
+            log("WARNING %s is not installed (stays off)" % u)
+    units = [u for u in units if u in known]
+    state = dict(zip(units, _lines(["systemctl", "is-enabled"] + units))) if units else {}
+    en = [u for u in units if want[u] and state.get(u) not in ("enabled", "static", "alias", "indirect", "generated")]
+    dis = [u for u in units if not want[u] and state.get(u) == "enabled"]
+    if en:
+        subprocess.run(["systemctl", "enable", "--no-reload"] + en, check=False, stderr=subprocess.DEVNULL)
+    if dis:
+        subprocess.run(["systemctl", "disable", "--no-reload"] + dis, check=False, stderr=subprocess.DEVNULL)
+    if en or dis:
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+    on = [u for u in units if want[u]]
+    off = [u for u in units if not want[u]]
+    if restart:
+        if on:
+            subprocess.run(["systemctl", "restart", "--no-block"] + on, check=False)
+        if off:
+            subprocess.run(["systemctl", "stop", "--no-block"] + off, check=False)
+    log("units on: %s; off: %s%s" % (" ".join(on) or "-", " ".join(off) or "-",
+                                       "; changed: " + " ".join(en + dis) if en or dis else ""))
+
+
+def config_lock():
+    """One apply/boot at a time (the Desk starts one per saved window)."""
+    import fcntl
+    os.makedirs(RUN_DIR, exist_ok=True)
+    f = open(os.path.join(RUN_DIR, "untrash-config.lock"), "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def wanted(s):
+    sv = s["services"]
+    # dev images keep SSH for the operator's key, whatever the stock had
+    return {"ssh": sv["ssh"]["active"] or os.path.exists(DEV_PROFILE) or os.path.isfile(SERVICE_KEYS), "ftp": sv["ftp"]["active"], "nfs": sv["nfs"]["active"],
+            "mediaserver": sv["mediaserver"]["active"], "spindown": s["power"]["spindown_min"] > 0,
+            "ntp": s["time"]["ntp"], "dyndns": sv["dyndns"]["active"] and sv["dyndns"]["provider"] in DYNDNS,
+            "webdav": sv["webdav"]["active"] or (sv["webpublish"]["active"] and int(sv["webpublish"]["port"]) != 80),
+            "printer": sv["printer"]["active"],
+            "cloud": any(j.get("active") for j in s.get("cloud", {}).get("jobs", [])),
+            "download": sv["download"]["active"],
+            "power_tick": s["power"]["schedule_active"] and any(e.get("action") in ("off", "reboot")
+                                                                 for e in s["power"]["schedule"]),
+            "iscsi": any(t.get("active") for t in s.get("iscsi", {}).get("targets", [])),
+            "upnp": any(int(v) > 0 for v in s.get("upnp", {}).get("services", {}).values()), "syslog_server": sv["syslog_server"]["active"] and bool(sv["syslog_server"]["path"]),
+            "syslog_forward": s["notify"]["syslog"]["active"] and bool(s["notify"]["syslog"]["server"]),
+            "mail_report": s["notify"]["mail"]["active"] and bool(s["notify"]["mail"]["log_to"]),
+            "mail_alerts": s["notify"]["mail"]["active"] and s["notify"]["mail"]["alerts"] and bool(s["notify"]["mail"]["alerts_to"])}
+
+
+def cmd_apply(args):
+    _lock = config_lock()  # noqa: F841 - held until the process ends
+    s = load()
+    for line in render(s):
+        log("render: " + line)
+    subprocess.run(["hostname", s["hostname"]], check=False)
+    if (s["services"]["ftp"]["active"] and s["services"]["ftp"]["tls"]) or s["services"]["webdav"]["active"] \
+            or s["services"]["https"]["active"]:
+        subprocess.run(["/usr/lib/untrash/untrash-tls"], check=False)
+    sync_units(s, restart=True)
+    subprocess.run(["networkctl", "reload"], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["/usr/lib/untrash/untrash-power", "boot"], check=False)     # power loss, WoL
+    if s["services"]["smb"] and os.path.exists("/etc/untrash/zyxel/takeover.json"):
+        subprocess.run(["/usr/sbin/untrash-import-zyxel", "render", STOCK_CONFIG, "--out", "/etc/samba/smb.conf"],
+                       check=False)
+        subprocess.run(["systemctl", "reload-or-restart", "smbd.service"], check=False)
+
+
+def cmd_reset_network(args):
+    """RESET button ~2 s (stock): network back to DHCP; untrash-desk then lets
+    the admin password be set without login for 15 minutes."""
+    s = load()
+    for ifn in ("eth0", "eth1"):
+        s["network"][ifn] = copy.deepcopy(DEFAULTS["network"][ifn])
+    s["network"]["bond"]["active"] = False
+    s["network"]["dns"] = copy.deepcopy(DEFAULTS["network"]["dns"])
+    save(s)
+    os.makedirs(RUN_DIR, exist_ok=True)
+    open(os.path.join(RUN_DIR, "admin-reset"), "w").close()
+    if "--no-apply" not in args:
+        render(s)
+        subprocess.run(["networkctl", "reload"], check=False)
+        subprocess.run(["networkctl", "reconfigure", "eth0", "eth1"], check=False, stderr=subprocess.DEVNULL)
+    log("network reset to DHCP, admin password may be set at Untrash Desk for 15 minutes")
+
+
+def cmd_factory_reset(args):
+    """RESET button ~7 s (stock): every setting, user, group and share back to
+    the defaults; volumes and data stay.  The old configuration is kept in
+    /var/lib/untrash/factory-reset-<time>.tar (0600)."""
+    base = os.path.dirname(SETTINGS)
+    keep = [p for p in ("settings.json", "zyxel/stock-config/ugs_conf.db", "rclone.conf", "iscsi-secrets.json",
+                        "backup-secrets", "aria2.secret", "tls", "inadyn.conf") if os.path.exists(os.path.join(base, p))]
+    os.makedirs(STATE_LIB, exist_ok=True)
+    tar = os.path.join(STATE_LIB, "factory-reset-%s.tar" % __import__("time").strftime("%Y%m%d-%H%M%S"))
+    if keep:
+        subprocess.run(["tar", "-cf", tar, "-C", base] + keep, check=True)
+        os.chmod(tar, 0o600)
+    for p in keep:
+        full = os.path.join(base, p)
+        if os.path.isdir(full):
+            shutil.rmtree(full)
+        else:
+            os.unlink(full)
+    save(copy.deepcopy(DEFAULTS))
+    if "--no-apply" not in args:
+        r = subprocess.run(["pdbedit", "-L"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in r.stdout.splitlines():
+            subprocess.run(["pdbedit", "-x", "-u", line.split(":")[0]], check=False, stdout=subprocess.DEVNULL)
+        subprocess.run(["usermod", "-L", "admin"], check=False)
+        cmd_apply([])
+    os.makedirs(RUN_DIR, exist_ok=True)
+    open(os.path.join(RUN_DIR, "admin-reset"), "w").close()
+    log("factory reset done (old configuration: %s); Untrash Desk shows the first setup" % tar)
+
+
+def cmd_shares_changed(args):
+    """Shares or rights changed (untrash-desk): WebDAV follows them."""
+    s = load()
+    out = []
+    render_webdav(s, "", out)
+    if s["services"]["webdav"]["active"]:
+        subprocess.run(["systemctl", "try-reload-or-restart", "untrash-webdav.service"], check=False)
+
+
+def cmd_boot(args):
+    _lock = config_lock()  # noqa: F841
+    if not os.path.exists(SETTINGS):
+        s = load()
+        # the language chosen in the installer (ways B/C: /.untrash/language)
+        try:
+            lang = open(os.path.join(RUN_DIR, "host", ".untrash", "language")).read().strip()
+            if lang in LANGUAGES:
+                s["language"] = lang
+        except OSError:
+            pass
+        save(s)
+        log("no settings yet: defaults written to %s (language %s)" % (SETTINGS, s["language"]))
+    for line in render(load()):
+        log("render: " + line)
+    sync_units(load(), restart=False)
+    # admin may use sudo (web terminal, SSH); stock had no sudo at all
+    if subprocess.run(["getent", "passwd", "admin"], stdout=subprocess.DEVNULL).returncode == 0:
+        subprocess.run(["usermod", "-a", "-G", "sudo", "admin"], check=False, stderr=subprocess.DEVNULL)
+
+
+def cmd_get(args):
+    v = load()
+    for k in args[0].split(".") if args else []:
+        v = v[k]
+    print(json.dumps(v, indent=1))
+
+
+def cmd_set(args):
+    if len(args) != 2:
+        die("usage: set KEY JSON_VALUE")
+    s = load()
+    keys = args[0].split(".")
+    d = s
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+    d[keys[-1]] = json.loads(args[1])
+    save(s)
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        die(__doc__)
+    if a[0] == "import-stock":
+        cmd_import_stock(a[1:])
+    elif a[0] == "show":
+        print(json.dumps(load(), indent=1, sort_keys=True))
+    elif a[0] == "get":
+        cmd_get(a[1:])
+    elif a[0] == "set":
+        cmd_set(a[1:])
+    elif a[0] == "render":
+        root = a[a.index("--root") + 1] if "--root" in a else ""
+        for line in render(load(), root):
+            log(line)
+    elif a[0] == "apply":
+        cmd_apply(a[1:])
+    elif a[0] == "shares-changed":
+        cmd_shares_changed(a[1:])
+    elif a[0] == "reset-network":
+        cmd_reset_network(a[1:])
+    elif a[0] == "factory-reset":
+        cmd_factory_reset(a[1:])
+    elif a[0] == "boot":
+        cmd_boot(a[1:])
+    else:
+        die(__doc__)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Enable networkd + sshd; key-only root login (dev images).
+set -e
+mkdir -p "$BUILDROOT/etc/ssh/sshd_config.d"
+printf 'PermitRootLogin prohibit-password\nPasswordAuthentication no\n' >"$BUILDROOT/etc/ssh/sshd_config.d/10-untrash.conf"

@@ -1,0 +1,9 @@
+[Unit]
+Description=UntrashOS: download service time window and watch folder
+ConditionPathExists=/etc/untrash/downloads.json
+After=untrash-aria2.service
+Requisite=untrash-aria2.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/untrash/untrash-downloads tick

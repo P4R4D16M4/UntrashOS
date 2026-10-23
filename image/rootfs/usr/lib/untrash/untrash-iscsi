@@ -1,0 +1,265 @@
+#!/usr/bin/python3
+"""untrash-iscsi - iSCSI targets like the stock firmware (iscsi_main_model):
+kernel LIO, file LUNs in <volume>/.iscsi_Lun/<name>, port 3260, CHAP and
+mutual CHAP, optional initiator list ("mask"), up to 10 LUNs per target.
+Configured directly through configfs (no targetcli).
+
+Settings: /etc/untrash/settings.json "iscsi" {luns [{name, path, size_gb,
+write_cache}], targets [{name, iqn, luns [names], initiators [iqn],
+active}]}; CHAP secrets: /etc/untrash/iscsi-secrets.json (0600)
+{iqn: {user, password, mutual_user, mutual_password}}.
+
+  apply                          tear down what this tool set up, build the
+                                 settings (untrash-iscsi.service)
+  create-lun NAME VOLUME GB thin|thick   file in VOLUME/.iscsi_Lun (thin =
+                                 sparse like stock "sparse", thick = allocated)
+  delete-lun NAME                remove the file (refused while in a target)
+  status                         JSON: LUNs (size, allocated), targets, sessions
+  stop                           tear down
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+CFS = os.environ.get("ZT_ISCSI_CONFIGFS", "/sys/kernel/config/target")
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+SECRETS = os.environ.get("ZT_ISCSI_SECRETS", "/etc/untrash/iscsi-secrets.json")
+PORTAL = os.environ.get("ZT_ISCSI_PORTAL", "0.0.0.0:3260")
+HBA = "fileio_77"                  # our backstore HBA (stock: fileio_<n>)
+LUN_FOLDER = ".iscsi_Lun"
+ROOT = os.environ.get("ZT_ISCSI_ROOT", "")          # tests: paths below a test root
+MAX_LUN_NUM = 10
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+IQN_RE = re.compile(r"^(iqn\.\d{4}-\d{2}\.[a-z0-9.-]+(:[\w.:-]+)?|eui\.[0-9a-fA-F]{16})$")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def wr(path, value):
+    with open(path, "w") as f:
+        f.write(str(value))
+
+
+def settings():
+    try:
+        return json.load(open(SETTINGS)).get("iscsi") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def secrets():
+    try:
+        return json.load(open(SECRETS))
+    except (OSError, ValueError):
+        return {}
+
+
+def ensure_configfs():
+    if os.path.isdir(CFS + "/core"):
+        return
+    subprocess.run(["modprobe", "-a", "configfs", "target_core_mod", "target_core_file", "iscsi_target_mod"], check=False)
+    if not os.path.ismount("/sys/kernel/config") and CFS.startswith("/sys/kernel/config"):
+        subprocess.run(["mount", "-t", "configfs", "none", "/sys/kernel/config"], check=False)
+    os.makedirs(CFS, exist_ok=True)       # loads target_core_mod's tree
+    if not os.path.isdir(CFS + "/core"):
+        sys.exit("untrash-iscsi: LIO target not available in this kernel")
+    os.makedirs(CFS + "/iscsi", exist_ok=True)
+
+
+def teardown():
+    tdir = os.path.join(CFS, "iscsi")
+    for iqn in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
+        if not os.path.isdir(os.path.join(tdir, iqn)) or iqn in ("discovery_auth",):
+            continue
+        tp = os.path.join(tdir, iqn, "tpgt_1")
+        if not os.path.isdir(tp) or not open(os.path.join(tp, "param", "TargetAlias")).read().startswith("untrash:"):
+            continue                           # not ours
+        if True:
+            wr(tp + "/enable", 0)
+            for acl in os.listdir(tp + "/acls"):
+                for ml in os.listdir(os.path.join(tp, "acls", acl)):
+                    if ml.startswith("lun_"):
+                        d = os.path.join(tp, "acls", acl, ml)
+                        for x in os.listdir(d):
+                            if os.path.islink(os.path.join(d, x)):
+                                os.unlink(os.path.join(d, x))
+                        os.rmdir(d)
+                os.rmdir(os.path.join(tp, "acls", acl))
+            for lun in os.listdir(tp + "/lun"):
+                d = os.path.join(tp, "lun", lun)
+                for x in os.listdir(d):
+                    if os.path.islink(os.path.join(d, x)):
+                        os.unlink(os.path.join(d, x))
+                os.rmdir(d)
+            for np in os.listdir(tp + "/np"):
+                os.rmdir(os.path.join(tp, "np", np))
+            os.rmdir(tp)
+        os.rmdir(os.path.join(tdir, iqn))
+        log("target %s removed" % iqn)
+    hba = os.path.join(CFS, "core", HBA)
+    if os.path.isdir(hba):
+        for so in os.listdir(hba):
+            if os.path.isdir(os.path.join(hba, so)):
+                os.rmdir(os.path.join(hba, so))
+        os.rmdir(hba)
+
+
+def lun_path(l):
+    return ROOT + l["path"]
+
+
+def apply():
+    ensure_configfs()
+    teardown()
+    cfg, sec = settings(), secrets()
+    luns = {l["name"]: l for l in cfg.get("luns") or []}
+    used = {n for t in cfg.get("targets") or [] if t.get("active") for n in t.get("luns") or []}
+    hba = os.path.join(CFS, "core", HBA)
+    for n in sorted(used):
+        l = luns.get(n)
+        if not l or not os.path.isfile(lun_path(l)):
+            log("LUN %s missing (volume not mounted?)" % n)
+            continue
+        so = os.path.join(hba, n)
+        os.makedirs(so)
+        wr(so + "/control", "fd_dev_name=%s,fd_dev_size=%d%s" % (lun_path(l), os.path.getsize(lun_path(l)),
+                                                                  ",fd_buffered_io=1" if l.get("write_cache") else ""))
+        wr(so + "/wwn/vpd_unit_serial", "untrash-" + n)
+        wr(so + "/enable", 1)
+        if l.get("write_cache"):
+            try:
+                wr(so + "/attrib/emulate_write_cache", 1)
+            except OSError:
+                pass
+    for t in cfg.get("targets") or []:
+        if not t.get("active"):
+            continue
+        iqn = t["iqn"]
+        tp = os.path.join(CFS, "iscsi", iqn, "tpgt_1")
+        os.makedirs(tp)
+        wr(tp + "/param/TargetAlias", "untrash:" + t["name"])
+        os.makedirs(os.path.join(tp, "np", PORTAL))
+        lnum = []
+        for i, n in enumerate((t.get("luns") or [])[:MAX_LUN_NUM]):
+            if not os.path.isdir(os.path.join(hba, n)):
+                continue
+            d = os.path.join(tp, "lun", "lun_%d" % i)
+            os.makedirs(d)
+            os.symlink(os.path.join(hba, n), os.path.join(d, "untrash_" + n))
+            lnum.append(i)
+        a = sec.get(iqn) or {}
+        auth = bool(a.get("user") and a.get("password"))
+        inis = [x for x in t.get("initiators") or [] if IQN_RE.match(x)]
+        if inis:                                   # stock "mask": only these initiators
+            wr(tp + "/attrib/generate_node_acls", 0)
+            for ini in inis:
+                ad = os.path.join(tp, "acls", ini)
+                os.makedirs(ad)
+                for i in lnum:
+                    os.makedirs(os.path.join(ad, "lun_%d" % i))
+                    os.symlink(os.path.join(tp, "lun", "lun_%d" % i), os.path.join(ad, "lun_%d" % i, "map"))
+                if auth:
+                    wr(ad + "/auth/userid", a["user"])
+                    wr(ad + "/auth/password", a["password"])
+                    if a.get("mutual_user") and a.get("mutual_password"):
+                        wr(ad + "/auth/userid_mutual", a["mutual_user"])
+                        wr(ad + "/auth/password_mutual", a["mutual_password"])
+        else:                                      # every initiator (demo mode), CHAP on the TPG
+            wr(tp + "/attrib/generate_node_acls", 1)
+            wr(tp + "/attrib/cache_dynamic_acls", 1)
+            wr(tp + "/attrib/demo_mode_write_protect", 0)
+            if auth:
+                wr(tp + "/auth/userid", a["user"])
+                wr(tp + "/auth/password", a["password"])
+                if a.get("mutual_user") and a.get("mutual_password"):
+                    wr(tp + "/auth/userid_mutual", a["mutual_user"])
+                    wr(tp + "/auth/password_mutual", a["mutual_password"])
+        wr(tp + "/attrib/authentication", 1 if auth else 0)
+        wr(tp + "/enable", 1)
+        log("target %s: %d LUN(s), %s, %s" % (iqn, len(lnum), "CHAP" if auth else "no CHAP",
+                                              ", ".join(inis) if inis else "all initiators"))
+    return 0
+
+
+def create_lun(name, volume, gb, mode):
+    if not NAME_RE.match(name) or not gb.isdigit() or not 1 <= int(gb) <= 16383 or mode not in ("thin", "thick"):
+        sys.exit("untrash-iscsi: name / size / thin|thick")
+    d = os.path.join(volume, LUN_FOLDER)
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, name)
+    if os.path.exists(p):
+        sys.exit("untrash-iscsi: LUN file exists")
+    size = int(gb) << 30
+    st = os.statvfs(volume)
+    if mode == "thick" and size > st.f_bavail * st.f_frsize:
+        sys.exit("untrash-iscsi: not enough space")
+    with open(p, "wb") as f:
+        if mode == "thick":
+            os.posix_fallocate(f.fileno(), 0, size)
+        else:
+            f.truncate(size)
+    os.chmod(p, 0o600)
+    print(json.dumps({"name": name, "path": p, "size_gb": int(gb)}))
+    return 0
+
+
+def status():
+    cfg = settings()
+    out = {"luns": [], "targets": []}
+    for l in cfg.get("luns") or []:
+        try:
+            st = os.stat(lun_path(l))
+            out["luns"].append({"name": l["name"], "size": st.st_size, "allocated": st.st_blocks * 512, "present": True})
+        except OSError:
+            out["luns"].append({"name": l["name"], "present": False})
+    for t in cfg.get("targets") or []:
+        tp = os.path.join(CFS, "iscsi", t["iqn"], "tpgt_1")
+        sess = ""
+        try:
+            sess = open(tp + "/dynamic_sessions").read().strip()
+        except OSError:
+            pass
+        acl_sess = []
+        for ini in t.get("initiators") or []:
+            try:
+                acl_sess.append(open(os.path.join(tp, "acls", ini, "info")).read().strip().splitlines()[0])
+            except (OSError, IndexError):
+                pass
+        out["targets"].append({"iqn": t["iqn"], "running": os.path.isdir(tp) and open(tp + "/enable").read().strip() == "1"
+                               if os.path.isdir(tp) else False, "sessions": [x for x in sess.split("\x00") if x] + acl_sess})
+    print(json.dumps(out))
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["apply"]:
+        return apply()
+    if a == ["stop"]:
+        if os.path.isdir(CFS):
+            teardown()
+        return 0
+    if a[:1] == ["create-lun"] and len(a) == 5:
+        return create_lun(*a[1:])
+    if a[:1] == ["delete-lun"] and len(a) == 2:
+        cfg = settings()
+        if any(a[1] in (t.get("luns") or []) for t in cfg.get("targets") or []):
+            sys.exit("untrash-iscsi: LUN is used by a target")
+        for l in cfg.get("luns") or []:
+            if l["name"] == a[1] and os.path.isfile(lun_path(l)) and LUN_FOLDER in lun_path(l):
+                os.unlink(lun_path(l))
+                print("{}")
+                return 0
+        sys.exit("untrash-iscsi: unknown LUN")
+    if a == ["status"]:
+        return status()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

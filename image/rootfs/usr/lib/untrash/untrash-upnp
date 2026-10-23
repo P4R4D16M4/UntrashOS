@@ -1,0 +1,96 @@
+#!/usr/bin/python3
+"""untrash-upnp - port forwarding on the router via UPnP IGD (stock
+upnp_main_model, /etc/zyxel/upnp.db upnpInfo: service, LAN port, WAN port).
+
+  untrash-upnp apply     map every configured service (settings "upnp.services"
+                         {service: WAN port}), remove our old mappings
+                         (untrash-upnp.timer renews them)
+  untrash-upnp status    JSON {router, external_ip, mappings [...]}
+LAN ports come from the current settings (Desk 80/HTTPS, FTP, SSH, WebDAV,
+Web Publishing, media server).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+UPNPC = os.environ.get("ZT_UPNPC", "upnpc")
+TAG = "UntrashOS "
+
+
+def settings():
+    try:
+        return json.load(open(SETTINGS))
+    except (OSError, ValueError):
+        return {}
+
+
+def lan_ports(s):
+    sv = s.get("services", {})
+    hs = sv.get("https") or {}
+    wp = sv.get("webpublish") or {}
+    return {"HTTP": 80, "HTTPS": int(hs.get("port", 443)) if isinstance(hs, dict) else 443,
+            "FTP": int((sv.get("ftp") or {}).get("port", 21)), "SSH": int((sv.get("ssh") or {}).get("port", 22)),
+            "WEBDAV_HTTP": 5002, "WEBDAV_HTTPS": 5003, "WEBPUBLISHING_HTTP": int(wp.get("port", 80) or 80),
+            "MEDIASERVER": 8200}
+
+
+def upnpc(*a):
+    r = subprocess.run([UPNPC] + list(a), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    return r.returncode, r.stdout
+
+
+def status():
+    rc, out = upnpc("-l")
+    m = re.search(r"ExternalIPAddress = (\S+)", out)
+    lan = re.search(r"Local LAN ip address : (\S+)", out)
+    router = re.search(r"Found valid IGD : (\S+)", out)
+    maps = []
+    for line in out.splitlines():
+        x = re.match(r"\s*\d+\s+(TCP|UDP)\s+(\d+)->([\d.]+):(\d+)\s+'([^']*)'", line)
+        if x:
+            maps.append({"proto": x.group(1), "wan_port": int(x.group(2)), "ip": x.group(3), "lan_port": int(x.group(4)),
+                         "description": x.group(5), "ours": x.group(5).startswith(TAG)})
+    return {"router": router.group(1) if router else "", "external_ip": m.group(1) if m else "",
+            "lan_ip": lan.group(1) if lan else "", "mappings": maps}
+
+
+def apply():
+    s = settings()
+    want = {k: int(v) for k, v in ((s.get("upnp") or {}).get("services") or {}).items() if int(v) > 0}
+    st = status()
+    if not st["router"]:
+        print("no UPnP router found", flush=True)
+        return 1 if want else 0
+    ports = lan_ports(s)
+    rc = 0
+    for m in st["mappings"]:                     # stale mappings of this NAS
+        svc = m["description"][len(TAG):]
+        if m["ours"] and m["ip"] == st["lan_ip"] and want.get(svc) != m["wan_port"]:
+            upnpc("-d", str(m["wan_port"]), m["proto"])
+            print("removed %s %d" % (svc, m["wan_port"]), flush=True)
+    for svc, wan in sorted(want.items()):
+        if svc not in ports:
+            continue
+        r, out = upnpc("-e", TAG + svc, "-a", st["lan_ip"], str(ports[svc]), str(wan), "TCP", "0")
+        ok = r == 0 and "failed" not in out.lower()
+        rc |= 0 if ok else 1
+        print("%s %s LAN %d -> WAN %d" % ("mapped" if ok else "FAILED", svc, ports[svc], wan), flush=True)
+    return rc
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["apply"]:
+        return apply()
+    if a == ["status"]:
+        print(json.dumps(status()))
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

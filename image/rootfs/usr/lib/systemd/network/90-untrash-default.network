@@ -1,0 +1,15 @@
+# UntrashOS fallback for both ports (installer stick, before any settings):
+# DHCP, and an IPv4 link-local address when there is no DHCP server (cable
+# straight to a PC: the browser then finds zyxel-untrash.local by mDNS).
+# untrash-config writes /etc/systemd/network/05-untrash-ethN.network, which wins.
+[Match]
+Name=eth*
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=ipv4
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseDomains=no
+ClientIdentifier=mac

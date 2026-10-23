@@ -1,0 +1,21 @@
+# UntrashOS rootfs ownership fixups.  The unprivileged mkosi build
+# (no newuidmap) leaves every file owned by the build user; mkslot-erofs.sh
+# makes everything root:root under fakeroot, then applies
+# /var/lib/dpkg/statoverride from the image and this list.
+# Debian package files with a non-root group (setgid binaries, shadow files)
+# and directories systemd-tmpfiles would otherwise only fix at runtime.
+# path                          owner  group            mode
+/etc/shadow                     root   shadow           0640
+/etc/gshadow                    root   shadow           0640
+/usr/sbin/unix_chkpwd           root   shadow           2755
+/usr/bin/expiry                 root   shadow           2755
+/usr/bin/chage                  root   shadow           2755
+/usr/bin/ssh-agent              root   _ssh             2755
+/var/mail                       root   mail             2775
+/var/log/journal                root   systemd-journal  2755
+/var/local                      root   staff            2775
+# stock services (L5/L6): media server cache, NFS status monitor
+/var/cache/minidlna             minidlna minidlna       0755
+/var/lib/nfs                    statd  nogroup          0755
+/var/lib/nfs/sm                 statd  nogroup          0700
+/var/lib/nfs/sm.bak             statd  nogroup          0700

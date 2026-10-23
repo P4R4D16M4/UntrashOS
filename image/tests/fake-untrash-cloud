@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Test double of untrash-cloud for test-desk-host.py (real tool:
+test-cloud-host.py).  One account "Box" (dropbox); calls are logged to
+$ZT_DESK_ROOT/cloud-calls.log."""
+import json
+import os
+import sys
+
+R = os.environ.get("ZT_DESK_ROOT", "")
+a = sys.argv[1:]
+open(R + "/cloud-calls.log", "a").write(" ".join(a) + "\n")
+if a[:1] == ["remotes"]:
+    print(json.dumps([{"name": "Box", "type": "dropbox"}]))
+elif a[:1] == ["status"]:
+    print("{}")
+elif a[:1] == ["auth-start"]:
+    print(json.dumps({"url": "https://www.dropbox.com/oauth2/authorize?x", "provider": a[1]}))
+elif a[:1] == ["auth-finish"]:
+    if "code=" not in a[2]:
+        print("untrash-cloud: Das ist nicht die Rücksprung-Adresse", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"name": a[1], "type": "dropbox"}))
+elif a[:1] in (["add-ftp"], ["delete"], ["run"]):
+    print("{}")
+else:
+    sys.exit(2)

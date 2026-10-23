@@ -1,0 +1,8 @@
+[Unit]
+Description=UntrashOS: password check (WebDAV)
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-authd
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal

@@ -1,0 +1,63 @@
+#!/usr/bin/python3
+"""FTP view of a user: /run/untrash/ftp/<user>/<share> = bind mounts of the
+shares the user may use, read-only where Samba gives read-only (stock rights,
+untrash-import-zyxel access).  Files are 0777 like under stock, so the binds
+are what enforces the share rights for FTP.
+  untrash-ftp-view build USER
+  untrash-ftp-view session   (pam_exec: PAM_USER, PAM_TYPE=open_session)"""
+import json
+import os
+import subprocess
+import sys
+
+BASE = "/run/untrash/ftp"
+CONFIG = "/etc/untrash/zyxel/stock-config"
+
+
+def mounted():
+    with open("/proc/self/mountinfo") as f:
+        return {l.split()[4].replace("\\040", " ") for l in f}
+
+
+def build(user):
+    if not user or "/" in user or user.startswith("."):
+        return 1
+    r = subprocess.run(["/usr/sbin/untrash-import-zyxel", "access", CONFIG, user],
+                       stdout=subprocess.PIPE, text=True)
+    if r.returncode:
+        return 1
+    acc = json.loads(r.stdout)
+    home = os.path.join(BASE, user)
+    os.makedirs(home, mode=0o755, exist_ok=True)
+    mnt = mounted()
+    for name in os.listdir(home):
+        p = os.path.join(home, name)
+        a = acc.get(name, {}).get("access", "deny")
+        if a == "deny" or not os.path.isdir(acc.get(name, {}).get("path", "")):
+            if p in mnt:
+                subprocess.run(["umount", "-l", p])
+            try:
+                os.rmdir(p)
+            except OSError:
+                pass
+    for name, info in acc.items():
+        if info["access"] == "deny" or not os.path.isdir(info["path"]) or "/" in name:
+            continue
+        p = os.path.join(home, name)
+        os.makedirs(p, exist_ok=True)
+        if p not in mnt:
+            subprocess.run(["mount", "--bind", info["path"], p], check=False)
+        ro = "ro" if info["access"] == "ro" else "rw"
+        subprocess.run(["mount", "-o", "remount,bind," + ro, p], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["build"] and len(a) == 2:
+        sys.exit(build(a[1]))
+    if a[:1] == ["session"]:
+        if os.environ.get("PAM_TYPE") == "open_session":
+            sys.exit(build(os.environ.get("PAM_USER", "")))
+        sys.exit(0)
+    sys.exit(__doc__)

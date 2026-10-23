@@ -1,0 +1,54 @@
+#!/bin/sh
+# untrash-boot-health  (untrash-mark-good.service, 60 s after boot)
+#
+# Confirms the running slot to the loader only when the system is really
+# usable, i.e. its network works: an Ethernet port has carrier AND has received
+# packets.  Carrier alone proves nothing (the PHY reports it without the
+# network engine); received packets only arrive when PFE driver and firmware
+# deliver to the host.  A home network sends some (ARP, mDNS) within seconds.
+#
+# Not healthy after ZT_HEALTH_WAIT seconds (default 600):
+#   - slot already confirmed (good = booting): nothing happens (cable out?)
+#   - new, unconfirmed slot (after an update): reboot; the loader counts the
+#     try and after three takes the previous slot again
+# Tests: ZT_HEALTH_SYS (sysfs root), ZT_HEALTH_WAIT, ZT_HEALTH_STEP,
+# ZT_HEALTH_BOOTSTATE (command), ZT_HEALTH_REBOOT (command).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+SYS=${ZT_HEALTH_SYS:-/sys}
+WAIT=${ZT_HEALTH_WAIT:-600}; STEP=${ZT_HEALTH_STEP:-5}
+BOOTSTATE=${ZT_HEALTH_BOOTSTATE:-/usr/lib/untrash/untrash-bootstate}
+REBOOT=${ZT_HEALTH_REBOOT:-systemctl reboot}
+log() { echo "untrash-boot-health: $*"; { echo "UNTRASH: boot health: $*" >/dev/kmsg; } 2>/dev/null; true; }
+
+healthy() {
+	for n in "$SYS"/class/net/eth*; do
+		[ -e "$n/carrier" ] || continue
+		[ "$(cat "$n/carrier" 2>/dev/null)" = 1 ] || continue
+		rx=$(cat "$n/statistics/rx_packets" 2>/dev/null || echo 0)
+		[ "$rx" -ge 3 ] && { HEALTHY_IF=${n##*/}; return 0; }
+	done
+	return 1
+}
+
+state=$($BOOTSTATE show 2>&1) || { log "$state"; exit 0; }
+case $state in *"installer stick"*) log "installer stick: nothing to confirm"; exit 0 ;; esac
+
+t=0
+while :; do
+	if healthy; then
+		log "network up on $HEALTHY_IF: slot confirmed"
+		exec $BOOTSTATE mark-good
+	fi
+	[ "$t" -ge "$WAIT" ] && break
+	sleep "$STEP"; t=$((t + STEP))
+done
+
+good=$(echo "$state" | sed -n 's/.*good=\([ab-]\).*/\1/p')
+booting=$(echo "$state" | sed -n 's/.*booting=\([ab-]\).*/\1/p')
+if [ -n "$booting" ] && [ "$good" = "$booting" ]; then
+	log "no network after ${WAIT}s, slot $booting is already confirmed: no action"
+	exit 1
+fi
+log "no network after ${WAIT}s on the unconfirmed slot $booting: reboot (the loader falls back after 3 tries)"
+$REBOOT
+exit 1

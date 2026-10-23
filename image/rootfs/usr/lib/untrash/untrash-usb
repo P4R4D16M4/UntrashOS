@@ -1,0 +1,127 @@
+#!/usr/bin/python3
+"""USB volumes like the stock firmware (decompiled storage_func
+GetExtVolUUID/MountFileSystem): mount point /e-data/<md5 of the blkid UUID>
+(md5 of the first sector when there is no UUID), the stock mount options per
+filesystem, chmod 777; the stock names stay in /etc/untrash/usb-names
+(extuuid.table).  After a change Samba is re-rendered, so stock shares on USB
+volumes (s_path /e-data/<id>/...) appear and disappear with the stick.
+  untrash-usb add DEV | remove DEV | list
+Started by udev (60-untrash-usb.rules -> untrash-usb@<dev>.service)."""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.environ.get("ZT_IMPORT_EDATA", "/e-data")
+NAMES = "/etc/untrash/usb-names"
+STATE = "/run/untrash/usb.json"
+OPTS = {  # stock MountFileSystem
+    "vfat": ("vfat", "fmask=000,dmask=000,iocharset=utf8,shortname=mixed,uid=99,errors=continue"),
+    "exfat": ("exfat", "rw,fmask=000,dmask=000,iocharset=utf8,uid=99"),
+    "ntfs": ("ntfs3", "uid=99,gid=99,umask=000,iocharset=utf8"),
+    "iso9660": ("iso9660", "iocharset=utf8"),
+    "udf": ("udf", "iocharset=utf8"),
+    "ext2": ("ext2", "errors=continue"), "ext3": ("ext3", "errors=continue"), "ext4": ("ext4", "errors=continue"),
+    "hfsplus": ("hfsplus", "ro,uid=99"),
+    "xfs": ("xfs", ""), "btrfs": ("btrfs", ""), "f2fs": ("f2fs", ""),
+}
+
+
+def blkid(dev, tag):
+    r = subprocess.run(["blkid", "-p", "-o", "value", "-s", tag, dev], stdout=subprocess.PIPE, text=True)
+    return r.stdout.strip()
+
+
+def ext_id(dev):
+    uuid = blkid(dev, "UUID")
+    if uuid:
+        return hashlib.md5(uuid.encode()).hexdigest()
+    with open(dev, "rb") as f:
+        return hashlib.md5(f.read(512)).hexdigest()
+
+
+def state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(st, f)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def names():
+    out = {}
+    try:
+        for line in open(NAMES, errors="replace"):
+            if "|" in line:
+                n, u = line.strip().rsplit("|", 1)
+                out[u] = n
+    except OSError:
+        pass
+    return out
+
+
+def resmb():
+    if os.path.exists("/etc/untrash/zyxel/takeover.json"):
+        subprocess.run(["/usr/sbin/untrash-import-zyxel", "render", "/etc/untrash/zyxel/stock-config",
+                        "--out", "/etc/samba/smb.conf"], stdout=subprocess.DEVNULL)
+        subprocess.run(["smbcontrol", "smbd", "reload-config"], stderr=subprocess.DEVNULL)
+
+
+def add(dev):
+    if not re.fullmatch(r"/dev/sd[a-z]+\d*", dev):
+        return 1
+    fs = blkid(dev, "TYPE")
+    if fs not in OPTS:
+        print("untrash-usb: %s: no supported filesystem (%s)" % (dev, fs or "none"))
+        return 0
+    vid = ext_id(dev)
+    mnt = os.path.join(ROOT, vid)
+    os.makedirs(mnt, exist_ok=True)
+    t, o = OPTS[fs]
+    r = subprocess.run(["mount", "-t", t] + (["-o", o] if o else []) + [dev, mnt])
+    if r.returncode:
+        print("untrash-usb: mount %s (%s) failed" % (dev, fs))
+        return 1
+    if fs not in ("hfsplus", "iso9660", "udf"):
+        os.chmod(mnt, 0o777)
+    st = state()
+    st[dev] = {"id": vid, "fs": fs, "mnt": mnt, "name": names().get(vid, ""), "label": blkid(dev, "LABEL")}
+    save(st)
+    print("untrash-usb: %s (%s) at %s %s" % (dev, fs, mnt, st[dev]["name"]))
+    resmb()
+    return 0
+
+
+def remove(dev):
+    st = state()
+    e = st.pop(dev, None)
+    if e:
+        subprocess.run(["umount", "-l", e["mnt"]])
+        try:
+            os.rmdir(e["mnt"])
+        except OSError:
+            pass
+        save(st)
+        resmb()
+    return 0
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["add"] and len(a) == 2:
+        sys.exit(add(a[1]))
+    if a[:1] == ["remove"] and len(a) == 2:
+        sys.exit(remove(a[1]))
+    if a[:1] == ["list"]:
+        print(json.dumps(state(), indent=1))
+        sys.exit(0)
+    sys.exit(__doc__)

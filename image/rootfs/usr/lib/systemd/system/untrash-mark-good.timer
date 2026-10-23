@@ -1,0 +1,9 @@
+[Unit]
+Description=UntrashOS: confirm the slot once the system is healthy (from 60 s after boot)
+
+[Timer]
+OnBootSec=60s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

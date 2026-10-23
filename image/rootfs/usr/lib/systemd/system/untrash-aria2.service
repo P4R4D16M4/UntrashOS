@@ -1,0 +1,18 @@
+[Unit]
+Description=UntrashOS: download service (stock dservice; aria2, RPC on localhost)
+ConditionPathExists=/etc/untrash/aria2.conf
+After=network-online.target untrash-zyxel.service untrash-data.service
+Wants=network-online.target
+
+[Service]
+# downloaded files 0666/0777 like the stock Samba rules
+UMask=0000
+Nice=10
+IOSchedulingClass=idle
+ExecStartPre=/bin/sh -c 'mkdir -p /var/lib/untrash && touch /var/lib/untrash/aria2.session && mkdir -p "$(sed -n "s/^dir=//p" /etc/untrash/aria2.conf)"'
+ExecStart=/usr/bin/aria2c --conf-path=/etc/untrash/aria2.conf
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

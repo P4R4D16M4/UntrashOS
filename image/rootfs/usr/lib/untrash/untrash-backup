@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+"""untrash-backup - Backup Planner (stock BackupPlanner_main_model) with rsync.
+
+Job types (stock names): archive = versions (each run a dated folder,
+unchanged files hard-linked to the previous version, keep the newest N),
+sync = one-way mirror (target = source, deletions included), rsync = copy
+to an rsync server on another NAS/computer (rsync://host/module).
+Sources: folders on the NAS; targets: a NAS folder, a USB volume (/e-data)
+or an rsync server.  Settings: /etc/untrash/settings.json "backup.jobs";
+rsync server passwords: /etc/untrash/backup-secrets/<job id> (0600).
+
+  run [JOB_ID]                 due jobs (untrash-backup.timer) or one job now
+  versions JOB_ID              JSON list of archive versions
+  restore JOB_ID VERSION DEST  copy a version (or the mirror: VERSION "-")
+                               back into DEST (a NAS folder)
+  status                       JSON {job id: last result}
+"""
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+STATE = os.environ.get("ZT_BACKUP_STATE", "/var/lib/untrash/backup")
+SECRETS = os.environ.get("ZT_BACKUP_SECRETS", "/etc/untrash/backup-secrets")
+NOTIFY = os.environ.get("ZT_NOTIFY_TOOL", "/usr/lib/untrash/untrash-notify")
+VER_RE = re.compile(r"^\d{8}-\d{6}$")
+ROOT = os.environ.get("ZT_BACKUP_ROOT", "")          # tests: paths below a test root
+
+
+def jobs():
+    try:
+        return (json.load(open(SETTINGS)).get("backup") or {}).get("jobs") or []
+    except (OSError, ValueError):
+        return []
+
+
+def job(jid):
+    for j in jobs():
+        if j.get("id") == jid:
+            return j
+    sys.exit("untrash-backup: unknown job %s" % jid)
+
+
+def target_dir(j):
+    """Local target folder of a job: <target>/<job name>."""
+    return os.path.join(ROOT + j["target"]["path"], re.sub(r"[^\w .-]", "_", j["name"]) or j["id"])
+
+
+def due(j, now, last):
+    s = j.get("schedule") or {}
+    kind = s.get("kind", "manual")
+    if kind == "manual" or not j.get("active"):
+        return False
+    if kind == "hourly":
+        return now - last >= 3600 - 60
+    t = datetime.datetime.fromtimestamp(now)
+    slot = t.replace(hour=int(s.get("hour", 0)), minute=int(s.get("minute", 0)), second=0, microsecond=0)
+    if kind == "weekly" and t.weekday() != int(s.get("day", 0)) % 7:
+        return False
+    if kind == "monthly" and t.day != int(s.get("mday", 1)):
+        return False
+    return t >= slot and last < slot.timestamp()
+
+
+def rsync_cmd(j, extra):
+    cmd = ["rsync", "-rlt", "--no-perms", "--chmod=ugo=rwX", "--stats"] + extra
+    if int(j.get("bwlimit") or 0) > 0:
+        cmd.append("--bwlimit=%d" % int(j["bwlimit"]))
+    return cmd
+
+
+def run_job(j):
+    t0 = time.time()
+    os.umask(0)
+    log, rc = [], 0
+    srcs = [ROOT + s.rstrip("/") for s in j["sources"]]
+    missing = [s for s in srcs if not os.path.isdir(s)]
+    tgt = j["target"]
+    if missing:
+        rc, log = 1, ["Quelle fehlt: %s" % ", ".join(missing)]
+    elif tgt["kind"] == "local" and not os.path.isdir(os.path.dirname(ROOT + tgt["path"].rstrip("/"))):
+        rc, log = 1, ["Ziel fehlt: %s" % tgt["path"]]
+    elif tgt["kind"] == "usb" and not os.path.isdir(ROOT + tgt["path"]):
+        rc, log = 1, ["Ziel fehlt: %s (USB-Datenträger eingesteckt?)" % tgt["path"]]
+    elif tgt["kind"] == "rsync":
+        env = dict(os.environ)
+        try:
+            env["RSYNC_PASSWORD"] = open(os.path.join(SECRETS, j["id"])).read().rstrip("\n")
+        except OSError:
+            pass
+        url = "rsync://%s%s/%s/%s/" % (tgt.get("user") + "@" if tgt.get("user") else "", tgt["host"],
+                                      tgt["module"].strip("/"), re.sub(r"[^\w .-]", "_", j["name"]))
+        for s in srcs:
+            r = subprocess.run(rsync_cmd(j, ["--delete"] if j["type"] == "sync" else []) + [s, url], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            rc |= r.returncode
+            log += r.stdout.strip().splitlines()[-12:]
+    else:
+        base = target_dir(j)
+        os.makedirs(base, exist_ok=True)
+        if j["type"] == "archive":
+            vers = sorted(v for v in os.listdir(base) if VER_RE.match(v))
+            new = os.path.join(base, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+            tmp = new + ".partial"
+            link = ["--link-dest=" + os.path.join(base, vers[-1])] if vers else []
+            for s in srcs:
+                os.makedirs(tmp, exist_ok=True)
+                # source without trailing slash -> <version>/<folder>/...; --link-dest matches the same paths
+                r = subprocess.run(rsync_cmd(j, ["--delete"] + link) + [s, tmp + "/"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                rc |= r.returncode
+                log += r.stdout.strip().splitlines()[-12:]
+            if rc == 0:
+                os.rename(tmp, new)
+                keep = max(1, int(j.get("keep") or 7))
+                vers = sorted(v for v in os.listdir(base) if VER_RE.match(v))
+                for old in vers[:-keep]:
+                    shutil.rmtree(os.path.join(base, old), ignore_errors=True)
+                    log.append("alte Version %s gelöscht" % old)
+        else:
+            for s in srcs:
+                r = subprocess.run(rsync_cmd(j, ["--delete"]) + [s, base + "/"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+                rc |= r.returncode
+                log += r.stdout.strip().splitlines()[-12:]
+    res = {"id": j["id"], "time": int(t0), "seconds": int(time.time() - t0), "ok": rc == 0, "rc": rc, "log": log[-40:]}
+    os.makedirs(STATE, exist_ok=True)
+    json.dump(res, open(os.path.join(STATE, j["id"] + ".json"), "w"), indent=1)
+    print("%s %s: %s" % (j["id"], j["type"], "ok" if rc == 0 else "FAILED %d" % rc), flush=True)
+    if rc:
+        subprocess.run([NOTIFY, "alert", "Sicherung %s fehlgeschlagen" % j["name"], "\n".join(log[-15:])], check=False)
+    return res
+
+
+def cmd_run(jid=None):
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(os.path.join(STATE, "run.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if jid else fcntl.LOCK_NB))
+    except OSError:
+        return 0
+    rc = 0
+    now = time.time()
+    for j in jobs():
+        if jid and j["id"] != jid:
+            continue
+        if not jid:
+            try:
+                last = json.load(open(os.path.join(STATE, j["id"] + ".json"))).get("time", 0)
+            except (OSError, ValueError):
+                last = 0
+            if not due(j, now, last):
+                continue
+        rc |= 0 if run_job(j)["ok"] else 1
+    return rc
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["run"]:
+        return cmd_run(a[1] if len(a) > 1 else None)
+    if a[:1] == ["versions"] and len(a) == 2:
+        j = job(a[1])
+        base = target_dir(j) if j["target"]["kind"] != "rsync" else ""
+        vers = sorted((v for v in os.listdir(base) if VER_RE.match(v)), reverse=True) if base and os.path.isdir(base) else []
+        print(json.dumps(vers if j["type"] == "archive" else (["-"] if base and os.path.isdir(base) else [])))
+        return 0
+    if a[:1] == ["restore"] and len(a) == 4:
+        j, ver, dest = job(a[1]), a[2], ROOT + a[3]
+        if j["target"]["kind"] == "rsync":
+            sys.exit("untrash-backup: restore from an rsync server: not offered")
+        src = os.path.join(target_dir(j), ver) if j["type"] == "archive" else target_dir(j)
+        if (j["type"] == "archive" and not VER_RE.match(ver)) or not os.path.isdir(src):
+            sys.exit("untrash-backup: unknown version")
+        os.umask(0)
+        os.makedirs(dest, exist_ok=True)
+        r = subprocess.run(rsync_cmd(j, []) + [src + "/", dest.rstrip("/") + "/"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
+        print(r.stdout.strip()[-1500:])
+        return r.returncode
+    if a[:1] == ["status"]:
+        out = {}
+        for j in jobs():
+            try:
+                out[j["id"]] = json.load(open(os.path.join(STATE, j["id"] + ".json")))
+            except (OSError, ValueError):
+                pass
+        print(json.dumps(out))
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

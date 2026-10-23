@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""miniupnpc "upnpc" stand-in (router state in $ZT_FAKE_UPNP_STATE, JSON)."""
+import json
+import os
+import sys
+
+st_file = os.environ["ZT_FAKE_UPNP_STATE"]
+st = json.load(open(st_file)) if os.path.exists(st_file) else {"maps": [["TCP", 9999, "192.168.1.77", 80, "foreign"]]}
+a = sys.argv[1:]
+if a == ["-l"]:
+    print("upnpc : miniupnpc library test client.\nFound valid IGD : http://192.168.1.1:5000/ctl/IPConn")
+    print("Local LAN ip address : 192.168.1.20\nExternalIPAddress = 203.0.113.5")
+    for i, (p, w, ip, l, d) in enumerate(st["maps"]):
+        print(" %d %s %5d->%s:%-5d '%s' '' 0" % (i, p, w, ip, l, d))
+elif a[:1] == ["-e"] and a[2] == "-a":
+    st["maps"] = [m for m in st["maps"] if m[1] != int(a[5])] + [[a[6], int(a[5]), a[3], int(a[4]), a[1]]]
+    print("external 203.0.113.5:%s TCP is redirected to internal %s:%s" % (a[5], a[3], a[4]))
+elif a[:1] == ["-d"]:
+    st["maps"] = [m for m in st["maps"] if m[1] != int(a[1])]
+json.dump(st, open(st_file, "w"))

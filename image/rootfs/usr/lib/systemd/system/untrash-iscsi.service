@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashOS: iSCSI targets (stock iSCSI, kernel LIO)
+After=network.target untrash-zyxel.service untrash-data.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/untrash/untrash-iscsi apply
+ExecReload=/usr/lib/untrash/untrash-iscsi apply
+ExecStop=/usr/lib/untrash/untrash-iscsi stop
+
+[Install]
+WantedBy=multi-user.target

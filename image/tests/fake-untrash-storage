@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Test double of untrash-storage for test-desk-host.py: fixed status (md2
+raid1 with one volume, disk3 free, disk4 with old data), jobs are appended
+to $ZT_DESK_ROOT/storage-jobs.log; "delete" of md9 fails."""
+import json
+import os
+import sys
+import time
+
+R = os.environ.get("ZT_DESK_ROOT", "")
+if sys.argv[1:2] == ["status"]:
+    vol = {"id": "md", "dev": "/dev/md2", "mnt": "/i-data/aaaa0001", "name": "Volume aaaa", "mounted": True,
+           "size": 4 * 10 ** 12, "free": 10 ** 12, "sysvol": False}
+    print(json.dumps({
+        "disks": [{"bay": "disk%d" % i, "dev": "/dev/sd" + "abcd"[i - 1], "size": 4 * 10 ** 12, "model": "TEST",
+                   "role": r, "detail": d} for i, (r, d) in enumerate(
+            [("member", "md2 (aktiv)"), ("member", "md2 (aktiv)"), ("free", "leer"),
+             ("foreign", "Daten eines anderen Arrays (raid1, 1234abcd)")], 1)],
+        "arrays": [{"md": "md2", "dev": "/dev/md2", "uuid": "aaaa0001:00:00:00", "uuid8": "aaaa0001", "level": "raid1",
+                    "state": "Normal", "progress": None, "raid_disks": 2, "size": 4 * 10 ** 12, "type": "md", "vg": "",
+                    "vg_free": 0, "name": "Volume aaaa", "host": False, "volumes": [vol], "next_level": "raid5",
+                    "members": [{"bay": "disk1", "part": "/dev/sda3", "state": "active"},
+                                {"bay": "disk2", "part": "/dev/sdb3", "state": "active"}],
+                    "actions": ["delete", "add-disks", "change-level", "add-spare", "expand"]}],
+        "free": ["disk3", "disk4"], "levels": {"jbod": 2, "raid0": 2, "basic": 1, "raid1": 2, "raid5": 3, "raid6": 4,
+                                               "raid10": 4}, "max_gb": 16383, "busy": False}))
+    sys.exit(0)
+if len(sys.argv) == 4 and sys.argv[1] == "run":
+    with open(R + "/storage-jobs.log", "a") as f:
+        f.write("%s %s\n" % (sys.argv[2], sys.argv[3]))
+    print("12:00:00 $ mdadm --fake", flush=True)
+    time.sleep(0.3)
+    if sys.argv[2] == "delete" and json.loads(sys.argv[3]).get("md") == "md9":
+        print("12:00:01 RESULT FAIL Unbekanntes Daten-Array: md9")
+        sys.exit(1)
+    print("12:00:01 RESULT OK")
+    sys.exit(0)
+sys.exit(2)

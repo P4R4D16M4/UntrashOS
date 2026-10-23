@@ -1,0 +1,17 @@
+[Unit]
+Description=UntrashOS: system files from /etc/untrash/settings.json
+# Renders hostname, time zone, NTP, network, SSH/FTP/NFS/media server and
+# spin-down configuration before those services start (untrash-config).
+ConditionKernelCommandLine=!untrash.installer=1
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+Before=network-pre.target systemd-networkd.service systemd-hostnamed.service avahi-daemon.service ssh.service vsftpd.service minidlna.service chrony.service hd-idle.service nfs-server.service smbd.service nmbd.service untrash-sound.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/untrash-config boot
+
+[Install]
+WantedBy=sysinit.target

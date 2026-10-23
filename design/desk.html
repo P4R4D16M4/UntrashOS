@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Untrash Desk</title>
+<link rel="icon" href="assets/favicon.ico">
+<link rel="stylesheet" href="untrash.css">
+<style>
+/* preview-only helpers; everything reusable lives in untrash.css */
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.vol { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; }
+.vol + .vol { margin-top: 14px; }
+.vol .ut-progress { grid-column: 1 / -1; }
+.bays { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+.bay { background: var(--ut-bg-0); border: 1px solid var(--ut-line); border-radius: var(--ut-r-md); padding: 10px; text-align: center; font-size: var(--ut-fs-xs); color: var(--ut-fg-2); }
+.bay i { display: block; width: 8px; height: 8px; margin: 0 auto 8px; border-radius: 50%; background: var(--ut-ok); box-shadow: 0 0 8px var(--ut-ok); }
+.bay--empty i { background: var(--ut-bg-5); box-shadow: none; }
+.bay b { display: block; color: var(--ut-fg); font-size: var(--ut-fs-sm); }
+.spark { width: 100%; height: 60px; display: block; }
+.placeholder { display: grid; place-items: center; text-align: center; height: 100%; color: var(--ut-fg-2); }
+.placeholder img { width: 96px; margin-bottom: 12px; }
+#launcher-search { margin-top: 2px; }
+</style>
+</head>
+<body class="ut">
+<div class="ut-desk" id="desk">
+
+  <header class="ut-topbar">
+    <button class="ut-topbar__item" id="logo-btn" aria-haspopup="menu" aria-expanded="false" title="Apps">
+      <img src="assets/logo-mark-48.png" alt="">
+      <span class="ut-topbar__title">Untrash<span style="color:var(--ut-teal)">OS</span></span>
+    </button>
+    <span class="ut-topbar__item" id="active-title" style="cursor:default">Desktop</span>
+    <div class="ut-topbar__spacer"></div>
+    <button class="ut-topbar__item" title="Speicherzustand"><span class="ut-pill ut-pill--ok" style="height:18px">RAID ok</span></button>
+    <button class="ut-topbar__item" title="Netzwerk">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="9" width="12" height="5" rx="1.5"/><path d="M5 9V6h6v3M8 6V2"/></svg>1 Gbit/s
+    </button>
+    <button class="ut-topbar__item" id="bell" title="Benachrichtigungen">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4 11V7a4 4 0 0 1 8 0v4l1.5 1.5h-11zM6.5 14h3"/></svg>
+      <span class="ut-topbar__badge" id="bell-n">2</span>
+    </button>
+    <button class="ut-topbar__item" id="user-btn" aria-haspopup="menu" aria-expanded="false">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5.5" r="2.8"/><path d="M2.5 14c.8-3 3-4.3 5.5-4.3s4.7 1.3 5.5 4.3"/></svg>admin
+    </button>
+    <span class="ut-topbar__item" id="clock" style="cursor:default">--:--</span>
+  </header>
+
+  <nav class="ut-desktop-icons" id="desk-icons" aria-label="Desktop"></nav>
+  <div id="windows"></div>
+  <div class="ut-toasts" id="toasts" aria-live="polite"></div>
+  <nav class="ut-dock" id="dock" aria-label="Dock"></nav>
+</div>
+
+<script>
+const ICON = n => /^(mesh|settings|logs|packages)$/.test(n) ? `assets/icons/${n}.svg` : `assets/icons/${n}-128.png`;
+const APPS = {
+  files:    { name: 'Dateien' },
+  shares:   { name: 'Freigaben' },
+  storage:  { name: 'Speicher-Manager', w: 860, h: 560 },
+  raid:     { name: 'RAID' },
+  network:  { name: 'Netzwerk' },
+  users:    { name: 'Benutzer' },
+  updates:  { name: 'Updates' },
+  backup:   { name: 'Backup' },
+  mesh:     { name: 'UntrashMesh' },
+  apps:     { name: 'App-Katalog' },
+  packages: { name: 'Pakete' },
+  terminal: { name: 'Terminal', w: 640, h: 380 },
+  monitor:  { name: 'Systemmonitor', w: 640, h: 460 },
+  logs:     { name: 'Protokolle' },
+  settings: { name: 'Einstellungen' },
+  power:    { name: 'Ausschalten' },
+};
+const DOCK = ['files', 'shares', 'storage', 'backup', 'users', 'network', 'apps', 'monitor', 'terminal', '|', 'settings', 'power'];
+const DESK = ['files', 'shares', 'storage', 'backup', 'mesh'];
+const $ = s => document.querySelector(s);
+const svg = d => `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+const IC = {
+  min: svg('<path d="M3 8h10"/>'), max: svg('<rect x="3" y="3" width="10" height="10" rx="1.5"/>'), close: svg('<path d="M4 4l8 8M12 4l-8 8"/>'),
+  grid: svg('<rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/>'),
+  disk: svg('<rect x="2" y="3" width="12" height="10" rx="2"/><circle cx="8" cy="7.5" r="2"/><path d="M4.5 11h2"/>'),
+  vol: svg('<ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/>'),
+  raid: svg('<rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M4.5 4.8h.01M4.5 11.3h.01"/>'),
+  import: svg('<path d="M8 2v8m-3-3 3 3 3-3M3 12v1.5h10V12"/>'),
+  heart: svg('<path d="M2 8h3l1.5-3 3 6L11 8h3"/>'),
+  power: svg('<path d="M8 2v6M4.5 4.5a5 5 0 1 0 7 0"/>'),
+  restart: svg('<path d="M13 8a5 5 0 1 1-1.5-3.5M13 2.5V5h-2.5"/>'),
+  lock: svg('<rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/>'),
+  info: svg('<circle cx="8" cy="8" r="6"/><path d="M8 7.5v3.5M8 5h.01"/>'),
+  user: svg('<circle cx="8" cy="5.5" r="2.8"/><path d="M2.5 14c.8-3 3-4.3 5.5-4.3s4.7 1.3 5.5 4.3"/>'),
+  refresh: svg('<path d="M13 8a5 5 0 1 1-1.5-3.5M13 2.5V5h-2.5"/>'),
+  folder: svg('<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H6l1.5 1.5h5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/>'),
+};
+
+/* ---------------------------------------------------------------- desktop + dock */
+$('#desk-icons').innerHTML = DESK.map(k =>
+  `<button class="ut-desk-icon" data-app="${k}"><img src="${ICON(k)}" alt="">${APPS[k].name}</button>`).join('');
+$('#dock').innerHTML = DOCK.map(k => k === '|' ? '<span class="ut-dock__sep"></span>' :
+  `<button class="ut-dock__item" data-app="${k}" aria-label="${APPS[k].name}"><img src="${ICON(k)}" alt=""><span class="ut-tip">${APPS[k].name}</span></button>`).join('');
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-app]');
+  if (!b) return;
+  if (b.classList.contains('ut-desk-icon')) {
+    document.querySelectorAll('.ut-desk-icon').forEach(x => x.removeAttribute('aria-selected'));
+    b.setAttribute('aria-selected', 'true');
+    return;
+  }
+  closeMenus(); open(b.dataset.app);
+});
+document.addEventListener('dblclick', e => { const b = e.target.closest('.ut-desk-icon'); if (b) open(b.dataset.app); });
+
+/* ---------------------------------------------------------------- windows */
+let Z = 10, N = 0;
+const wins = {};
+function open(k) {
+  if (k === 'power') return powerDialog();
+  if (wins[k]) { wins[k].hidden = false; return focus(wins[k]); }
+  const a = APPS[k], w = document.createElement('section');
+  const W = Math.min(a.w || 720, innerWidth - 24), H = Math.min(a.h || 480, innerHeight - 140);
+  w.className = 'ut-window'; w.dataset.app = k;
+  w.style.cssText = `width:${W}px;height:${H}px;left:${Math.max(12, (innerWidth - W) / 2 - 60 + (N % 5) * 34)}px;top:${54 + (N++ % 5) * 30}px`;
+  w.innerHTML = `<div class="ut-window__bar"><img src="${ICON(k)}" alt=""><span class="ut-window__title">${a.name}</span>
+    <div class="ut-window__ctl"><button data-act="min" aria-label="Minimieren">${IC.min}</button><button data-act="max" aria-label="Maximieren">${IC.max}</button><button data-act="close" aria-label="Schließen">${IC.close}</button></div></div>
+    <div class="ut-window__body">${(CONTENT[k] || CONTENT._)(k)}</div>`;
+  $('#windows').append(w); wins[k] = w;
+  w.addEventListener('mousedown', () => focus(w));
+  w.querySelector('[data-act=close]').onclick = () => { w.remove(); delete wins[k]; dockState(); };
+  w.querySelector('[data-act=min]').onclick = e => { e.stopPropagation(); w.hidden = true; w.removeAttribute('data-active'); dockState(); };
+  w.querySelector('[data-act=max]').onclick = () => {
+    if (w.dataset.max) { w.style.cssText = w.dataset.max; delete w.dataset.max; }
+    else { w.dataset.max = w.style.cssText; Object.assign(w.style, { left: '6px', top: 'calc(var(--ut-topbar-h) + 6px)', width: 'calc(100% - 12px)', height: 'calc(100% - var(--ut-topbar-h) - 90px)' }); }
+  };
+  drag(w, w.querySelector('.ut-window__bar'));
+  w.querySelectorAll('.ut-nav').forEach(n => n.onclick = () => { w.querySelectorAll('.ut-nav').forEach(x => x.removeAttribute('aria-current')); n.setAttribute('aria-current', 'page'); });
+  w.querySelectorAll('.ut-tab').forEach(n => n.onclick = () => { w.querySelectorAll('.ut-tab').forEach(x => x.setAttribute('aria-selected', 'false')); n.setAttribute('aria-selected', 'true'); });
+  focus(w);
+}
+function focus(w) {
+  Object.values(wins).forEach(x => x.removeAttribute('data-active'));
+  w.setAttribute('data-active', ''); w.style.zIndex = ++Z;
+  $('#active-title').textContent = APPS[w.dataset.app].name; dockState();
+}
+function dockState() {
+  document.querySelectorAll('.ut-dock__item').forEach(d => {
+    const w = wins[d.dataset.app];
+    d.toggleAttribute('data-running', !!w); d.toggleAttribute('data-active', !!w && w.hasAttribute('data-active'));
+  });
+  if (!document.querySelector('.ut-window[data-active]')) $('#active-title').textContent = 'Desktop';
+}
+function drag(w, handle) {
+  handle.addEventListener('pointerdown', e => {
+    if (e.target.closest('button') || w.dataset.max) return;
+    const sx = e.clientX - w.offsetLeft, sy = e.clientY - w.offsetTop;
+    const mv = e => { w.style.left = (e.clientX - sx) + 'px'; w.style.top = Math.max(34, e.clientY - sy) + 'px'; };
+    const up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); };
+    addEventListener('pointermove', mv); addEventListener('pointerup', up);
+  });
+  handle.addEventListener('dblclick', () => w.querySelector('[data-act=max]').click());
+}
+
+/* ---------------------------------------------------------------- app content (mock data, placeholders only) */
+const nav = (items, cur = 0) => `<aside class="ut-sidebar">${items.map((it, i) => it[0][0] === '#'
+  ? `<div class="ut-sidebar__group">${it[0].slice(1)}</div>`
+  : `<button class="ut-nav"${i === cur ? ' aria-current="page"' : ''}>${IC[it[1]]}<span>${it[0]}</span>${it[2] ? `<span class="ut-pill ut-pill--plain ${it[2][1] || ''}">${it[2][0]}</span>` : ''}</button>`).join('')}</aside>`;
+const CONTENT = {
+  _: k => `<div class="ut-window__main"><div class="placeholder"><div><img src="${ICON(k)}" alt=""><h3>${APPS[k].name}</h3><p class="ut-muted">Modul folgt in P4 – Cockpit-Paket im Untrash-Desk-Stil.</p></div></div></div>`,
+  storage: () => nav([['#Speicher'], ['Übersicht', 'grid'], ['Volumes', 'vol', ['2']], ['Datenträger', 'disk', ['3']], ['RAID', 'raid'],
+      ['#Altbestand'], ['Stock-Übernahme', 'import', ['1', 'ut-pill--warn']], ['SMART', 'heart']], 2) + `
+    <div class="ut-window__main">
+      <div class="ut-card__head" style="margin-bottom:16px"><h2 style="margin:0">Volumes</h2><span class="ut-spacer"></span>
+        <button class="ut-btn ut-btn--sm">${IC.refresh}Neu einlesen</button><button class="ut-btn ut-btn--primary ut-btn--sm">Volume anlegen</button></div>
+      <div class="ut-callout ut-callout--warn" style="margin-bottom:16px">${IC.info}<div><b>Zyxel-Volume erkannt.</b> Es ist nur lesend eingebunden; Freigaben und Rechte sind unverändert.
+        <div style="margin-top:8px"><button class="ut-btn ut-btn--sm" onclick="takeoverDialog()">Übernahme prüfen …</button></div></div></div>
+      <div class="bays"><div class="bay"><i></i><b>Schacht 1</b>2,0 TB · sda</div><div class="bay"><i></i><b>Schacht 2</b>2,0 TB · sdb</div>
+        <div class="bay"><i style="background:var(--ut-warn);box-shadow:0 0 8px var(--ut-warn)"></i><b>Schacht 3</b>4,0 TB · sdc</div><div class="bay bay--empty"><i></i><b>Schacht 4</b>leer</div></div>
+      <div class="ut-card">
+        <div class="vol"><div><b>Volume 1</b> <span class="ut-faint">· btrfs auf RAID 1 · sda, sdb</span></div><span class="ut-pill ut-pill--ok">Gesund</span>
+          <div class="ut-progress" style="--v:41%"><i></i></div><span class="ut-faint" style="font-size:var(--ut-fs-xs)">742 GB von 1,8 TB belegt</span></div>
+        <div class="vol"><div><b>Altbestand</b> <span class="ut-faint">· ext4 auf LVM (Zyxel) · sdc</span></div><span class="ut-pill ut-pill--warn">Nur lesen</span>
+          <div class="ut-progress ut-progress--warn" style="--v:78%"><i></i></div><span class="ut-faint" style="font-size:var(--ut-fs-xs)">2,8 TB von 3,6 TB belegt</span></div>
+      </div>
+      <div class="ut-section-title">Laufende Vorgänge</div>
+      <div class="ut-card"><div class="vol"><div>RAID 1 · Volume 1 · Konsistenzprüfung</div><span class="ut-pill ut-pill--info ut-pill--live">62 %</span>
+        <div class="ut-progress" style="--v:62%"><i></i></div></div></div>
+    </div>`,
+  monitor: () => `<div class="ut-window__main">
+      <div class="ut-tabs"><button class="ut-tab" aria-selected="true">Leistung</button><button class="ut-tab" aria-selected="false">Prozesse</button><button class="ut-tab" aria-selected="false">Dienste</button></div>
+      <div class="grid-3">
+        <div class="ut-stat"><div class="ut-stat__label">CPU · 2× A9</div><div class="ut-stat__value">23<small>%</small></div></div>
+        <div class="ut-stat"><div class="ut-stat__label">Speicher</div><div class="ut-stat__value">412<small>/ 1024 MB</small></div></div>
+        <div class="ut-stat"><div class="ut-stat__label">Temperatur</div><div class="ut-stat__value">41<small>°C · Lüfter 1</small></div></div>
+      </div>
+      <div class="ut-card"><div class="ut-card__head"><h3>CPU-Last</h3><span class="ut-spacer"></span><span class="ut-faint">letzte 60 s</span></div>
+        <svg class="spark" viewBox="0 0 300 60" preserveAspectRatio="none"><defs><linearGradient id="sg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#19d6a6" stop-opacity=".35"/><stop offset="1" stop-color="#19d6a6" stop-opacity="0"/></linearGradient><linearGradient id="sl" x1="0" x2="1"><stop offset="0" stop-color="#6ff06b"/><stop offset="1" stop-color="#00bfd0"/></linearGradient></defs>
+          <path id="spark-a" fill="url(#sg)"/><path id="spark-l" fill="none" stroke="url(#sl)" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></div>
+    </div>`,
+  terminal: () => `<div class="ut-window__main" style="padding:0;background:#05080a"><pre class="ut-log" style="border:0;border-radius:0;max-height:none;height:100%;color:#cfe">admin@zyxel-untrash:~$ untrash status
+<span style="color:var(--ut-green)">●</span> System    Slot A · 1.0 · gut
+<span style="color:var(--ut-green)">●</span> Speicher  Volume 1 gesund · Altbestand nur lesen
+<span style="color:var(--ut-warn)">●</span> Backup    letzte Sicherung vor 3 Tagen
+admin@zyxel-untrash:~$ <span style="background:var(--ut-teal)"> </span></pre></div>`,
+};
+setInterval(() => { /* fake sparkline */
+  const l = $('#spark-l'); if (!l) return;
+  const pts = (window.SP = (window.SP || Array.from({ length: 30 }, () => 20 + Math.random() * 20)).slice(1).concat(10 + Math.random() * 40));
+  const d = pts.map((v, i) => `${i ? 'L' : 'M'}${i * 300 / 29},${60 - v}`).join('');
+  l.setAttribute('d', d); $('#spark-a').setAttribute('d', d + 'L300,60L0,60Z');
+}, 1000);
+
+/* ---------------------------------------------------------------- menus */
+function closeMenus() { document.querySelectorAll('.ut-menu').forEach(m => m.remove()); document.querySelectorAll('[aria-expanded=true]').forEach(b => b.setAttribute('aria-expanded', 'false')); }
+function menu(html, x, y, cls = '', btn) {
+  closeMenus(); const m = document.createElement('div');
+  m.className = 'ut-menu ' + cls; m.setAttribute('role', 'menu'); m.innerHTML = html; $('#desk').append(m);
+  m.style.left = Math.min(x, innerWidth - m.offsetWidth - 8) + 'px'; m.style.top = Math.min(y, innerHeight - m.offsetHeight - 8) + 'px';
+  if (btn) btn.setAttribute('aria-expanded', 'true');
+  return m;
+}
+document.addEventListener('mousedown', e => { if (!e.target.closest('.ut-menu, [aria-haspopup]')) closeMenus(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeMenus(); document.querySelector('.ut-scrim')?.remove(); } });
+$('#logo-btn').onclick = e => {
+  if (e.currentTarget.getAttribute('aria-expanded') === 'true') return closeMenus();
+  const m = menu(`<input class="ut-input" id="launcher-search" placeholder="App suchen …" autocomplete="off">
+    <div class="ut-launcher__grid">${Object.keys(APPS).filter(k => k !== 'power').map(k => `<button class="ut-launcher__app" data-app="${k}"><img src="${ICON(k)}" alt="">${APPS[k].name}</button>`).join('')}</div>`,
+    8, 40, 'ut-launcher', e.currentTarget);
+  const s = m.querySelector('input'); s.focus();
+  s.oninput = () => m.querySelectorAll('.ut-launcher__app').forEach(b => b.hidden = !b.textContent.toLowerCase().includes(s.value.toLowerCase()));
+};
+$('#user-btn').onclick = e => {
+  if (e.currentTarget.getAttribute('aria-expanded') === 'true') return closeMenus();
+  const r = e.currentTarget.getBoundingClientRect();
+  menu(`<div class="ut-menu__label">Angemeldet als admin</div>
+    <button class="ut-menu__item">${IC.user}Mein Konto</button><button class="ut-menu__item">${IC.lock}Sperren<kbd>Ctrl L</kbd></button>
+    <div class="ut-menu__sep"></div><button class="ut-menu__item" onclick="location.href='login.html'">${IC.restart}Abmelden</button>
+    <button class="ut-menu__item ut-menu__item--danger" data-app="power">${IC.power}Ausschalten …</button>`, r.right - 230, r.bottom + 6, '', e.currentTarget);
+};
+$('#desk').addEventListener('contextmenu', e => {
+  if (e.target.closest('.ut-window, .ut-dock, .ut-topbar, .ut-menu')) return;
+  e.preventDefault();
+  menu(`<button class="ut-menu__item" data-app="files">${IC.folder}Dateien öffnen</button><button class="ut-menu__item" data-app="storage">${IC.vol}Speicher-Manager</button>
+    <div class="ut-menu__sep"></div><button class="ut-menu__item" data-app="settings">${IC.grid}Hintergrund & Darstellung</button><button class="ut-menu__item" onclick="location.href='styleguide.html'">${IC.info}Design-System</button>`, e.clientX, e.clientY);
+});
+
+/* ---------------------------------------------------------------- toasts + dialogs */
+function toast({ icon, title, text, kind = '', actions = '' }) {
+  const t = document.createElement('div'); t.className = 'ut-toast ' + (kind ? 'ut-toast--' + kind : '');
+  t.innerHTML = `<img src="${ICON(icon)}" alt=""><div class="ut-toast__body"><div class="ut-toast__title">${title}</div><div class="ut-toast__text">${text}</div>
+    ${actions ? `<div class="ut-toast__actions">${actions}</div>` : ''}<div class="ut-toast__time">gerade eben</div></div>
+    <button class="ut-btn ut-btn--ghost ut-btn--icon ut-btn--sm ut-toast__close" aria-label="Schließen">${IC.close}</button>`;
+  t.querySelector('.ut-toast__close').onclick = () => { t.remove(); $('#bell-n').textContent = Math.max(0, $('#toasts').children.length); };
+  $('#toasts').append(t);
+}
+function dialog({ kind = '', icon = IC.info, title, body, ok, okCls = 'ut-btn--primary', onOk }) {
+  const s = document.createElement('div'); s.className = 'ut-scrim';
+  s.innerHTML = `<div class="ut-dialog ${kind ? 'ut-dialog--' + kind : ''}" role="dialog" aria-modal="true"><div class="ut-dialog__head"><div class="ut-dialog__icon">${icon}</div><h2>${title}</h2></div>
+    <div class="ut-dialog__body">${body}</div><div class="ut-dialog__foot"><button class="ut-btn" data-x>Abbrechen</button><button class="ut-btn ${okCls}" data-ok>${ok}</button></div></div>`;
+  s.onclick = e => { if (e.target === s || e.target.closest('[data-x]')) s.remove(); };
+  s.querySelector('[data-ok]').onclick = () => { s.remove(); onOk && onOk(); };
+  document.body.append(s); s.querySelector('[data-ok]').focus();
+}
+function powerDialog() {
+  closeMenus();
+  dialog({ kind: 'danger', icon: IC.power, title: 'NAS ausschalten?', ok: 'Ausschalten', okCls: 'ut-btn--danger',
+    body: '<p>Laufende Kopien und die Konsistenzprüfung von <b style="color:var(--ut-fg)">Volume 1</b> werden angehalten und beim nächsten Start fortgesetzt.</p><label class="ut-switch"><input type="checkbox"><i></i>Stattdessen neu starten</label>',
+    onOk: () => toast({ icon: 'power', title: 'Vorschau', text: 'Hier würde die NAS jetzt herunterfahren.' }) });
+}
+function takeoverDialog() {
+  dialog({ kind: 'warn', title: 'Zyxel-Volume übernehmen?', ok: 'Übernahme starten',
+    body: '<p>UntrashOS liest Benutzer, Gruppen und Freigaben der Stock-Firmware und stellt sie unverändert bereit. md-, LVM- und ext4-Metadaten bleiben, wie sie sind.</p><p class="ut-faint" style="margin:0">Vorher wird die Stock-Konfiguration auf den Stick gesichert.</p>' });
+}
+setTimeout(() => toast({ icon: 'raid', title: 'Konsistenzprüfung läuft', text: 'RAID 1 · Volume 1 – 62 %, noch etwa 2 h' }), 600);
+setTimeout(() => toast({ icon: 'backup', kind: 'warn', title: 'Backup überfällig', text: 'Die letzte Sicherung ist 3 Tage alt.',
+  actions: '<button class="ut-btn ut-btn--primary ut-btn--sm" data-app="backup">Jetzt sichern</button><button class="ut-btn ut-btn--sm">Später</button>' }), 1300);
+
+/* ---------------------------------------------------------------- clock */
+const tick = () => $('#clock').textContent = new Date().toLocaleString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+tick(); setInterval(tick, 15000);
+open('storage');
+</script>
+</body>
+</html>

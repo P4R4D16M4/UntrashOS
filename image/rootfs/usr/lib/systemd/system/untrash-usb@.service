@@ -1,0 +1,11 @@
+[Unit]
+Description=UntrashOS: USB volume %I under /e-data (stock layout)
+ConditionKernelCommandLine=!untrash.installer=1
+BindsTo=dev-%i.device
+After=dev-%i.device local-fs.target untrash-zyxel.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/untrash/untrash-usb add /dev/%I
+ExecStop=/usr/lib/untrash/untrash-usb remove /dev/%I

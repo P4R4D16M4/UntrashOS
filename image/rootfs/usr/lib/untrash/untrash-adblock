@@ -1,0 +1,336 @@
+#!/usr/bin/python3
+"""untrash-adblock - DNS ad filter for the home network (like Pi-hole), on dnsmasq.
+
+  untrash-adblock render        dnsmasq.conf from the store (ExecStartPre)
+  untrash-adblock update        download the enabled block lists, build the hosts file
+  untrash-adblock stats [HOURS] statistics of the query log as JSON (default 24 h)
+  untrash-adblock log [N]       the last N queries as JSON
+  untrash-adblock rotate        keep the query log small (RAM)
+
+The NAS answers DNS on port 53 of its network interfaces (not loopback: there
+systemd-resolved keeps serving the NAS itself) and forwards to the servers it
+got by DHCP (/run/systemd/resolve/resolv.conf).  Blocked names get 0.0.0.0 / ::.
+On/off is the flag file DATA/enabled; the units are always enabled and carry
+ConditionPathExists on it, so switching never needs a systemd daemon-reload.
+
+Store (/etc/untrash/adblock.json): {"lists": [{"name", "url", "on"}],
+  "allow": [domain], "block": [domain or *.domain], "updated": time, "count": n,
+  "errors": [..]}
+"""
+import collections
+import hashlib
+import json
+import os
+import re
+import signal
+import sys
+import time
+import urllib.request
+
+STORE = os.environ.get("ZT_ADBLOCK_STORE", "/etc/untrash/adblock.json")
+DATA = os.environ.get("ZT_ADBLOCK_DATA", "/var/lib/untrash/adblock")
+RUN = os.environ.get("ZT_ADBLOCK_RUN", "/run/untrash/adblock")
+UPSTREAM = os.environ.get("ZT_ADBLOCK_UPSTREAM", "/run/systemd/resolve/resolv.conf")
+PORT = int(os.environ.get("ZT_ADBLOCK_PORT", "53"))
+LISTEN = os.environ.get("ZT_ADBLOCK_LISTEN", "")      # tests: one address instead of every interface
+HOSTS = os.path.join(DATA, "blocked.hosts")
+FLAG = os.path.join(DATA, "enabled")
+CONF = os.path.join(RUN, "dnsmasq.conf")
+LOG = os.path.join(RUN, "query.log")
+PID = os.path.join(RUN, "dnsmasq.pid")
+LOG_MAX = int(os.environ.get("ZT_ADBLOCK_LOG_MAX", str(8 << 20)))   # x2 files, ~2 days of a household
+MAX_DOMAINS = 250000            # RAM guard (1 GB NAS): 2 entries per name, ~40 MB in dnsmasq at most
+DEFAULT_LISTS = [
+    {"name": "StevenBlack (Werbung + Malware)", "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", "on": True},
+    {"name": "Hagezi Light", "url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/light.txt", "on": False},
+    {"name": "Hagezi Pro (strenger)", "url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/pro.txt", "on": False},
+]
+DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z][a-z0-9-]{0,62}$")
+NOT_BLOCKED = {"localhost", "localhost.localdomain", "local", "broadcasthost", "ip6-localhost", "ip6-loopback",
+               "0.0.0.0", "ip6-allnodes", "ip6-allrouters", "ip6-localnet", "ip6-mcastprefix"}
+
+
+def load():
+    try:
+        s = json.load(open(STORE))
+    except (OSError, ValueError):
+        s = {}
+    s.setdefault("lists", [dict(x) for x in DEFAULT_LISTS])
+    s.setdefault("allow", [])
+    s.setdefault("block", [])
+    s.setdefault("updated", 0)
+    s.setdefault("count", 0)
+    s.setdefault("errors", [])
+    return s
+
+
+def save(s):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    tmp = STORE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, STORE)
+
+
+def clean_domain(d):
+    """Normalised domain, wildcard "*.x" kept as such; None if invalid."""
+    d = (d or "").strip().lower().rstrip(".")
+    wild = d.startswith("*.")
+    if wild:
+        d = d[2:]
+    if not DOMAIN.match(d) or d in NOT_BLOCKED:
+        return None
+    return ("*." if wild else "") + d
+
+
+def parse_list(text):
+    """Domains of a block list: hosts format (0.0.0.0/127.0.0.1 name), plain
+    domains, or adblock syntax ||domain^ (only plain domain rules)."""
+    out = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or line.startswith(("!", "[")):
+            continue
+        if line.startswith("||"):
+            m = re.match(r"^\|\|([a-z0-9._-]+)\^$", line.lower())
+            if m:
+                out.add(m.group(1))
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1"):
+            names = parts[1:]
+        elif len(parts) == 1:
+            names = parts
+        else:
+            continue
+        for n in names:
+            n = n.lower().rstrip(".")
+            if DOMAIN.match(n) and n not in NOT_BLOCKED:
+                out.add(n)
+    return out
+
+
+def fetch(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": "UntrashOS-adblock/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(64 << 20)
+    return data.decode("utf-8", "replace")
+
+
+def cache_path(url):
+    return os.path.join(DATA, "list-%s.txt" % hashlib.sha1(url.encode()).hexdigest()[:12])
+
+
+def build(s):
+    """Hosts file from the cached lists minus the allow list (exact names)."""
+    allow = {a for a in (clean_domain(x) for x in s["allow"]) if a and not a.startswith("*.")}
+    names = set()
+    for l in s["lists"]:
+        if l.get("on"):
+            try:
+                names |= parse_list(open(cache_path(l["url"]), encoding="utf-8", errors="replace").read())
+            except OSError:
+                pass
+    names -= allow
+    names = sorted(names)[:MAX_DOMAINS]
+    os.makedirs(DATA, exist_ok=True)
+    tmp = HOSTS + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("# untrash-adblock: %d names from the enabled lists\n" % len(names))
+        for n in names:
+            # both families: with only an A entry dnsmasq forwards AAAA (tested)
+            f.write("0.0.0.0 %s\n:: %s\n" % (n, n))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, HOSTS)
+    return len(names)
+
+
+def update(s=None, fetcher=fetch):
+    s = s or load()
+    errors = []
+    for l in s["lists"]:
+        if not l.get("on"):
+            continue
+        try:
+            text = fetcher(l["url"])
+            if not parse_list(text):
+                raise ValueError("keine Domains erkannt")
+            os.makedirs(DATA, exist_ok=True)
+            with open(cache_path(l["url"]) + ".tmp", "w") as f:
+                f.write(text)
+            os.replace(cache_path(l["url"]) + ".tmp", cache_path(l["url"]))
+        except Exception as e:      # a dead list must not stop the others
+            errors.append("%s: %s" % (l.get("name") or l["url"], e))
+    s["count"] = build(s)
+    s["updated"] = int(time.time())
+    s["errors"] = errors
+    save(s)
+    reload_hosts()
+    return {"count": s["count"], "errors": errors}
+
+
+def reload_hosts():
+    """SIGHUP: dnsmasq re-reads the hosts file and clears its cache."""
+    try:
+        os.kill(int(open(PID).read().strip()), signal.SIGHUP)
+    except (OSError, ValueError):
+        pass
+
+
+def log_owner():
+    """dnsmasq drops root before it writes the log: give the log to that user
+    (Debian: "dnsmasq", else "nobody"); returns the user name (None in tests)."""
+    if os.getuid() != 0:
+        return None
+    import pwd
+    for u in ("dnsmasq", "nobody"):
+        try:
+            pw = pwd.getpwnam(u)
+        except KeyError:
+            continue
+        for f in (LOG, LOG + ".1"):
+            try:
+                os.chown(f, pw.pw_uid, pw.pw_gid)
+            except OSError:
+                pass
+        return u
+    return None
+
+
+def render():
+    s = load()
+    os.makedirs(RUN, exist_ok=True)
+    os.makedirs(DATA, exist_ok=True)
+    if not os.path.exists(HOSTS):
+        build(s)
+    if not os.path.exists(LOG):
+        open(LOG, "a").close()
+    user = log_owner()
+    lines = ["# untrash-adblock (generated, see /etc/untrash/adblock.json)",
+             "port=%d" % PORT] + (["listen-address=%s" % LISTEN, "bind-interfaces"] if LISTEN else
+                                    ["bind-dynamic", "except-interface=lo"]) + [
+             "resolv-file=%s" % UPSTREAM, "domain-needed", "bogus-priv", "no-hosts",
+             "cache-size=10000", "log-queries=extra", "log-facility=%s" % LOG, "log-async=25",
+             "pid-file=%s" % PID, "addn-hosts=%s" % HOSTS] + (["user=%s" % user] if user else [])
+    for b in s["block"]:
+        b = clean_domain(b)
+        if b:                       # address=/x/ blocks x and every subdomain
+            lines += ["address=/%s/0.0.0.0" % b.lstrip("*."), "address=/%s/::" % b.lstrip("*.")]
+    for a in s["allow"]:
+        a = clean_domain(a)
+        if a:                       # forward normally even below a wildcard block
+            lines.append("server=/%s/#" % a.lstrip("*."))
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, CONF)
+    return CONF
+
+
+# ------------------------------------------------------------- query log
+LINE = re.compile(r"^(\w{3} [ \d]\d \d\d:\d\d:\d\d) dnsmasq\[\d+\]: (\d+) ([0-9a-fA-F.:]+)/\d+ (.*)$")
+
+
+def _ts(stamp, now):
+    t = time.mktime(time.strptime("%d %s" % (time.localtime(now).tm_year, stamp), "%Y %b %d %H:%M:%S"))
+    return t - 365 * 86400 if t > now + 86400 else t     # December lines read in January
+
+
+def queries(since=0, now=None):
+    """[(time, client, type, name, status)] status: blocked|cached|forwarded|local."""
+    now = now or time.time()
+    pend = {}
+    out = []
+    for path in (LOG + ".1", LOG):
+        try:
+            f = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                m = LINE.match(line)
+                if not m:
+                    continue
+                stamp, serial, client, rest = m.groups()
+                if rest.startswith("query["):
+                    q = re.match(r"query\[(\w+)\] (\S+) from", rest)
+                    if q:
+                        t = _ts(stamp, now)
+                        if t >= since:
+                            e = [t, client, q.group(1), q.group(2).lower(), "forwarded"]
+                            pend[serial] = e
+                            out.append(e)
+                    continue
+                e = pend.get(serial)
+                if not e:
+                    continue
+                if rest.startswith(HOSTS + " ") or (rest.startswith("config ") and
+                                                    re.search(r" is (0\.0\.0\.0|::|NXDOMAIN|NODATA)", rest)):
+                    e[4] = "blocked"
+                elif rest.startswith("cached "):
+                    e[4] = "cached" if e[4] != "blocked" else e[4]
+                elif rest.startswith(("/etc/hosts", "config ")) and e[4] == "forwarded":
+                    e[4] = "local"
+    return out
+
+
+def stats(hours=24, now=None):
+    now = now or time.time()
+    q = queries(now - hours * 3600, now)
+    blocked = [e for e in q if e[4] == "blocked"]
+    hist = [[0, 0] for _ in range(hours)]
+    for e in q:
+        i = min(hours - 1, max(0, int((e[0] - (now - hours * 3600)) // 3600)))
+        hist[i][0] += 1
+        hist[i][1] += e[4] == "blocked"
+    top = lambda it, n=10: [{"name": k, "n": v} for k, v in collections.Counter(it).most_common(n)]  # noqa: E731
+    return {"hours": hours, "queries": len(q), "blocked": len(blocked),
+            "percent": round(100.0 * len(blocked) / len(q), 1) if q else 0.0,
+            "clients": len({e[1] for e in q}),
+            "top_blocked": top(e[3] for e in blocked), "top_allowed": top(e[3] for e in q if e[4] != "blocked"),
+            "top_clients": top(e[1] for e in q), "hist": hist}
+
+
+def last(n=200):
+    q = queries(0)[-n:]
+    return [{"t": int(e[0]), "client": e[1], "type": e[2], "name": e[3], "status": e[4]} for e in reversed(q)]
+
+
+def rotate():
+    """Keep LOG + LOG.1 below 2 x LOG_MAX: rename, SIGUSR2 = dnsmasq reopens its log."""
+    try:
+        if os.path.getsize(LOG) < LOG_MAX:
+            return False
+    except OSError:
+        return False
+    os.replace(LOG, LOG + ".1")
+    open(LOG, "a").close()
+    log_owner()
+    try:
+        os.kill(int(open(PID).read().strip()), signal.SIGUSR2)
+    except (OSError, ValueError):
+        pass
+    return True
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd == "render":
+        print(render())
+    elif cmd == "update":
+        print(json.dumps(update()))
+    elif cmd == "stats":
+        rotate()
+        print(json.dumps(stats(int(argv[1]) if len(argv) > 1 else 24)))
+    elif cmd == "log":
+        print(json.dumps(last(int(argv[1]) if len(argv) > 1 else 200)))
+    elif cmd == "rotate":
+        rotate()
+    else:
+        sys.stderr.write(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

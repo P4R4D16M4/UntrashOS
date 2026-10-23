@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashOS: password check socket for WebDAV
+
+[Socket]
+ListenStream=/run/untrash/authd.sock
+SocketUser=root
+SocketGroup=www-data
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

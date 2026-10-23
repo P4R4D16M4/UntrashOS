@@ -1,0 +1,84 @@
+#!/usr/bin/python3
+"""untrash-downloads - helper of the download service (stock dservice, aria2).
+
+  untrash-downloads tick         untrash-downloads.timer, every minute:
+                                 active time window (stock "time period"
+                                 HHMM:HHMM) -> pause/unpause all; .torrent
+                                 files in the watch folder (stock "incoming",
+                                 admin/download/torrent) are added
+  untrash-downloads GID N PATH   aria2 on-download-complete: mail if wanted
+Settings: /etc/untrash/downloads.json, RPC secret /etc/untrash/aria2.secret.
+"""
+import base64
+import datetime
+import glob
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+CONF = os.environ.get("ZT_DL_CONF", "/etc/untrash/downloads.json")
+SECRET = os.environ.get("ZT_DL_SECRET", "/etc/untrash/aria2.secret")
+RPC = os.environ.get("ZT_DL_RPC", "http://127.0.0.1:6800/jsonrpc")
+STATEF = os.environ.get("ZT_DL_STATE", "/run/untrash/downloads.paused")
+
+
+def rpc(method, *params):
+    tok = "token:" + open(SECRET).read().strip()
+    body = json.dumps({"jsonrpc": "2.0", "id": "u", "method": method, "params": [tok] + list(params)}).encode()
+    with urllib.request.urlopen(urllib.request.Request(RPC, body, {"Content-Type": "application/json"}), timeout=10) as r:
+        return json.load(r).get("result")
+
+
+def in_window(period, now=None):
+    """Stock RULE_TIME_PERIOD "HHMM:HHMM"; empty or equal = always."""
+    if not period or period[:4] == period[5:]:
+        return True
+    now = now or datetime.datetime.now()
+    t = now.hour * 100 + now.minute
+    a, b = int(period[:4]), int(period[5:])
+    return a <= t < b if a < b else (t >= a or t < b)
+
+
+def tick():
+    c = json.load(open(CONF))
+    want_pause = not in_window(c.get("period", ""))
+    paused = os.path.exists(STATEF)
+    if want_pause != paused:
+        rpc("aria2.forcePauseAll" if want_pause else "aria2.unpauseAll")
+        if want_pause:
+            open(STATEF, "w").close()
+        else:
+            os.unlink(STATEF)
+        print("time window: %s" % ("paused" if want_pause else "running"), flush=True)
+    for t in sorted(glob.glob(os.path.join(c.get("watch", ""), "*.torrent"))):
+        try:
+            gid = rpc("aria2.addTorrent", base64.b64encode(open(t, "rb").read()).decode(), [], {"dir": c["dir"]})
+            os.makedirs(os.path.join(os.path.dirname(t), ".added"), exist_ok=True)
+            os.replace(t, os.path.join(os.path.dirname(t), ".added", os.path.basename(t)))
+            print("added %s (%s)" % (t, gid), flush=True)
+        except OSError as e:
+            print("cannot add %s: %s" % (t, e), flush=True)
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["tick"]:
+        tick()
+        return 0
+    if len(a) == 3:                     # aria2 on-download-complete GID FILES PATH
+        try:
+            c = json.load(open(CONF))
+        except (OSError, ValueError):
+            c = {}
+        print("download complete: %s" % a[2], flush=True)
+        if c.get("notify"):
+            subprocess.run(["/usr/lib/untrash/untrash-notify", "alert", "Download fertig", a[2]], check=False)
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

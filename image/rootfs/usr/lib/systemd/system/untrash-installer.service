@@ -1,0 +1,11 @@
+[Unit]
+Description=UntrashOS installer (first-time setup in the browser)
+ConditionKernelCommandLine=untrash.installer=1
+After=network.target
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-installer
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

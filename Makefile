@@ -1,0 +1,36 @@
+.PHONY: help test i18n docs-check
+
+# UntrashOS: the device-independent part.  Images are built by a firmware
+# repository (e.g. ZyxelUntrash) that has this repository as a submodule and
+# provides the board (docs/board-interface.md).
+# BOARD_ROOTFS = <firmware>/board/<name>/rootfs: tests that need board tools.
+
+help:
+	@echo "UntrashOS (device-independent part)"
+	@echo "  make test         PC tests (no root) [BOARD_ROOTFS=<board>/rootfs]"
+	@echo "  make i18n         write design/i18n/*.json from tools/i18n"
+	@echo "  make docs-check   privacy check of the docs"
+
+i18n:
+	python3 tools/i18n/build.py
+
+docs-check:
+	@python3 tools/check_public_docs.py
+
+test:
+	ZT_BOARD_ROOTFS=$(BOARD_ROOTFS) $(MAKE) --no-print-directory test-run
+
+test-run:
+	python3 image/tests/test_exec_bits.py
+	python3 image/tests/test_live_host.py
+	python3 image/tests/test_bootstate.py
+	python3 image/tests/test_export_host.py
+	python3 image/tests/test_tv_host.py
+	python3 image/tests/test_wdt_host.py
+	PATH=$$PATH:/usr/sbin python3 image/tests/test_adblock_host.py
+	python3 tools/i18n/build.py --check
+	python3 image/tests/test_import_zyxel.py
+	python3 image/tests/test_untrash_config.py
+	python3 image/tests/test-desk-host.py
+	python3 image/tests/test-backup-host.py
+	python3 image/tests/test-sound-host.py

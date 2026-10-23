@@ -1,0 +1,135 @@
+#!/usr/bin/python3
+"""untrash-syslogd - syslog server for other devices (stock "Syslog Server",
+syslog-ng: /etc/zyxel/syslog-ng/syslog.table "path|format|months").
+
+Listens on 514/udp and 514/tcp, writes every message to
+  <path>/<YYYYMM>/<source IP>_<YYYYMMDD>.txt
+with the stock line formats: simple = DATE HOST MESSAGE, full = DATE HOST
+PROGRAM TAG FACILITY LEVEL MESSAGE, or a custom list of these names; fields
+separated by tabs.  Month folders older than <months> are deleted.
+Settings: /etc/untrash/syslog-server.json (untrash-config).
+"""
+import asyncio
+import datetime
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+
+CONF = os.environ.get("ZT_SYSLOGD_CONF", "/etc/untrash/syslog-server.json")
+PORT = int(os.environ.get("ZT_SYSLOGD_PORT", "514"))
+BIND = os.environ.get("ZT_SYSLOGD_BIND", "")
+FAC = ("kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp",
+       "ntp", "security", "console", "solaris-cron", "local0", "local1", "local2", "local3", "local4", "local5",
+       "local6", "local7")
+LEV = ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")
+FORMATS = {"simple": ["DATE", "HOST", "MESSAGE"], "full": ["DATE", "HOST", "PROGRAM", "TAG", "FACILITY", "LEVEL", "MESSAGE"]}
+FIELDS = {"DATE", "HOST", "PROGRAM", "TAG", "FACILITY", "LEVEL", "MESSAGE", "PRIORITY", "SOURCEIP", "PID"}
+RFC3164 = re.compile(r"^(?P<date>[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d) (?P<host>\S+) (?P<prog>[^:\[\s]+)(\[(?P<pid>\d+)\])?: ?(?P<msg>.*)$", re.S)
+RFC5424 = re.compile(r"^1 (?P<ts>\S+) (?P<host>\S+) (?P<prog>\S+) (?P<pid>\S+) \S+ (?:-|\[.*?\]) ?(?P<msg>.*)$", re.S)
+
+
+def load():
+    with open(CONF) as f:
+        c = json.load(f)
+    fmt = FORMATS.get(c.get("format"), [x for x in str(c.get("format", "")).split() if x in FIELDS] or FORMATS["simple"])
+    return c["path"], fmt, max(1, int(c.get("months") or 6))
+
+
+def parse(data, src):
+    text = data.decode("utf-8", "replace").rstrip("\r\n\0")
+    pri = 13
+    m = re.match(r"<(\d{1,3})>", text)
+    if m:
+        pri, text = int(m.group(1)), text[m.end():]
+    now = datetime.datetime.now()
+    f = {"DATE": now.strftime("%b %d %H:%M:%S"), "HOST": src, "PROGRAM": "", "PID": "", "MESSAGE": text}
+    m5 = RFC5424.match(text)
+    m3 = RFC3164.match(text) if not m5 else None
+    if m5:
+        f.update(HOST=m5["host"], PROGRAM=m5["prog"].strip("-"), PID=m5["pid"].strip("-"), MESSAGE=m5["msg"])
+    elif m3:
+        f.update(DATE=m3["date"], HOST=m3["host"], PROGRAM=m3["prog"], PID=m3["pid"] or "", MESSAGE=m3["msg"])
+    f.update(FACILITY=FAC[pri >> 3] if pri >> 3 < len(FAC) else str(pri >> 3), LEVEL=LEV[pri & 7],
+             TAG="%02x" % pri, PRIORITY=LEV[pri & 7], SOURCEIP=src)
+    return f, now
+
+
+class Writer:
+    def __init__(self):
+        self.path, self.fmt, self.months = load()
+        self.pruned = ""
+
+    def write(self, data, src):
+        f, now = parse(data, src)
+        month = os.path.join(self.path, now.strftime("%Y%m"))
+        if not os.path.isdir(month):
+            os.makedirs(month, exist_ok=True)
+            os.chmod(month, 0o777)
+        line = "\t".join(f[k].replace("\t", " ").replace("\n", " ") for k in self.fmt) + "\n"
+        with open(os.path.join(month, "%s_%s.txt" % (src, now.strftime("%Y%m%d"))), "a", encoding="utf-8") as fh:
+            fh.write(line)
+        if self.pruned != now.strftime("%Y%m%d"):
+            self.prune(now)
+
+    def prune(self, now):
+        self.pruned = now.strftime("%Y%m%d")
+        y, m = now.year, now.month - self.months + 1
+        while m < 1:
+            y, m = y - 1, m + 12
+        oldest = "%04d%02d" % (y, m)
+        for d in os.listdir(self.path):
+            if re.fullmatch(r"\d{6}", d) and d < oldest and os.path.isdir(os.path.join(self.path, d)):
+                shutil.rmtree(os.path.join(self.path, d), ignore_errors=True)
+
+
+class Udp(asyncio.DatagramProtocol):
+    def __init__(self, w):
+        self.w = w
+
+    def datagram_received(self, data, addr):
+        try:
+            self.w.write(data, addr[0])
+        except OSError as e:
+            print("write failed: %s" % e, file=sys.stderr, flush=True)
+
+
+async def tcp_client(w, reader, writer):
+    src = writer.get_extra_info("peername")[0]
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            m = re.match(rb"(\d+) ", line)       # RFC 6587 octet counting
+            if m and not line.startswith(b"<"):
+                n = int(m.group(1))
+                rest = line[m.end():]
+                while len(rest) < n:
+                    more = await reader.read(n - len(rest))
+                    if not more:
+                        break
+                    rest += more
+                line = rest
+            w.write(line, src)
+    except (OSError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        writer.close()
+
+
+async def main():
+    w = Writer()
+    os.makedirs(w.path, exist_ok=True)
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(lambda: Udp(w), local_addr=(BIND or "0.0.0.0", PORT), family=socket.AF_INET)
+    srv = await asyncio.start_server(lambda r, wr: tcp_client(w, r, wr), BIND or "0.0.0.0", PORT)
+    print("untrash-syslogd: %s, format %s, %d months, port %d" % (w.path, " ".join(w.fmt), w.months, PORT), flush=True)
+    async with srv:
+        await srv.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

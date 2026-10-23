@@ -1,0 +1,27 @@
+#!/usr/bin/python3
+"""mod_authnz_external "pipe" authenticator for WebDAV (runs as www-data):
+user and password on stdin, one per line.  The check itself runs as root in
+untrash-authd (socket /run/untrash/authd.sock), www-data never sees hashes.
+Exit 0 = SMB or Unix password matches (pylib/untrash_auth.py)."""
+import os
+import socket
+import sys
+import time
+
+SOCK = os.environ.get("ZT_AUTHD_SOCK", "/run/untrash/authd.sock")
+lines = sys.stdin.buffer.read(8192).split(b"\n")
+user, pw = (lines + [b"", b""])[:2]
+if not user or b"\0" in user + pw:
+    sys.exit(1)
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(20)
+    s.connect(SOCK)
+    s.sendall(user + b"\0" + pw + b"\0")
+    s.shutdown(socket.SHUT_WR)
+    ok = s.recv(16).startswith(b"OK")
+except OSError:
+    ok = False
+if not ok:
+    time.sleep(1)
+sys.exit(0 if ok else 1)

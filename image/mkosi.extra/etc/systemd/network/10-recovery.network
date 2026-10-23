@@ -1,0 +1,15 @@
+# Recovery address as in the RAM/loader stages, plus DHCP so that
+# chrony reaches the NTP pool and keeps the RTC current (kernel 11-minute
+# mode).  The fixed address stays the SSH path when no DHCP server
+# answers.
+[Match]
+Name=eth0
+
+[Network]
+Address=169.254.100.64/1
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseDomains=no

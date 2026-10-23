@@ -1,0 +1,17 @@
+[Unit]
+Description=UntrashOS: WebDAV (Apache mod_dav, stock ports 5002/5003)
+ConditionPathExists=/etc/untrash/webdav/httpd.conf
+After=network.target untrash-zyxel.service untrash-data.service
+Wants=untrash-authd.socket
+
+[Service]
+# files created over WebDAV get 0666/0777 like the stock Samba rules (force mode 0777)
+UMask=0000
+RuntimeDirectory=untrash-webdav
+ExecStart=/usr/sbin/apache2 -DFOREGROUND -f /etc/untrash/webdav/httpd.conf
+ExecReload=/usr/sbin/apache2 -f /etc/untrash/webdav/httpd.conf -k graceful
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

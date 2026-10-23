@@ -1,0 +1,20 @@
+[Unit]
+Description=UntrashOS: take over the stock users, shares and settings staged by the installer (ways B/C)
+# untrash-installer (way B) leaves the stock /etc/zyxel copy and the marker in
+# /.untrash of the volume this system boots from (slot file boot).
+# The marker goes only after the whole takeover succeeded: an interrupted run
+# runs again at the next start (apply resumes with the same stock config).
+ConditionPathExists=/run/untrash/host/.untrash/takeover-pending
+After=local-fs.target systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/untrash-import-zyxel apply /run/untrash/host/.untrash/stock-config --yes-take-over
+# then every other stock setting (name, time, network, services, spin-down,
+# USB names) -> /etc/untrash/settings.json, applied (untrash-config)
+ExecStartPost=/usr/sbin/untrash-config import-stock /etc/untrash/zyxel/stock-config --once
+ExecStartPost=/usr/sbin/untrash-config apply
+ExecStartPost=/usr/bin/rm -f /run/untrash/host/.untrash/takeover-pending
+
+[Install]
+WantedBy=multi-user.target

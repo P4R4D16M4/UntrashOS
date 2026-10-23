@@ -1,0 +1,8 @@
+[Unit]
+Description=UntrashOS: port forwarding on the router (UPnP IGD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/untrash/untrash-upnp apply

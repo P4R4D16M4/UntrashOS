@@ -1,0 +1,12 @@
+[Unit]
+Description=UntrashOS: USB printer %I (CUPS raw queue, stock printer sharing)
+ConditionPathExists=/etc/untrash/printing.enabled
+BindsTo=dev-usb-%i.device
+After=dev-usb-%i.device cups.service
+Wants=cups.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/untrash/untrash-printer add %I
+ExecStop=/usr/lib/untrash/untrash-printer remove %I

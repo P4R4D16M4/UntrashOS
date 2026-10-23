@@ -1,0 +1,19 @@
+#!/bin/sh
+# Write a slot file (head + 8 KiB trailer, os/install/mk-stick-system.sh) to a
+# slot partition: head at the start, trailer into the last 8 KiB; read back
+# and compare (as the installer's way A does).
+#   untrash-slot-write SLOT.utslot /dev/sdXN
+set -e
+F=$1; P=$2
+[ -f "$F" ] && [ -b "$P" ] || { echo "usage: untrash-slot-write FILE PARTITION" >&2; exit 2; }
+size=$(stat -c %s "$F"); hlen=$((size - 8192)); psize=$(blockdev --getsize64 "$P")
+[ $((hlen % 4096)) = 0 ] && [ $hlen -gt 0 ] && [ $size -le $psize ] || { echo "bad slot file or partition too small" >&2; exit 1; }
+blocks=$((psize / 4096))
+dd if="$F" of="$P" bs=4096 count=$((hlen / 4096)) conv=fsync status=none
+dd if="$F" of="$P" bs=4096 skip=$((hlen / 4096)) seek=$((blocks - 2)) count=2 conv=fsync status=none
+echo 3 >/proc/sys/vm/drop_caches
+want_h=$(head -c $hlen "$F" | sha256sum | cut -d' ' -f1); want_t=$(tail -c 8192 "$F" | sha256sum | cut -d' ' -f1)
+got_h=$(head -c $hlen "$P" | sha256sum | cut -d' ' -f1)
+got_t=$(dd if="$P" bs=4096 skip=$((blocks - 2)) count=2 status=none | sha256sum | cut -d' ' -f1)
+[ "$want_h" = "$got_h" ] && [ "$want_t" = "$got_t" ] || { echo "read-back mismatch" >&2; exit 1; }
+echo "slot written to $P ($hlen bytes + trailer), read back OK"

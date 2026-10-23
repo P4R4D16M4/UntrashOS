@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+"""untrash-syslog-forward - send the journal to a syslog server (stock
+maintenance.log.syslog: address, all categories).  RFC 3164 over UDP.
+Settings: /etc/untrash/syslog-forward.env (SERVER, PORT; untrash-config)."""
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+ENV = os.environ.get("ZT_SYSLOGFWD_ENV", "/etc/untrash/syslog-forward.env")
+
+
+def main():
+    try:
+        env = dict(l.strip().split("=", 1) for l in open(ENV) if "=" in l)
+    except OSError:
+        env = {}
+    server, port = env.get("SERVER", ""), int(env.get("PORT") or 514)
+    if not server:
+        print("no syslog server configured", flush=True)
+        return 0
+    host = socket.gethostname()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    addr, resolved = None, 0
+    cmd = os.environ.get("ZT_SYSLOGFWD_CMD", "journalctl -f -n 0 -o json --no-pager").split()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    for line in p.stdout:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if time.time() - resolved > 300 or addr is None:
+            try:
+                addr = (socket.gethostbyname(server), port)
+                resolved = time.time()
+            except OSError:
+                continue
+        msg = e.get("MESSAGE")
+        if isinstance(msg, list):           # binary message: byte list
+            msg = bytes(msg).decode("utf-8", "replace")
+        fac, lev = e.get("SYSLOG_FACILITY"), e.get("PRIORITY")
+        pri = int(fac if str(fac).isdigit() else 3) * 8 + int(lev if str(lev).isdigit() else 6)
+        ts = int(e.get("__REALTIME_TIMESTAMP", time.time() * 1e6)) / 1e6
+        tag = e.get("SYSLOG_IDENTIFIER") or e.get("_COMM") or "untrash"
+        pid = e.get("_PID") or e.get("SYSLOG_PID")
+        t = time.localtime(ts)
+        stamp = time.strftime("%b ", t) + "%2d" % t.tm_mday + time.strftime(" %H:%M:%S", t)   # RFC 3164
+        out = "<%d>%s %s %s%s: %s" % (pri, stamp, host, tag, "[%s]" % pid if pid else "", msg or "")
+        try:
+            sock.sendto(out.encode("utf-8", "replace")[:2048], addr)
+        except OSError:
+            addr = None
+    return p.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

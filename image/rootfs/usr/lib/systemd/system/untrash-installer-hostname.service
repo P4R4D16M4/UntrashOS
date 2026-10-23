@@ -1,0 +1,17 @@
+[Unit]
+Description=UntrashOS installer: network name zyxel-untrash (DHCP, mDNS)
+# installer-plan.md: the installer is reachable as zyxel-untrash(.local).
+# Kernel hostname only (the stick system keeps no state); set before the
+# network and Avahi start, so DHCP and mDNS announce this name.
+ConditionKernelCommandLine=untrash.installer=1
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=network-pre.target avahi-daemon.service systemd-networkd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hostname zyxel-untrash
+
+[Install]
+WantedBy=sysinit.target

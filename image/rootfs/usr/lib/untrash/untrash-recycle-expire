@@ -1,0 +1,13 @@
+#!/bin/sh
+# Stock recycle bin expiry (ugs_misc rbm_expire_day -> /etc/untrash/recycle.env):
+# files older than EXPIRE_DAYS in the "recycle" folder of every share with
+# recycle bin are deleted (0 = keep forever).
+EXPIRE_DAYS=0
+[ -f /etc/untrash/recycle.env ] && . /etc/untrash/recycle.env
+[ "$EXPIRE_DAYS" -gt 0 ] 2>/dev/null || exit 0
+sed -n '/^\[/{h;d};/vfs objects = .*recycle/{x;p}' /etc/samba/smb.conf 2>/dev/null | tr -d '[]' | while read -r s; do
+	p=$(sed -n "/^\[$s\]/,/^\[/s/^\tpath = //p" /etc/samba/smb.conf | head -1)
+	[ -d "$p/recycle" ] || continue
+	find "$p/recycle" -xdev -type f -mtime +"$EXPIRE_DAYS" -delete
+	find "$p/recycle" -xdev -mindepth 1 -type d -empty -delete
+done

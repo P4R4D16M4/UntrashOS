@@ -1,0 +1,12 @@
+[Unit]
+Description=UntrashOS: syslog server for other devices (stock Syslog Server)
+ConditionPathExists=/etc/untrash/syslog-server.json
+After=network.target untrash-zyxel.service untrash-data.service
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-syslogd
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

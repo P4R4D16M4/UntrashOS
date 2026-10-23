@@ -1,0 +1,273 @@
+#!/usr/bin/python3
+"""untrash-cloud - the stock cloud apps with rclone.
+
+Stock: DropboxClient and GoogleDriveClient (folder <-> account sync), Upload
+Manager (new files of a share -> FTP server).  Accounts ("remotes") live in
+/etc/untrash/rclone.conf (0600, never sent to the browser); jobs in
+/etc/untrash/settings.json "cloud.jobs" (untrash-desk).
+
+  remotes                         JSON [{name, type}]
+  auth-start dropbox|drive        start rclone's OAuth helper; JSON {url}: the
+                                  provider login page for the user's browser
+  auth-finish NAME URL            URL = the address the browser was sent back
+                                  to (http://127.0.0.1:53682/?...), copied from
+                                  its address bar; stores remote NAME
+  add-ftp NAME HOST PORT USER TLS password on stdin
+  delete NAME
+  run [JOB_ID]                    due jobs (untrash-cloud.timer) or one job now
+  status                          JSON {job id: last result}
+
+Job: {id, name, remote, path, local, direction both|up|down, interval_min,
+active}.  both = rclone bisync (first run --resync), up = copy new/changed
+files to the cloud (Upload Manager), down = copy from the cloud.  Deleting
+on one side is only mirrored by "both".
+"""
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CONF = os.environ.get("ZT_CLOUD_RCLONE_CONF", "/etc/untrash/rclone.conf")
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+STATE = os.environ.get("ZT_CLOUD_STATE", "/var/lib/untrash/cloud")
+RUN = os.environ.get("ZT_CLOUD_RUN", "/run/untrash")
+RCLONE = os.environ.get("ZT_RCLONE", "rclone")
+AUTH_PORT = 53682                      # rclone's fixed OAuth redirect port
+PROVIDERS = {"dropbox": "dropbox", "drive": "drive"}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+
+
+def out(obj):
+    print(json.dumps(obj, indent=1))
+
+
+def die(msg, code=1):
+    print("untrash-cloud: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def rclone(*args, input=None, check=True):
+    r = subprocess.run([RCLONE, "--config", CONF] + list(args), input=input, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if check and r.returncode:
+        die("rclone %s: %s" % (args[0], r.stdout.strip()[-400:]))
+    return r
+
+
+def secure_conf():
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    if not os.path.exists(CONF):
+        os.close(os.open(CONF, os.O_WRONLY | os.O_CREAT, 0o600))
+    os.chmod(CONF, 0o600)
+
+
+def remotes():
+    r = rclone("config", "dump", check=False)
+    try:
+        d = json.loads(r.stdout or "{}")
+    except ValueError:
+        d = {}
+    return [{"name": k, "type": v.get("type", "?")} for k, v in sorted(d.items())]
+
+
+# ------------------------------------------------------------------ OAuth
+
+def auth_start(provider):
+    """rclone authorize runs its redirect server on 127.0.0.1:53682; its
+    /auth?state= page only redirects to the provider, so we read that
+    Location and give it to the browser on the other device."""
+    if provider not in PROVIDERS:
+        die("unknown provider")
+    os.makedirs(RUN, exist_ok=True)
+    st = os.path.join(RUN, "cloud-auth.json")
+    try:
+        old = json.load(open(st))
+        os.kill(old["pid"], 15)
+    except (OSError, ValueError, KeyError):
+        pass
+    logf = os.path.join(RUN, "cloud-auth.log")
+    lf = open(logf, "w")
+    p = subprocess.Popen([RCLONE, "authorize", PROVIDERS[provider], "--auth-no-open-browser"], stdout=lf,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    local = None
+    for _ in range(100):
+        time.sleep(0.1)
+        m = re.search(r"(http://127\.0\.0\.1:%d/auth\?state=[\w-]+)" % AUTH_PORT, open(logf).read())
+        if m:
+            local = m.group(1)
+            break
+        if p.poll() is not None:
+            break
+    if not local:
+        p.kill()
+        die("rclone authorize did not start: %s" % open(logf).read()[-300:])
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    try:
+        urllib.request.build_opener(NoRedirect).open(local, timeout=10)
+        die("no redirect from rclone")
+    except urllib.error.HTTPError as e:
+        url = e.headers.get("Location", "")
+    if not url.startswith("https://"):
+        p.kill()
+        die("unexpected login address")
+    json.dump({"pid": p.pid, "provider": provider, "log": logf, "started": int(time.time())}, open(st, "w"))
+    out({"url": url, "provider": provider})
+
+
+def auth_finish(name, url):
+    if not NAME_RE.match(name):
+        die("name: letters, digits, _ -")
+    if any(r["name"] == name for r in remotes()):
+        die("account %s exists" % name)
+    u = urllib.parse.urlsplit(url.strip())
+    q = urllib.parse.parse_qs(u.query)
+    if u.hostname not in ("127.0.0.1", "localhost") or (u.port or 80) != AUTH_PORT or "state" not in q:
+        die("Das ist nicht die Rücksprung-Adresse (http://127.0.0.1:%d/?state=…&code=…)." % AUTH_PORT)
+    if "code" not in q:
+        die("Anmeldung abgelehnt: %s" % (q.get("error", ["kein code"])[0]))
+    st = json.load(open(os.path.join(RUN, "cloud-auth.json")))
+    local = "http://127.0.0.1:%d/?%s" % (AUTH_PORT, u.query)
+    try:
+        urllib.request.urlopen(local, timeout=30).read()
+    except OSError as e:
+        die("rclone hat die Anmeldung nicht angenommen: %s" % e)
+    token = None
+    for _ in range(300):
+        m = re.search(r"--->\s*(\{.*?\})\s*<---", open(st["log"]).read(), re.S)
+        if m:
+            token = m.group(1)
+            break
+        time.sleep(0.1)
+    if not token:
+        die("kein Token von rclone: %s" % open(st["log"]).read()[-300:])
+    secure_conf()
+    extra = ["scope=drive"] if st["provider"] == "drive" else []
+    rclone("config", "create", name, PROVIDERS[st["provider"]], "token=" + token, *extra, "--non-interactive")
+    os.unlink(os.path.join(RUN, "cloud-auth.json"))
+    out({"name": name, "type": st["provider"]})
+
+
+def add_ftp(name, host, port, user, tls):
+    if not NAME_RE.match(name) or not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", host) or not port.isdigit():
+        die("name/host/port")
+    pw = sys.stdin.read().rstrip("\n")
+    secure_conf()
+    obscured = rclone("obscure", pw, check=True).stdout.strip() if pw else ""
+    args = ["config", "create", name, "ftp", "host=" + host, "port=" + port, "user=" + user]
+    if obscured:
+        args.append("pass=" + obscured)
+    if tls in ("1", "true", "yes"):
+        args.append("explicit_tls=true")
+    rclone(*args, "--non-interactive")
+    out({"name": name, "type": "ftp"})
+
+
+# ------------------------------------------------------------------- jobs
+
+def jobs():
+    try:
+        return (json.load(open(SETTINGS)).get("cloud") or {}).get("jobs") or []
+    except (OSError, ValueError):
+        return []
+
+
+def status_file(jid):
+    return os.path.join(STATE, "%s.json" % re.sub(r"[^A-Za-z0-9_-]", "", jid))
+
+
+def run_job(j):
+    local = j["local"].rstrip("/")
+    remote = "%s:%s" % (j["remote"], j.get("path", "").strip("/"))
+    os.makedirs(local, exist_ok=True)
+    common = ["--log-level", "INFO", "--stats", "0", "--create-empty-src-dirs"]
+    d = j.get("direction", "both")
+    if d == "up":
+        args = ["copy", local, remote] + common
+    elif d == "down":
+        args = ["copy", remote, local] + common
+    else:
+        flag = os.path.join(STATE, "%s.bisync-ok" % j["id"])
+        args = ["bisync", local, remote, "--workdir", os.path.join(STATE, "bisync")] + common[:4]
+        if not os.path.exists(flag):
+            args.append("--resync")
+    os.umask(0)                          # stock: every file 0777 (Samba rules decide)
+    t0 = time.time()
+    r = rclone(*args, check=False)
+    if d == "both" and r.returncode == 0:
+        open(os.path.join(STATE, "%s.bisync-ok" % j["id"]), "w").close()
+    res = {"id": j["id"], "time": int(t0), "seconds": int(time.time() - t0), "ok": r.returncode == 0,
+           "rc": r.returncode, "log": r.stdout.strip().splitlines()[-40:]}
+    json.dump(res, open(status_file(j["id"]), "w"), indent=1)
+    print("%s %s: %s" % (j["id"], d, "ok" if res["ok"] else "FAILED rc %d" % r.returncode), flush=True)
+    return res
+
+
+def cmd_run(jid=None):
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(os.path.join(STATE, "run.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if jid else fcntl.LOCK_NB))
+    except OSError:
+        print("another run is busy", flush=True)
+        return 0
+    rc = 0
+    known = {r["name"] for r in remotes()}
+    for j in jobs():
+        if jid and j.get("id") != jid:
+            continue
+        if not jid:
+            if not j.get("active"):
+                continue
+            try:
+                last = json.load(open(status_file(j["id"]))).get("time", 0)
+            except (OSError, ValueError):
+                last = 0
+            if time.time() - last < 60 * max(5, int(j.get("interval_min") or 60)) - 30:
+                continue
+        if j.get("remote") not in known:
+            print("%s: account %s missing" % (j.get("id"), j.get("remote")), flush=True)
+            rc = 1
+            continue
+        rc |= 0 if run_job(j)["ok"] else 1
+    return rc
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["remotes"]:
+        out(remotes())
+    elif a[:1] == ["auth-start"] and len(a) == 2:
+        auth_start(a[1])
+    elif a[:1] == ["auth-finish"] and len(a) == 3:
+        auth_finish(a[1], a[2])
+    elif a[:1] == ["add-ftp"] and len(a) == 6:
+        add_ftp(*a[1:])
+    elif a[:1] == ["delete"] and len(a) == 2:
+        rclone("config", "delete", a[1])
+        out({"deleted": a[1]})
+    elif a[:1] == ["run"]:
+        return cmd_run(a[1] if len(a) > 1 else None)
+    elif a[:1] == ["status"]:
+        res = {}
+        for j in jobs():
+            try:
+                res[j["id"]] = json.load(open(status_file(j["id"])))
+            except (OSError, ValueError):
+                pass
+        out(res)
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

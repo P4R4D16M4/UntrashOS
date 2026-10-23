@@ -1,0 +1,7 @@
+[Unit]
+Description=UntrashOS: bay LEDs (stock: green = disk, red = failed disk)
+ConditionKernelCommandLine=!untrash.installer=1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/untrash-storage leds

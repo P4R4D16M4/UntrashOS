@@ -1,0 +1,9 @@
+[Unit]
+Description=UntrashOS: Backup Planner jobs (stock BackupPlanner)
+After=untrash-zyxel.service untrash-data.service network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/lib/untrash/untrash-backup run

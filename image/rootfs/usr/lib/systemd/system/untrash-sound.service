@@ -1,0 +1,14 @@
+[Unit]
+Description=UntrashOS NAS542 boot and shutdown sound
+After=multi-user.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/untrash/untrash-sound --optional play boot
+ExecStop=/usr/lib/untrash/untrash-sound --optional play shutdown
+
+[Install]
+WantedBy=multi-user.target

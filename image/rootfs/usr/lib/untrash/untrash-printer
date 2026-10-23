@@ -1,0 +1,71 @@
+#!/usr/bin/python3
+"""untrash-printer add|remove lpN - USB printers like the stock prt_main_model:
+a raw CUPS queue per printer (clients bring their driver; Samba [printers]
+and IPP share it), name from the stock table (system.service.printer.<serial>
+prt_name, imported into settings) or generated as <vendor>_<product>_<n>.
+On removal the queue stays and is disabled (stock: status off-line).
+Started by udev (untrash-printer@lpN.service) when printing is on."""
+import json
+import os
+import re
+import subprocess
+import sys
+
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+SEEN = os.environ.get("ZT_PRINTERS_SEEN", "/var/lib/untrash/printers.json")
+
+
+def attr(dev, name):
+    """USB device attribute of /dev/usb/lpN (interface's parent)."""
+    p = os.path.realpath("/sys/class/usbmisc/%s/device" % dev)
+    for d in (p, os.path.dirname(p)):
+        try:
+            return open(os.path.join(d, name)).read().strip()
+        except OSError:
+            continue
+    return ""
+
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in ("add", "remove") or not re.fullmatch(r"lp\d+", sys.argv[2]):
+        print(__doc__)
+        return 2
+    act, dev = sys.argv[1:]
+    seen = load(SEEN)
+    serial = attr(dev, "serial") or "%s-%s" % (attr(dev, "idVendor"), attr(dev, "idProduct"))
+    names = (load(SETTINGS).get("services", {}).get("printer", {}) or {}).get("names", {})
+    name = names.get(serial) or (seen.get(serial) or {}).get("name")
+    if act == "remove":
+        if name:
+            subprocess.run(["cupsdisable", name], check=False)
+            seen.setdefault(serial, {})["status"] = "off-line"
+    else:
+        if not name:
+            base = re.sub(r"[^A-Za-z0-9_]", "_", "%s_%s_" % (attr(dev, "manufacturer") or "USB",
+                                                             attr(dev, "product") or "Printer"))
+            used = {v.get("name") for v in seen.values()} | set(names.values())
+            i = 1
+            while base + str(i) in used:
+                i += 1
+            name = base + str(i)
+        subprocess.run(["lpadmin", "-p", name, "-v", "parallel:/dev/usb/%s" % dev, "-E",
+                        "-o", "printer-is-shared=true"], check=True)
+        subprocess.run(["cupsctl", "--share-printers"], check=False)
+        seen[serial] = {"name": name, "dev": dev, "status": "on-line",
+                        "model": "%s %s" % (attr(dev, "manufacturer"), attr(dev, "product"))}
+    os.makedirs(os.path.dirname(SEEN), exist_ok=True)
+    json.dump(seen, open(SEEN + ".tmp", "w"), indent=1)
+    os.replace(SEEN + ".tmp", SEEN)
+    print("%s %s %s (%s)" % (act, dev, name, serial), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

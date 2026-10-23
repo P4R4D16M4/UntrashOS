@@ -1,0 +1,41 @@
+#!/bin/sh
+# untrash-servicekey - service SSH access from the UntrashOS stick.
+# If the stick (FAT label UNTRASHPK) is plugged in at boot and carries
+# UNTRASH/ssh/authorized_keys, its public keys go to
+# /run/untrash/servicekey/authorized_keys (tmpfs, root only), which sshd
+# accepts for root (sshd_config.d/20-untrash-servicekey.conf), and ssh starts.
+# Without the stick nothing happens; the keys never reach persistent storage.
+OUT=${ZT_SK_OUT:-/run/untrash/servicekey}		# test hooks: ZT_SK_OUT, ZT_SK_NOSSH=1
+log() { echo "untrash-servicekey: $*"; echo "UNTRASH-SERVICEKEY: $*" >/dev/kmsg 2>/dev/null; }
+dev=
+for i in $(seq 1 20); do
+	[ -e /dev/disk/by-label/UNTRASHPK ] && { dev=$(readlink -f /dev/disk/by-label/UNTRASHPK); break; }
+	sleep 1
+done
+[ -n "$dev" ] || { log "no UntrashOS stick"; exit 0; }
+mnt=$(findmnt -n -o TARGET --source "$dev" | head -1)
+tmp=
+if [ -z "$mnt" ]; then
+	tmp=$(mktemp -d /run/untrash-servicekey.XXXXXX)
+	mount -t vfat -o ro,nosuid,nodev,noexec "$dev" "$tmp" || { log "mount $dev failed"; rmdir "$tmp"; exit 0; }
+	mnt=$tmp
+fi
+keys=$mnt/UNTRASH/ssh/authorized_keys
+if [ -f "$keys" ]; then
+	umask 077; mkdir -p "$OUT"
+	# public keys only, no options (no command=, from= ... tricks)
+	grep -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com) [A-Za-z0-9+/=]+( [^ ]*)?$' "$keys" | tr -d '\r' >"$OUT/authorized_keys.tmp"
+	n=$(wc -l <"$OUT/authorized_keys.tmp")
+	mv "$OUT/authorized_keys.tmp" "$OUT/authorized_keys"
+	log "$n service key(s) from $dev for root (until the next start)"
+else
+	log "stick $dev has no UNTRASH/ssh/authorized_keys"
+fi
+[ -n "$tmp" ] && { umount "$tmp"; rmdir "$tmp"; }
+if [ -s "$OUT/authorized_keys" ] && [ "${ZT_SK_NOSSH:-0}" != 1 ]; then
+	# --no-block: a blocking start from a boot unit can wait for itself (with
+	# Before=ssh.service ssh would never start).  untrash-config keeps
+	# ssh on while these keys exist, whatever the SSH setting says.
+	systemctl start --no-block ssh.service || log "ssh.service did not start"
+fi
+exit 0

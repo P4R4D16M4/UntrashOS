@@ -1,0 +1,3032 @@
+#!/usr/bin/python3
+"""untrash-desk - the UntrashOS web interface (Untrash Desk), port 80.
+
+Everything the stock web UI did, on the stock data model:
+  users, groups, shares and rights live in the stock database
+  (/etc/untrash/zyxel/stock-config/ugs_conf.db, untrash-import-zyxel renders
+  smb.conf from it); all other settings in /etc/untrash/settings.json
+  (untrash-config renders the system files).
+Login: SMB or Unix password (pylib/untrash_auth.py).  Members of the stock
+group "administrators" and admin manage the NAS; other users see the file
+browser and can change their own password.  First start without users (way
+A): /api/setup sets the admin password and the name.
+Frontend: /usr/share/untrash/desk (index.html, desk.js), design /ut/.
+
+Test mode (ZT_DESK_TEST=1, os/image/tests/test-desk-host.py): system
+commands are only logged, all paths under ZT_DESK_ROOT.
+"""
+import base64
+import datetime
+import glob
+import hashlib
+import hmac
+import html
+import importlib.machinery
+import importlib.util
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TEST = os.environ.get("ZT_DESK_TEST") == "1"
+R = os.environ.get("ZT_DESK_ROOT", "") if TEST else ""
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "pylib"))
+import untrash_auth  # noqa: E402
+import untrash_live  # noqa: E402
+import untrash_tv  # noqa: E402
+
+PORT = int(os.environ.get("ZT_DESK_PORT", "80"))
+CONFIG = R + "/etc/untrash/zyxel/stock-config"
+DB = CONFIG + "/ugs_conf.db"
+TAKEOVER = R + "/etc/untrash/zyxel/takeover.json"
+IMPORT = os.environ.get("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
+CFGTOOL = os.environ.get("ZT_CONFIG_TOOL", "/usr/sbin/untrash-config")
+STATIC = os.environ.get("ZT_DESK_STATIC") or next(
+    (d for d in ("/usr/share/untrash/desk", os.path.join(HERE, "../../share/untrash/desk"))
+     if os.path.isfile(os.path.join(d, "index.html"))), "/usr/share/untrash/desk")
+DESIGN = os.environ.get("ZT_DESIGN_DIR") or next(
+    (d for d in ("/usr/share/untrash/design", os.path.join(HERE, "../../../../../design"))
+     if os.path.isfile(os.path.join(d, "untrash.css"))), "/usr/share/untrash/design")
+# user manual (docs/user-guide, built by tools/manual/build.py; mkslot-erofs.sh
+# copies manual.html as index.html, the screenshots and the PDF)
+MANUAL = os.environ.get("ZT_MANUAL_DIR") or next(
+    (d for d in ("/usr/share/untrash/manual", os.path.join(HERE, "../../../../../../docs/user-guide"))
+     if os.path.isfile(os.path.join(d, "index.html")) or os.path.isfile(os.path.join(d, "manual.html"))),
+    "/usr/share/untrash/manual")
+MANUAL_HDR = (("X-Frame-Options", "SAMEORIGIN"), ("Content-Security-Policy", "default-src 'self' data:; style-src 'unsafe-inline'; frame-ancestors 'self'"))
+IDATA = R + "/i-data"
+EDATA = R + "/e-data"
+STICK_MNT = R + "/run/untrash/desk-stick"
+UPLOAD_DIR = R + "/var/lib/untrash/upload"
+GUEST, EVERYONE, ADMIN_GROUP = "pc-guest", "everyone", "administrators"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")          # stock RULE_USER/GROUP (simplified)
+SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS smb_user (uid integer PRIMARY KEY NOT NULL, uname TEXT NOT NULL, create_type TEXT, utype TEXT, passwd TEXT, description TEXT, UNIQUE (uname COLLATE NOCASE));
+CREATE TABLE IF NOT EXISTS smb_group (gid integer PRIMARY KEY NOT NULL, gname TEXT NOT NULL, gtype TEXT, description TEXT, UNIQUE (gname COLLATE NOCASE));
+CREATE TABLE IF NOT EXISTS group_member (gid integer, gname TEXT, uid integer, uname TEXT);
+CREATE TABLE IF NOT EXISTS ugs_misc (key TEXT PRIMARY KEY NOT NULL, value TEXT);
+CREATE TABLE IF NOT EXISTS smb_share (s_name TEXT primary key NOT NULL, s_path TEXT NOT NULL, create_type TEXT, s_desc TEXT, s_enable TEXT, browseable TEXT, recycle TEXT, mdaserv_public_type INT, web_public TEXT, UNIQUE (s_name COLLATE NOCASE));
+CREATE TABLE IF NOT EXISTS share_user_privilege (s_name TEXT, uid INT, uname TEXT, privilege TEXT);
+CREATE TABLE IF NOT EXISTS share_group_privilege (s_name TEXT, gid INT, gname TEXT, privilege TEXT);
+"""
+LOCK = threading.RLock()       # one change at a time (database + system files)
+SYSLOG = []                    # test mode: commands that would have run
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=400):
+        super().__init__(msg)
+        self.code = code
+
+
+def load_module(path, name):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, path))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+IMP = load_module(IMPORT, "untrash_import_zyxel")
+
+
+def sysrun(cmd, input=None, check=True):
+    """System command (logged instead in test mode)."""
+    if TEST:
+        SYSLOG.append(cmd)
+        return ""
+    r = subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = r.stdout.decode("utf-8", "replace")
+    if check and r.returncode:
+        raise Fail("%s: %s" % (cmd[0], out.strip()[-300:]), 500)
+    return out
+
+
+def read(cmd, timeout=20):
+    """Read-only command (also runs in test mode, empty on failure)."""
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+        return r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# ------------------------------------------------------------- stock database
+
+def db():
+    os.makedirs(CONFIG, mode=0o700, exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.executescript(SCHEMA)
+    return c
+
+
+def initialized():
+    if not os.path.isfile(DB):
+        return False
+    c = db()
+    try:
+        return c.execute("SELECT count(*) FROM smb_user WHERE uname='admin'").fetchone()[0] > 0
+    finally:
+        c.close()
+
+
+def is_admin(user):
+    if user in ("admin", "root"):
+        return True
+    c = db()
+    try:
+        return c.execute("SELECT count(*) FROM group_member WHERE uname=? AND gname=?",
+                         (user, ADMIN_GROUP)).fetchone()[0] > 0
+    finally:
+        c.close()
+
+
+def resmb():
+    """smb.conf from the database, Samba reload (after every rights change)."""
+    if TEST:
+        stock = IMP.Stock(CONFIG)
+        text, _s = IMP.render_smbconf(stock, path_exists=lambda p: True)
+        os.makedirs(R + "/etc/samba", exist_ok=True)
+        open(R + "/etc/samba/smb.conf", "w").write(text)
+        SYSLOG.append(["smbcontrol", "smbd", "reload-config"])
+        return
+    sysrun([IMPORT, "render", CONFIG, "--out", "/etc/samba/smb.conf"])
+    sysrun(["smbcontrol", "smbd", "reload-config"], check=False)
+    sysrun([CFGTOOL, "shares-changed"], check=False)      # WebDAV rights follow the share rights
+
+
+def mark_takeover():
+    """Way A/first setup: the database is ours now, Samba runs from it."""
+    if not os.path.exists(TAKEOVER):
+        os.makedirs(os.path.dirname(TAKEOVER), mode=0o700, exist_ok=True)
+        with open(TAKEOVER, "w") as f:
+            json.dump({"rw": True, "config": CONFIG.replace(R, "", 1), "source": "untrash-desk"}, f)
+        sysrun(["systemctl", "enable", "--now", "untrash-zyxel.service", "smbd.service", "nmbd.service"], check=False)
+
+
+def users():
+    c = db()
+    try:
+        out = []
+        for uid, uname, ctype, utype, pw, desc in c.execute(
+                "SELECT uid, uname, create_type, utype, passwd, description FROM smb_user ORDER BY uid"):
+            groups = [g for (g,) in c.execute("SELECT gname FROM group_member WHERE uname=? ORDER BY gname", (uname,))]
+            out.append({"uid": uid, "name": uname, "type": utype, "builtin": ctype in ("bulit-in", "built-in"),
+                        "description": desc or "", "groups": groups,
+                        "admin": uname == "admin" or ADMIN_GROUP in groups})
+        return out
+    finally:
+        c.close()
+
+
+def groups():
+    c = db()
+    try:
+        return [{"gid": gid, "name": g, "description": d or "", "builtin": g == EVERYONE,
+                 "members": [u for (u,) in c.execute("SELECT uname FROM group_member WHERE gname=? ORDER BY uname", (g,))]}
+                for gid, g, _t, d in c.execute("SELECT gid, gname, gtype, description FROM smb_group ORDER BY gid")]
+    finally:
+        c.close()
+
+
+def check_password(pw):
+    if not isinstance(pw, str) or len(pw) < 8 or len(pw) > 64 or "\n" in pw or "\0" in pw:
+        raise Fail("Das Passwort braucht 8 bis 64 Zeichen.")
+
+
+def smb_set_password(name, uid, pw):
+    nt = untrash_auth.nt_hash(pw)
+    c = db()
+    try:
+        c.execute("UPDATE smb_user SET passwd=? WHERE uname=?", ("X" * 32 + ":" + nt, name))
+        if name == "admin":
+            sh = untrash_auth.unix_crypt(pw, "$6$" + secrets.token_hex(8) + "$")
+            c.execute("INSERT OR REPLACE INTO ugs_misc VALUES ('admin_shadow_passwd', ?)", (sh,))
+            sysrun(["usermod", "-p", sh, "admin"])
+        c.commit()
+    finally:
+        c.close()
+    line = "%s:%d:%s:%s:[U          ]:LCT-00000000:\n" % (name, uid, "X" * 32, nt)
+    if TEST:
+        SYSLOG.append(["pdbedit-import", name])
+        return
+    tmp = os.path.join("/run/untrash", "pw-%s" % secrets.token_hex(6))
+    os.makedirs("/run/untrash", exist_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, line.encode())
+        os.close(fd)
+        sysrun(["pdbedit", "-x", "-u", name], check=False)
+        sysrun(["pdbedit", "-i", "smbpasswd:" + tmp, "-e", "tdbsam"])
+    finally:
+        os.unlink(tmp)
+
+
+def user_create(req):
+    name, pw = req.get("name", ""), req.get("password", "")
+    if not NAME_RE.match(name) or name.lower() in ("root", "admin", GUEST, "nobody", EVERYONE):
+        raise Fail("Ungültiger Benutzername.")
+    check_password(pw)
+    c = db()
+    try:
+        if c.execute("SELECT 1 FROM smb_user WHERE uname=? COLLATE NOCASE", (name,)).fetchone():
+            raise Fail("Den Benutzer gibt es schon.")
+        uid = max(503, c.execute("SELECT max(uid) FROM smb_user").fetchone()[0] or 0) + 1
+        c.execute("INSERT INTO smb_user VALUES (?,?,?,?,?,?)",
+                  (uid, name, "user-create", "user", "", (req.get("description") or "")[:60]))
+        c.execute("INSERT INTO group_member VALUES (500, ?, ?, ?)", (EVERYONE, uid, name))
+        c.commit()
+    finally:
+        c.close()
+    sysrun(["useradd", "-u", str(uid), "-g", "500", "-M", "-d", "/nonexistent", "-s", "/usr/sbin/nologin",
+            "-c", (req.get("description") or "")[:60], name])
+    smb_set_password(name, uid, pw)
+    for g in req.get("groups") or []:
+        group_member(g, name, True)
+    resmb()
+    return {"uid": uid}
+
+
+def user_delete(req):
+    name = req.get("name", "")
+    if name in ("admin", GUEST):
+        raise Fail("Eingebaute Benutzer bleiben.")
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM smb_user WHERE uname=?", (name,)).fetchone():
+            raise Fail("Unbekannter Benutzer.", 404)
+        for t in ("smb_user", "group_member", "share_user_privilege"):
+            c.execute("DELETE FROM %s WHERE uname=?" % t, (name,))
+        c.commit()
+    finally:
+        c.close()
+    sysrun(["pdbedit", "-x", "-u", name], check=False)
+    sysrun(["userdel", name], check=False)
+    resmb()
+    return {}
+
+
+def user_quota(name):
+    """Stock per-user, per-volume hard block limit (user_grp_func.set_vol_quota)."""
+    c = db()
+    try:
+        r = c.execute("SELECT uid FROM smb_user WHERE uname=?", (name,)).fetchone()
+    finally:
+        c.close()
+    if not r:
+        raise Fail("Unbekannter Benutzer.", 404)
+    uid = r[0]
+    out = []
+    for v in volumes():
+        if v["kind"] != "intern":
+            continue
+        used = limit = 0
+        for line in read(["repquota", "-n", "-u", "-O", "csv", v["path"]]).splitlines()[1:]:
+            f = line.split(",")
+            if len(f) > 5 and f[0].lstrip("#") == str(uid):
+                used, limit = int(f[3] or 0), int(f[5] or 0)
+        out.append({"volume": v["id"], "label": v["label"], "used_kb": used, "limit_gb": round(limit / 1048576.0, 2)})
+    return {"uid": uid, "quotas": out}
+
+
+def user_quota_set(req):
+    q = user_quota(req.get("name", ""))
+    vols = {v["id"]: v for v in volumes() if v["kind"] == "intern"}
+    for vid, gb in (req.get("quotas") or {}).items():
+        if vid not in vols:
+            raise Fail("Unbekanntes Volume.")
+        gb = int(gb or 0)
+        if not 0 <= gb <= 16383:
+            raise Fail("Kontingent 0 (ohne Grenze) bis 16383 GB.")
+        sysrun(["setquota", "-u", str(q["uid"]), "0", str(gb * 1048576), "0", "0", vols[vid]["path"]])
+    return {}
+
+
+def user_password(req, me):
+    name = req.get("name") or me
+    if name != me and not is_admin(me):
+        raise Fail("Nur Administratoren ändern fremde Passwörter.", 403)
+    if name == me and not is_admin(me) and not auth_ok(me, req.get("old", "")):
+        raise Fail("Das bisherige Passwort stimmt nicht.", 403)
+    check_password(req.get("password", ""))
+    c = db()
+    try:
+        r = c.execute("SELECT uid FROM smb_user WHERE uname=?", (name,)).fetchone()
+    finally:
+        c.close()
+    if not r or name == GUEST:
+        raise Fail("Unbekannter Benutzer.", 404)
+    smb_set_password(name, r[0], req["password"])
+    return {}
+
+
+def auth_ok(user, pw):
+    if TEST:
+        return pw == os.environ.get("ZT_DESK_TESTPW")
+    return untrash_auth.check(user, pw)
+
+
+def group_member(gname, uname, add):
+    c = db()
+    try:
+        g = c.execute("SELECT gid FROM smb_group WHERE gname=?", (gname,)).fetchone()
+        u = c.execute("SELECT uid FROM smb_user WHERE uname=?", (uname,)).fetchone()
+        if not g or not u:
+            raise Fail("Unbekannte Gruppe oder unbekannter Benutzer.", 404)
+        if gname == EVERYONE:
+            raise Fail("Alle Benutzer gehören zu everyone.")
+        c.execute("DELETE FROM group_member WHERE gname=? AND uname=?", (gname, uname))
+        if add:
+            c.execute("INSERT INTO group_member VALUES (?,?,?,?)", (g[0], gname, u[0], uname))
+        c.commit()
+    finally:
+        c.close()
+    sysrun(["gpasswd", "-a" if add else "-d", uname, gname], check=False)
+
+
+def group_create(req):
+    name = req.get("name", "")
+    if not NAME_RE.match(name) or name.lower() in (EVERYONE, "root", "users", "admin"):
+        raise Fail("Ungültiger Gruppenname.")
+    c = db()
+    try:
+        if c.execute("SELECT 1 FROM smb_group WHERE gname=? COLLATE NOCASE", (name,)).fetchone():
+            raise Fail("Die Gruppe gibt es schon.")
+        gid = max(500, c.execute("SELECT max(gid) FROM smb_group").fetchone()[0] or 0) + 1
+        c.execute("INSERT INTO smb_group VALUES (?,?,?,?)", (gid, name, "local", (req.get("description") or "")[:60]))
+        c.commit()
+    finally:
+        c.close()
+    sysrun(["groupadd", "-g", str(gid), name])
+    for u in req.get("members") or []:
+        group_member(name, u, True)
+    resmb()
+    return {"gid": gid}
+
+
+def group_delete(req):
+    name = req.get("name", "")
+    if name == EVERYONE:
+        raise Fail("everyone bleibt.")
+    c = db()
+    try:
+        for t in ("smb_group", "group_member", "share_group_privilege"):
+            c.execute("DELETE FROM %s WHERE gname=?" % t, (name,))
+        c.commit()
+    finally:
+        c.close()
+    sysrun(["groupdel", name], check=False)
+    resmb()
+    return {}
+
+
+def group_set_members(req):
+    name, want = req.get("name", ""), set(req.get("members") or [])
+    have = set(next((g["members"] for g in groups() if g["name"] == name), []))
+    for u in sorted(want - have):
+        group_member(name, u, True)
+    for u in sorted(have - want):
+        group_member(name, u, False)
+    resmb()
+    return {}
+
+
+# ---------------------------------------------------------------- shares
+
+def volumes():
+    """Mounted data volumes under /i-data (stock and ut-data) and /e-data."""
+    out = []
+    for root, kind in ((IDATA, "intern"), (EDATA, "usb")):
+        for d in sorted(glob.glob(root + "/*")):
+            n = os.path.basename(d)
+            if n in ("sysvol", ".system", ".media") or os.path.islink(d) or not os.path.isdir(d):
+                continue
+            label = ""
+            try:
+                label = open(os.path.join(d, ".system", "name_label")).read().strip()
+            except OSError:
+                pass
+            try:
+                st = os.statvfs(d)
+                size, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+            except OSError:
+                size = free = 0
+            out.append({"id": n, "path": d.replace(R, "", 1), "kind": kind, "label": label or n,
+                        "size": size, "free": free, "sysvol": os.path.realpath(IDATA + "/sysvol") == os.path.realpath(d)})
+    return out
+
+
+def shares():
+    c = db()
+    try:
+        out = []
+        for s_name, s_path, ctype, desc, en, br, rc, media, web in c.execute(
+                "SELECT s_name, s_path, create_type, s_desc, s_enable, browseable, recycle, mdaserv_public_type, "
+                "web_public FROM smb_share ORDER BY s_name COLLATE NOCASE"):
+            out.append({"name": s_name, "path": s_path, "type": ctype, "description": desc or "",
+                        "enabled": en == "y", "browseable": br == "y", "recycle": rc == "y", "media": media or 0,
+                        "web_public": web == "y",
+                        "present": os.path.isdir(R + s_path),
+                        "users": dict(c.execute("SELECT uname, privilege FROM share_user_privilege WHERE s_name=?", (s_name,))),
+                        "groups": dict(c.execute("SELECT gname, privilege FROM share_group_privilege WHERE s_name=?", (s_name,)))})
+        return out
+    finally:
+        c.close()
+
+
+def volume_dirs(q):
+    """Folders below a volume (one level, for the folder picker); admins only."""
+    vol = next((v for v in volumes() if v["id"] == q.get("volume")), None)
+    if not vol:
+        raise Fail("Volume wählen.")
+    rel = "/".join(x for x in str(q.get("path") or "").split("/") if x not in ("", ".", ".."))
+    base = os.path.realpath(R + vol["path"])
+    full = os.path.realpath(os.path.join(base, rel))
+    if full != base and not full.startswith(base + "/") or not os.path.isdir(full):
+        raise Fail("Ordner prüfen.")
+    shared = {x["path"] for x in shares()}
+    out = []
+    for e in sorted(os.scandir(full), key=lambda e: e.name.lower()):
+        if e.is_dir(follow_symlinks=False) and not e.name.startswith((".", "@")):
+            p = vol["path"] + "/" + os.path.relpath(e.path, base)
+            out.append({"name": e.name, "shared": next((x["name"] for x in shares() if x["path"] == p), None) if p in shared else None})
+    return {"volume": vol["id"], "path": rel, "dirs": out}
+
+
+def share_save(req):
+    """Create (new=true) or update a share: description, flags, rights."""
+    name = req.get("name", "")
+    if not SHARE_RE.match(name) or name.lower() in ("global", "homes", "printers", "ipc$"):
+        raise Fail("Ungültiger Freigabename.")
+    c = db()
+    try:
+        exists = c.execute("SELECT s_path FROM smb_share WHERE s_name=? COLLATE NOCASE", (name,)).fetchone()
+        if req.get("new"):
+            if exists:
+                raise Fail("Die Freigabe gibt es schon.")
+            vol = next((v for v in volumes() if v["id"] == req.get("volume")), None)
+            if not vol:
+                raise Fail("Volume wählen.")
+            folder = "/".join(x for x in str(req.get("folder") or "").split("/") if x not in ("", ".", ".."))
+            if folder:
+                # an existing folder on the volume (any depth) becomes the share
+                path = "%s/%s" % (vol["path"], folder)
+                if not os.path.isdir(R + path) or os.path.islink(R + path):
+                    raise Fail("Ordner prüfen.")
+                if any(x[0] == path for x in c.execute("SELECT s_path FROM smb_share")):
+                    raise Fail("Dieser Ordner ist schon freigegeben.")
+            else:
+                path = "%s/%s" % (vol["path"], name)
+            c.execute("INSERT INTO smb_share VALUES (?,?,?,?,?,?,?,?,?)",
+                      (name, path, "user-create", "", "y", "y", "n", 0, "n"))
+            if not folder:
+                if not TEST:
+                    os.makedirs(path, exist_ok=True)
+                    os.chmod(path, 0o777)
+                else:
+                    os.makedirs(R + path, exist_ok=True)
+        elif not exists:
+            raise Fail("Unbekannte Freigabe.", 404)
+        sets = {"s_desc": (req.get("description") or "")[:120],
+                "s_enable": "y" if req.get("enabled", True) else "n",
+                "browseable": "y" if req.get("browseable", True) else "n",
+                "recycle": "y" if req.get("recycle", False) else "n",
+                "mdaserv_public_type": int(req.get("media") or 0) & 7}
+        if "web_public" in req:
+            sets["web_public"] = "y" if req.get("web_public") else "n"
+        c.execute("UPDATE smb_share SET %s WHERE s_name=?" % ", ".join("%s=?" % k for k in sets),
+                  list(sets.values()) + [name])
+        if "users" in req or "groups" in req or req.get("new"):
+            ulist = req.get("users") or ({"admin": "rw"} if req.get("new") else {})
+            glist = req.get("groups") or {}
+            uids = dict(c.execute("SELECT uname, uid FROM smb_user"))
+            gids = dict(c.execute("SELECT gname, gid FROM smb_group"))
+            for u, p in list(ulist.items()) + list(glist.items()):
+                if p not in ("rw", "ro", "deny"):
+                    raise Fail("Recht muss rw, ro oder deny sein.")
+            if any(u not in uids for u in ulist) or any(g not in gids for g in glist):
+                raise Fail("Unbekannter Benutzer oder unbekannte Gruppe in den Rechten.")
+            c.execute("DELETE FROM share_user_privilege WHERE s_name=?", (name,))
+            c.execute("DELETE FROM share_group_privilege WHERE s_name=?", (name,))
+            c.executemany("INSERT INTO share_user_privilege VALUES (?,?,?,?)",
+                          [(name, uids[u], u, p) for u, p in sorted(ulist.items())])
+            c.executemany("INSERT INTO share_group_privilege VALUES (?,?,?,?)",
+                          [(name, gids[g], g, p) for g, p in sorted(glist.items())])
+        c.commit()
+    finally:
+        c.close()
+    resmb()
+    media_sync()
+    return {}
+
+
+def share_delete(req):
+    """Stock semantics: the share disappears, the folder and its data stay."""
+    name = req.get("name", "")
+    c = db()
+    try:
+        r = c.execute("SELECT create_type FROM smb_share WHERE s_name=?", (name,)).fetchone()
+        if not r:
+            raise Fail("Unbekannte Freigabe.", 404)
+        if r[0] == "built-in":
+            raise Fail("Eingebaute Freigaben bleiben.")
+        for t in ("smb_share", "share_user_privilege", "share_group_privilege"):
+            c.execute("DELETE FROM %s WHERE s_name=?" % t, (name,))
+        c.commit()
+    finally:
+        c.close()
+    resmb()
+    media_sync()
+    return {}
+
+
+def media_sync():
+    """Media server shares follow the per-share media flags."""
+    s = settings_load()
+    s["services"]["mediaserver"]["shares"] = {x["name"]: x["media"] for x in shares() if x["enabled"] and x["media"]}
+    settings_save(s, apply=False)
+
+
+# ------------------------------------------------------------- settings
+
+SETTINGS = R + "/etc/untrash/settings.json"
+
+
+def settings_load():
+    cfg = load_module(CFGTOOL, "untrash_config")
+    cfg.SETTINGS = SETTINGS
+    return cfg.load()
+
+
+def settings_save(s, apply=True):
+    cfg = load_module(CFGTOOL, "untrash_config")
+    cfg.SETTINGS = SETTINGS
+    cfg.save(s)
+    if apply:
+        if TEST:
+            SYSLOG.append([CFGTOOL, "apply"])
+        else:
+            threading.Thread(target=lambda: subprocess.run([CFGTOOL, "apply"]), daemon=True).start()
+
+
+IP4 = r"\d{1,3}(\.\d{1,3}){3}"
+
+
+def settings_update(req):
+    """Validated partial update from the Settings/Network/Services windows."""
+    s = settings_load()
+    if "language" in req:
+        if req["language"] not in ("de", "en", "fr"):
+            raise Fail("Unbekannte Sprache.")
+        s["language"] = req["language"]
+    if "hostname" in req:
+        if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?", req["hostname"]):
+            raise Fail("Ungültiger Rechnername.")
+        s["hostname"] = req["hostname"]
+    nb = req.get("netbios")
+    if nb:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,14}", nb.get("name", "")):
+            raise Fail("NetBIOS-Name: bis 15 Zeichen, Buchstaben, Ziffern, Bindestrich.")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,14}", nb.get("workgroup", "")):
+            raise Fail("Ungültige Arbeitsgruppe.")
+        s["netbios"].update({"name": nb["name"], "workgroup": nb["workgroup"],
+                             "description": (nb.get("description") or "")[:48].replace('"', "")})
+    t = req.get("time")
+    if t:
+        if not os.path.isfile(os.path.join(R + "/usr/share/zoneinfo" if TEST else "/usr/share/zoneinfo", t.get("timezone", ""))):
+            raise Fail("Unbekannte Zeitzone.")
+        if not re.fullmatch(r"[A-Za-z0-9.-]{1,80}", t.get("ntp_server", "x")):
+            raise Fail("Ungültiger NTP-Server.")
+        s["time"].update({"timezone": t["timezone"], "ntp": bool(t.get("ntp")), "ntp_server": t.get("ntp_server")})
+    n = req.get("network")
+    if n:
+        for ifn in ("eth0", "eth1"):
+            c = n.get(ifn)
+            if not c:
+                continue
+            if c.get("mode") == "static":
+                if not re.fullmatch(IP4 + r"/\d{1,2}", c.get("address", "")) or \
+                        (c.get("gateway") and not re.fullmatch(IP4, c["gateway"])):
+                    raise Fail("%s: Adresse als a.b.c.d/nn, Gateway als a.b.c.d." % ifn)
+            mtu = int(c.get("mtu") or 1500)
+            if not 576 <= mtu <= 9000:
+                raise Fail("MTU 576 bis 9000.")
+            s["network"][ifn] = {"mode": "static" if c.get("mode") == "static" else "dhcp",
+                                 "address": c.get("address", "") if c.get("mode") == "static" else "",
+                                 "gateway": c.get("gateway", "") if c.get("mode") == "static" else "", "mtu": mtu}
+        if "bond" in n:
+            bd = n["bond"]
+            if bd.get("active") and bd.get("mode_ip") == "static" and (
+                    not re.fullmatch(IP4 + r"/\d{1,2}", bd.get("address", "")) or
+                    (bd.get("gateway") and not re.fullmatch(IP4, bd["gateway"]))):
+                raise Fail("bond0: Adresse als a.b.c.d/nn, Gateway als a.b.c.d.")
+            s["network"]["bond"].update({"active": bool(bd.get("active")), "mode": int(bd.get("mode", 1)) % 7,
+                                         "mode_ip": "static" if bd.get("mode_ip") == "static" else "dhcp",
+                                         "address": bd.get("address", "") if bd.get("mode_ip") == "static" else "",
+                                         "gateway": bd.get("gateway", "") if bd.get("mode_ip") == "static" else ""})
+        if "dns" in n:
+            servers = [x for x in n["dns"].get("servers") or [] if x]
+            if any(not re.fullmatch(IP4, x) for x in servers):
+                raise Fail("DNS-Server als a.b.c.d.")
+            s["network"]["dns"] = {"auto": bool(n["dns"].get("auto")), "servers": servers}
+    sv = req.get("services")
+    if sv:
+        cur = s["services"]
+        if "ssh" in sv:
+            cur["ssh"].update({k: sv["ssh"][k] for k in ("active", "sftp") if k in sv["ssh"]})
+            if "port" in sv["ssh"]:
+                cur["ssh"]["port"] = int(sv["ssh"]["port"])
+        if "ftp" in sv:
+            for k in ("active", "anonymous", "tls"):
+                if k in sv["ftp"]:
+                    cur["ftp"][k] = bool(sv["ftp"][k])
+            for k in ("port", "conn_limit", "idle_min", "pasv_min", "pasv_max", "up_kbs", "down_kbs",
+                      "anon_up_kbs", "anon_down_kbs"):
+                if k in sv["ftp"]:
+                    cur["ftp"][k] = max(0, int(sv["ftp"][k]))
+        if "nfs" in sv:
+            cur["nfs"]["active"] = bool(sv["nfs"].get("active", cur["nfs"]["active"]))
+            if "exports" in sv["nfs"]:
+                ex = []
+                for e in sv["nfs"]["exports"]:
+                    if not re.fullmatch(r"/[^\s]+", e.get("path", "")) or not re.fullmatch(r"[\w.*/:-]+", e.get("clients", "")):
+                        raise Fail("NFS: Pfad und Clients prüfen.")
+                    ex.append({"path": e["path"], "clients": e["clients"],
+                               "options": "ro,sync,no_subtree_check" if e.get("readonly") else "rw,sync,no_subtree_check"})
+                cur["nfs"]["exports"] = ex
+        if "mediaserver" in sv:
+            cur["mediaserver"]["active"] = bool(sv["mediaserver"].get("active"))
+        if "time_machine" in sv:
+            tm = sv["time_machine"]
+            if tm.get("active") and tm.get("share") not in [x["name"] for x in shares()]:
+                raise Fail("Time Machine: Freigabe wählen.")
+            cur["time_machine"] = {"active": bool(tm.get("active")), "share": tm.get("share", "")}
+        if "webdav" in sv:
+            cur["webdav"] = {"active": bool(sv["webdav"].get("active")), "anonymous": bool(sv["webdav"].get("anonymous"))}
+        if "dyndns" in sv:
+            d = sv["dyndns"]
+            cfg = load_module(CFGTOOL, "untrash_config")
+            if d.get("active"):
+                if d.get("provider") not in cfg.DYNDNS:
+                    raise Fail("DynDNS: Anbieter wählen.")
+                if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", d.get("hostname", "")):
+                    raise Fail("DynDNS: Rechnername prüfen.")
+            cur["dyndns"].update({k: str(d.get(k, cur["dyndns"][k]))[:128] for k in ("provider", "username", "hostname")})
+            cur["dyndns"]["active"] = bool(d.get("active"))
+            if d.get("password"):
+                cur["dyndns"]["password"] = str(d["password"])[:128]
+        if "webpublish" in sv:
+            port = int(sv["webpublish"].get("port") or 80)
+            if not (port == 80 or 1024 <= port <= 65535) or port in (5002, 5003):
+                raise Fail("Web Publishing: Port 80 oder 1024 bis 65535 (nicht 5002/5003).")
+            cur["webpublish"] = {"active": bool(sv["webpublish"].get("active")), "port": port}
+        if "download" in sv:
+            d, cd = sv["download"], cur["download"]
+            if d.get("share") and d["share"] not in [x["name"] for x in shares()]:
+                raise Fail("Downloads: Freigabe wählen.")
+            if d.get("period") and not re.fullmatch(r"([01]\d|2[0-3])[0-5]\d:([01]\d|2[0-3])[0-5]\d", d["period"]):
+                raise Fail("Zeitfenster als HHMM:HHMM (z. B. 0100:0700).")
+            clean = lambda p: "/".join(x for x in str(p).split("/") if x not in ("", ".", ".."))[:200]  # noqa: E731
+            cd.update({"active": bool(d.get("active", cd["active"])), "share": d.get("share", cd["share"]),
+                       "folder": clean(d.get("folder", cd["folder"])), "incoming": clean(d.get("incoming", cd["incoming"])),
+                       "bt_port": max(1024, min(65535, int(d.get("bt_port", cd["bt_port"])))),
+                       "dht": bool(d.get("dht", cd["dht"])), "dl_kbs": max(0, int(d.get("dl_kbs", cd["dl_kbs"]))),
+                       "up_kbs": max(0, int(d.get("up_kbs", cd["up_kbs"]))),
+                       "slots": max(1, min(10, int(d.get("slots", cd["slots"])))),
+                       "max_conn": max(2, min(450, int(d.get("max_conn", cd["max_conn"])))),
+                       "ratio": max(-1, min(10000, int(d.get("ratio", cd["ratio"])))),
+                       "seed_min": max(-1, int(d.get("seed_min", cd["seed_min"]))), "period": d.get("period", cd["period"]),
+                       "notify": bool(d.get("notify", cd["notify"]))})
+        if "https" in sv:
+            hp = int(sv["https"].get("port") or 443)
+            if not (hp == 443 or 1024 <= hp <= 65535) or hp in (5002, 5003):
+                raise Fail("HTTPS-Port: 443 oder 1024 bis 65535.")
+            if sv["https"].get("active") and not os.path.isfile(TLS_DIR + "/untrash.crt"):
+                raise Fail("Erst ein Zertifikat erzeugen oder hochladen (Einstellungen → Zertifikat).")
+            new = {"active": bool(sv["https"].get("active")), "port": hp, "force": bool(sv["https"].get("force"))}
+            if new != cur["https"]:
+                cur["https"] = new
+                restart_desk()
+        if "printer" in sv:
+            cur["printer"]["active"] = bool(sv["printer"].get("active"))
+        if "ups" in sv:
+            cur["ups"] = {"active": bool(sv["ups"].get("active")),
+                          "min_capacity": max(1, min(95, int(sv["ups"].get("min_capacity") or 5)))}
+        if "syslog_server" in sv:
+            ss = sv["syslog_server"]
+            path = cur["syslog_server"]["path"]
+            if ss.get("share"):
+                m = {x["name"]: x["path"] for x in shares()}
+                if ss["share"] not in m:
+                    raise Fail("Syslog-Server: Freigabe wählen.")
+                path = m[ss["share"]].rstrip("/") + "/" + re.sub(r"[^A-Za-z0-9._-]", "", ss.get("folder") or "syslog") + "/"
+            if ss.get("active") and not path:
+                raise Fail("Syslog-Server: Freigabe wählen.")
+            cur["syslog_server"] = {"active": bool(ss.get("active")), "path": path,
+                                    "format": ss.get("format") if ss.get("format") in ("simple", "full") else "simple",
+                                    "months": max(1, min(60, int(ss.get("months") or 6)))}
+    cb = req.get("copybtn")
+    if cb:
+        paths = {x["name"]: x["path"] for x in shares()}
+        dirs = {"copy": ("cp2Vol", "cp2USB"), "sync": ("sync2USB", "sync2Vol", "twoWay")}
+        for kind in ("copy", "sync"):
+            c = cb.get(kind)
+            if c is None:
+                continue
+            for k in ("share", "bak_share"):
+                if c.get(k) and c[k] not in paths:
+                    raise Fail("COPY-Taste: Freigabe wählen.")
+            if c.get("share") and c.get("share") == c.get("bak_share"):
+                raise Fail("COPY-Taste: Sicherungsordner muss eine andere Freigabe sein.")
+            if c.get("direction") not in dirs[kind]:
+                raise Fail("COPY-Taste: Richtung prüfen.")
+            cur = s["copybtn"][kind]
+            cur.update({"share_path": paths.get(c.get("share"), ""), "bak_path": paths.get(c.get("bak_share"), ""),
+                        "direction": c["direction"]})
+            if kind == "copy":
+                cur["newdir"] = bool(c.get("newdir")) and not c.get("bak_share")
+    nt = req.get("notify")
+    if nt:
+        mail = nt.get("mail")
+        if mail is not None:
+            m = s["notify"]["mail"]
+            addr = r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+"
+            for k in ("alerts_to", "log_to"):
+                v = (mail.get(k) or "").strip()
+                if v and not re.fullmatch(r"%s(\s*[,;]\s*%s)*" % (addr, addr), v):
+                    raise Fail("E-Mail-Adresse prüfen: %s" % v)
+                m[k] = v
+            if mail.get("from") and not re.fullmatch(addr, mail["from"].strip()):
+                raise Fail("Absenderadresse prüfen.")
+            if mail.get("active") and not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", mail.get("server", "")):
+                raise Fail("Mailserver prüfen.")
+            if mail.get("schedule", "daily") not in ("hourly", "daily", "weekly"):
+                raise Fail("Zeitplan: stündlich, täglich oder wöchentlich.")
+            m.update({"active": bool(mail.get("active")), "server": mail.get("server", m["server"]).strip(),
+                      "port": max(0, min(65535, int(mail.get("port") or 0))), "auth": bool(mail.get("auth")),
+                      "username": str(mail.get("username", m["username"]))[:128], "from": (mail.get("from") or "").strip(),
+                      "subject": str(mail.get("subject", m["subject"]))[:64].replace("\n", " "),
+                      "alerts": bool(mail.get("alerts")), "report_all": bool(mail.get("report_all")),
+                      "schedule": mail.get("schedule", m["schedule"]), "day": int(mail.get("day", m["day"])) % 7,
+                      "hour": int(mail.get("hour", m["hour"])) % 24, "minute": int(mail.get("minute", m["minute"])) % 60})
+            if mail.get("password"):
+                m["password"] = str(mail["password"])[:256]
+        lg = nt.get("syslog")
+        if lg is not None:
+            if lg.get("active") and not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", lg.get("server", "")):
+                raise Fail("Syslog-Server-Adresse prüfen.")
+            s["notify"]["syslog"] = {"active": bool(lg.get("active")), "server": (lg.get("server") or "").strip(),
+                                     "port": max(1, min(65535, int(lg.get("port") or 514)))}
+    p = req.get("power")
+    if p:
+        if "spindown_min" in p:
+            s["power"]["spindown_min"] = max(0, min(600, int(p.get("spindown_min", 0))))
+        if "pwron" in p:
+            if p["pwron"] not in ("always", "never", "former"):
+                raise Fail("Nach Stromausfall: immer, nie oder wie vorher.")
+            s["power"]["pwron"] = p["pwron"]
+        if "wol" in p:
+            s["power"]["wol"] = bool(p["wol"])
+        if "schedule_active" in p:
+            s["power"]["schedule_active"] = bool(p["schedule_active"])
+        if "schedule" in p:
+            sched = []
+            for e in p["schedule"] or []:
+                if e.get("action") not in ("on", "off", "reboot") or e.get("kind") not in ("daily", "weekly", "monthly"):
+                    raise Fail("Zeitplan: Aktion und Wiederholung prüfen.")
+                x = {"action": e["action"], "kind": e["kind"], "hour": int(e.get("hour", 0)), "minute": int(e.get("minute", 0))}
+                if not (0 <= x["hour"] <= 23 and 0 <= x["minute"] <= 59):
+                    raise Fail("Zeitplan: Uhrzeit prüfen.")
+                if e["kind"] == "weekly":
+                    x["day"] = int(e.get("day", 0)) % 7
+                if e["kind"] == "monthly":
+                    x["mday"] = max(1, min(28, int(e.get("mday", 1))))
+                sched.append(x)
+            if len(sched) > 30:
+                raise Fail("Höchstens 30 Zeitplan-Einträge.")
+            s["power"]["schedule"] = sched
+    rc = req.get("recycle")
+    if rc:
+        s["recycle"]["expire_days"] = max(0, min(3650, int(rc.get("expire_days", 0))))
+    settings_save(s)
+    if nb or (sv and "time_machine" in sv):
+        resmb()
+    return {}
+
+
+def settings_public():
+    """Settings for the browser: stored passwords are never sent back."""
+    s = settings_load()
+    for d in (s["services"]["dyndns"], s["notify"]["mail"]):
+        d["password_set"] = bool(d.get("password"))
+        d["password"] = ""
+    return s
+
+
+def printers():
+    """Known printers (untrash-printer table) with CUPS state and job count."""
+    try:
+        seen = json.load(open(R + "/var/lib/untrash/printers.json"))
+    except (OSError, ValueError):
+        seen = {}
+    jobs = read(["lpstat", "-o"]).splitlines()
+    out = []
+    for serial, p in sorted(seen.items()):
+        name = p.get("name", "")
+        st = read(["lpstat", "-p", name]).strip()
+        out.append({"serial": serial, "name": name, "model": p.get("model", ""),
+                    "status": "bereit" if "idle" in st or "Leerlauf" in st else ("druckt" if "printing" in st else
+                                                                                  p.get("status", "?")),
+                    "jobs": sum(1 for j in jobs if j.startswith(name + "-"))})
+    return {"printers": out}
+
+
+def printer_cancel(req):
+    names = {p["name"] for p in printers()["printers"]}
+    if req.get("name") not in names:
+        raise Fail("Unbekannter Drucker.")
+    sysrun(["cancel", "-a", req["name"]], check=False)
+    return {}
+
+
+# ------------------------------------------------------- download service
+
+ARIA_RPC = os.environ.get("ZT_ARIA2_RPC", "http://127.0.0.1:6800/jsonrpc")
+DL_KEYS = ["gid", "status", "totalLength", "completedLength", "downloadSpeed", "uploadSpeed", "errorMessage",
+           "files", "bittorrent", "dir"]
+
+
+def aria(method, *params):
+    try:
+        tok = "token:" + open(R + "/etc/untrash/aria2.secret").read().strip()
+        body = json.dumps({"jsonrpc": "2.0", "id": "d", "method": method, "params": [tok] + list(params)}).encode()
+        with urllib.request.urlopen(urllib.request.Request(ARIA_RPC, body, {"Content-Type": "application/json"}),
+                                    timeout=10) as r:
+            return json.load(r).get("result")
+    except urllib.error.HTTPError as e:
+        try:
+            raise Fail("Download-Dienst: %s" % json.load(e)["error"]["message"])
+        except (ValueError, KeyError):
+            raise Fail("Download-Dienst: Fehler %d" % e.code)
+    except OSError:
+        raise Fail("Der Download-Dienst läuft nicht.", 503)
+
+
+def downloads():
+    d = settings_load()["services"]["download"]
+    out = {"settings": d, "shares": [x["name"] for x in shares() if x["enabled"]], "items": [], "running": False}
+    if not d["active"]:
+        return out
+    try:
+        items = aria("aria2.tellActive", DL_KEYS) + aria("aria2.tellWaiting", 0, 200, DL_KEYS) + \
+            aria("aria2.tellStopped", 0, 200, DL_KEYS)
+    except Fail:
+        return out
+    out["running"] = True
+    for it in items:
+        bt = (it.get("bittorrent") or {}).get("info") or {}
+        f0 = (it.get("files") or [{}])[0]
+        name = bt.get("name") or os.path.basename(f0.get("path") or "") or \
+            ((f0.get("uris") or [{}])[0].get("uri", "") if f0.get("uris") else "?")
+        out["items"].append({"gid": it["gid"], "status": it["status"], "name": name,
+                             "size": int(it.get("totalLength") or 0), "done": int(it.get("completedLength") or 0),
+                             "down": int(it.get("downloadSpeed") or 0), "up": int(it.get("uploadSpeed") or 0),
+                             "error": it.get("errorMessage", ""), "torrent": bool(it.get("bittorrent"))})
+    return out
+
+
+def downloads_add(req):
+    url = (req.get("url") or "").strip()
+    if not re.fullmatch(r"(https?|ftp|sftp)://\S+|magnet:\?\S+", url):
+        raise Fail("Adresse: http(s)://, ftp:// oder magnet:?…")
+    return {"gid": aria("aria2.addUri", [url])}
+
+
+def downloads_torrent(handler, length):
+    if not 0 < length <= 4 << 20:
+        raise Fail("Keine Torrent-Datei.")
+    data = handler.rfile.read(length)
+    if not data.startswith(b"d"):
+        raise Fail("Keine Torrent-Datei.")
+    return {"gid": aria("aria2.addTorrent", base64.b64encode(data).decode())}
+
+
+def downloads_ctl(req):
+    gid, act = req.get("gid", ""), req.get("action")
+    if act == "purge":
+        aria("aria2.purgeDownloadResult")
+        return {}
+    if not re.fullmatch(r"[0-9a-f]{16}", gid):
+        raise Fail("Unbekannter Download.")
+    if act == "pause":
+        aria("aria2.forcePause", gid)
+    elif act == "resume":
+        aria("aria2.unpause", gid)
+    elif act == "remove":
+        try:
+            aria("aria2.forceRemove", gid)
+        except Fail:
+            pass
+        aria("aria2.removeDownloadResult", gid)
+    else:
+        raise Fail("pause, resume, remove oder purge.")
+    return {}
+
+
+# ---------------------------------------------------------- Backup Planner
+
+BACKUP = os.environ.get("ZT_BACKUP_TOOL", "/usr/lib/untrash/untrash-backup")
+BACKUP_SECRETS = R + "/etc/untrash/backup-secrets"
+
+
+def backup_tool(*args):
+    r = subprocess.run([BACKUP] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+    if r.returncode:
+        raise Fail((r.stderr.strip().splitlines() or r.stdout.strip().splitlines() or ["Fehler"])[-1].replace("untrash-backup: ", ""))
+    return r.stdout
+
+
+def backup_state():
+    jobs = settings_load().get("backup", {}).get("jobs", [])
+    try:
+        status = json.loads(backup_tool("status") or "{}")
+    except (Fail, ValueError):
+        status = {}
+    return {"jobs": jobs, "status": status, "shares": [x["name"] for x in shares() if x["enabled"]],
+            "usb": [{"path": v["path"], "label": v["label"]} for v in volumes() if v["kind"] == "usb"]}
+
+
+def backup_jobs(req):
+    paths = {x["name"]: x["path"] for x in shares()}
+    usb = {v["path"] for v in volumes() if v["kind"] == "usb"}
+    clean = lambda p: "/".join(x for x in str(p or "").split("/") if x not in ("", ".", ".."))[:200]  # noqa: E731
+    out, secrets_ = [], {}
+    for j in req.get("jobs") or []:
+        if j.get("type") not in ("archive", "sync", "rsync"):
+            raise Fail("Art: Archiv, Synchronisation oder Rsync.")
+        src = []
+        for x in j.get("sources") or []:
+            if x.get("share") not in paths:
+                raise Fail("Quelle: Freigabe wählen.")
+            src.append((paths[x["share"]].rstrip("/") + "/" + clean(x.get("folder"))).rstrip("/"))
+        if not src:
+            raise Fail("Mindestens eine Quelle.")
+        t = j.get("target") or {}
+        if j["type"] == "rsync":
+            if not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", t.get("host", "")) or not re.fullmatch(r"[\w.-]{1,64}", t.get("module", "")):
+                raise Fail("Rsync-Server und Modul prüfen.")
+            tgt = {"kind": "rsync", "host": t["host"], "module": t["module"], "user": re.sub(r"[^\w.@-]", "", t.get("user", ""))[:64]}
+        elif t.get("kind") == "usb":
+            if t.get("path") not in usb:
+                raise Fail("USB-Ziel wählen.")
+            tgt = {"kind": "usb", "path": t["path"]}
+        else:
+            if t.get("share") not in paths:
+                raise Fail("Ziel: Freigabe wählen.")
+            tgt = {"kind": "local", "path": (paths[t["share"]].rstrip("/") + "/" + clean(t.get("folder"))).rstrip("/"),
+                   "share": t["share"], "folder": clean(t.get("folder"))}
+            if any(tgt["path"] == p0 or tgt["path"].startswith(p0 + "/") for p0 in src):
+                raise Fail("Das Ziel darf nicht in der Quelle liegen.")
+        sc = j.get("schedule") or {}
+        if sc.get("kind", "manual") not in ("manual", "hourly", "daily", "weekly", "monthly"):
+            raise Fail("Zeitplan prüfen.")
+        jid = j.get("id") if re.fullmatch(r"[a-z0-9]{8}", j.get("id") or "") else secrets.token_hex(4)
+        out.append({"id": jid, "name": re.sub(r"[^\w .-]", "_", (j.get("name") or "Sicherung"))[:40], "type": j["type"],
+                    "sources": src, "source_names": [{"share": x["share"], "folder": clean(x.get("folder"))} for x in j["sources"]],
+                    "target": tgt, "keep": max(1, min(1000, int(j.get("keep") or 7))),
+                    "bwlimit": max(0, int(j.get("bwlimit") or 0)), "active": bool(j.get("active")),
+                    "schedule": {"kind": sc.get("kind", "manual"), "hour": int(sc.get("hour", 2)) % 24,
+                                 "minute": int(sc.get("minute", 0)) % 60, "day": int(sc.get("day", 0)) % 7,
+                                 "mday": max(1, min(28, int(sc.get("mday", 1))))}})
+        if j["type"] == "rsync" and j.get("password"):      # empty = keep the stored one
+            secrets_[jid] = j["password"]
+    s = settings_load()
+    s.setdefault("backup", {})["jobs"] = out
+    settings_save(s, apply=False)
+    os.makedirs(BACKUP_SECRETS, mode=0o700, exist_ok=True)
+    for jid, pw in secrets_.items():
+        with open(os.open(os.path.join(BACKUP_SECRETS, jid), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            f.write(pw)
+    for f in os.listdir(BACKUP_SECRETS):
+        if f not in {j["id"] for j in out}:
+            os.unlink(os.path.join(BACKUP_SECRETS, f))
+    return {"jobs": out}
+
+
+def backup_run(req):
+    if req.get("id") not in {j["id"] for j in settings_load().get("backup", {}).get("jobs", [])}:
+        raise Fail("Unbekannter Auftrag.")
+    threading.Thread(target=lambda: subprocess.run([BACKUP, "run", req["id"]], stdout=subprocess.DEVNULL,
+                                                   stderr=subprocess.DEVNULL), daemon=True).start()
+    return {}
+
+
+def backup_restore(req):
+    paths = {x["name"]: x["path"] for x in shares()}
+    if req.get("share") not in paths:
+        raise Fail("Ziel-Freigabe wählen.")
+    folder = "/".join(x for x in str(req.get("folder") or "").split("/") if x not in ("", ".", ".."))
+    dest = (paths[req["share"]].rstrip("/") + "/" + folder).rstrip("/")
+    return {"log": backup_tool("restore", req.get("id", ""), req.get("version", ""), dest).splitlines()[-5:]}
+
+
+# ------------------------------------------------------------ cloud apps
+
+CLOUD = os.environ.get("ZT_CLOUD_TOOL", "/usr/lib/untrash/untrash-cloud")
+
+
+def cloud_tool(*args, input=None):
+    r = subprocess.run([CLOUD] + list(args), input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                       timeout=120)
+    if r.returncode:
+        raise Fail((r.stderr.strip().splitlines() or ["Fehler"])[-1].replace("untrash-cloud: ", ""))
+    return json.loads(r.stdout or "{}")
+
+
+def cloud_state():
+    s = settings_load()
+    return {"remotes": cloud_tool("remotes"), "jobs": s.get("cloud", {}).get("jobs", []), "status": cloud_tool("status"),
+            "shares": [x["name"] for x in shares() if x["enabled"]]}
+
+
+def cloud_auth_start(req):
+    return cloud_tool("auth-start", req.get("provider", ""))
+
+
+def cloud_auth_finish(req):
+    return cloud_tool("auth-finish", req.get("name", ""), req.get("url", ""))
+
+
+def cloud_ftp(req):
+    return cloud_tool("add-ftp", req.get("name", ""), req.get("host", ""), str(int(req.get("port") or 21)),
+                      req.get("user", "") or "anonymous", "1" if req.get("tls") else "0", input=req.get("password", ""))
+
+
+def cloud_delete(req):
+    if any(j.get("remote") == req.get("name") for j in settings_load().get("cloud", {}).get("jobs", [])):
+        raise Fail("Das Konto wird noch von einem Auftrag benutzt.")
+    return cloud_tool("delete", req.get("name", ""))
+
+
+def cloud_jobs(req):
+    """Replaces the job list (validated)."""
+    known = {r["name"] for r in cloud_tool("remotes")}
+    paths = {x["name"]: x["path"] for x in shares()}
+    out = []
+    for j in req.get("jobs") or []:
+        if j.get("remote") not in known:
+            raise Fail("Auftrag %s: Konto wählen." % j.get("name", ""))
+        if j.get("share") not in paths:
+            raise Fail("Auftrag %s: Freigabe wählen." % j.get("name", ""))
+        folder = (j.get("folder") or "").strip("/")
+        if ".." in folder.split("/") or not re.fullmatch(r"[^\0]{0,200}", folder):
+            raise Fail("Ordner prüfen.")
+        if j.get("direction") not in ("both", "up", "down"):
+            raise Fail("Richtung: beide, hoch oder runter.")
+        rpath = (j.get("path") or "").strip("/")
+        if ".." in rpath.split("/"):
+            raise Fail("Cloud-Pfad prüfen.")
+        jid = j.get("id") if re.fullmatch(r"[a-z0-9]{8}", j.get("id") or "") else secrets.token_hex(4)
+        out.append({"id": jid, "name": (j.get("name") or "Auftrag")[:40], "remote": j["remote"], "path": rpath,
+                    "share": j["share"], "folder": folder,
+                    "local": paths[j["share"]].rstrip("/") + ("/" + folder if folder else ""),
+                    "direction": j["direction"], "interval_min": max(5, min(10080, int(j.get("interval_min") or 60))),
+                    "active": bool(j.get("active"))})
+    s = settings_load()
+    s.setdefault("cloud", {})["jobs"] = out
+    settings_save(s)
+    return {"jobs": out}
+
+
+def cloud_run(req):
+    jid = req.get("id", "")
+    if jid not in {j["id"] for j in settings_load().get("cloud", {}).get("jobs", [])}:
+        raise Fail("Unbekannter Auftrag.")
+    threading.Thread(target=lambda: subprocess.run([CLOUD, "run", jid], stdout=subprocess.DEVNULL,
+                                                   stderr=subprocess.DEVNULL), daemon=True).start()
+    return {}
+
+
+def copybtn_run(req):
+    kind = req.get("kind")
+    if kind not in ("copy", "sync"):
+        raise Fail("copy oder sync.")
+    if TEST:
+        SYSLOG.append(["/usr/lib/untrash/untrash-copybtn", kind])
+        return {}
+    threading.Thread(target=lambda: subprocess.run(["/usr/lib/untrash/untrash-copybtn", kind]), daemon=True).start()
+    return {}
+
+
+# ----------------------------------------------------------------- iSCSI
+
+ISCSI = os.environ.get("ZT_ISCSI_TOOL", "/usr/lib/untrash/untrash-iscsi")
+ISCSI_SECRETS = R + "/etc/untrash/iscsi-secrets.json"
+
+
+def iscsi_tool(*args):
+    r = subprocess.run([ISCSI] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+    if r.returncode:
+        raise Fail((r.stderr.strip().splitlines() or ["Fehler"])[-1].replace("untrash-iscsi: ", ""))
+    return r.stdout
+
+
+def iscsi_secrets():
+    try:
+        return json.load(open(ISCSI_SECRETS))
+    except (OSError, ValueError):
+        return {}
+
+
+def iscsi_state():
+    cfg = settings_load().get("iscsi", {"luns": [], "targets": []})
+    sec = iscsi_secrets()
+    try:
+        st = json.loads(iscsi_tool("status") or "{}")
+    except (Fail, ValueError):
+        st = {}
+    targets = [dict(t, chap=bool((sec.get(t["iqn"]) or {}).get("user")), chap_user=(sec.get(t["iqn"]) or {}).get("user", ""),
+                    mutual=bool((sec.get(t["iqn"]) or {}).get("mutual_user"))) for t in cfg.get("targets", [])]
+    return {"luns": cfg.get("luns", []), "targets": targets, "status": st, "hostname": settings_load()["hostname"],
+            "volumes": [{"id": v["id"], "label": v["label"], "free": v["free"]} for v in volumes() if v["kind"] == "intern"]}
+
+
+def iscsi_apply():
+    if TEST:
+        SYSLOG.append(["systemctl", "restart", "untrash-iscsi.service"])
+        return
+    sysrun(["systemctl", "restart" if any(t.get("active") for t in settings_load()["iscsi"]["targets"]) else "stop",
+            "untrash-iscsi.service"], check=False)
+
+
+def iscsi_lun(req):
+    vol = next((v for v in volumes() if v["kind"] == "intern" and v["id"] == req.get("volume")), None)
+    if not vol:
+        raise Fail("Volume wählen.")
+    s = settings_load()
+    if any(l["name"].lower() == (req.get("name") or "").lower() for l in s["iscsi"]["luns"]):
+        raise Fail("Den LUN-Namen gibt es schon.")
+    r = json.loads(iscsi_tool("create-lun", req.get("name", ""), R + vol["path"], str(int(req.get("size_gb") or 0)),
+                              "thin" if req.get("thin", True) else "thick"))
+    s["iscsi"]["luns"].append({"name": r["name"], "path": r["path"][len(R):] if R else r["path"], "size_gb": r["size_gb"],
+                               "write_cache": bool(req.get("write_cache")), "volume": vol["id"]})
+    settings_save(s, apply=False)
+    return {}
+
+
+def iscsi_lun_delete(req):
+    s = settings_load()
+    if any(req.get("name") in t.get("luns", []) for t in s["iscsi"]["targets"]):
+        raise Fail("Die LUN gehört noch zu einem Ziel.")
+    if req.get("confirm") != "LÖSCHEN":
+        raise Fail("Zum Bestätigen LÖSCHEN eintippen.")
+    iscsi_tool("delete-lun", req.get("name", ""))
+    s["iscsi"]["luns"] = [l for l in s["iscsi"]["luns"] if l["name"] != req.get("name")]
+    settings_save(s, apply=False)
+    return {}
+
+
+def iscsi_targets(req):
+    s = settings_load()
+    lunnames = {l["name"] for l in s["iscsi"]["luns"]}
+    sec, old = iscsi_secrets(), {t["iqn"]: t for t in s["iscsi"]["targets"]}
+    out, newsec, seen = [], {}, set()
+    iqn_re = r"(iqn\.\d{4}-\d{2}\.[a-z0-9.-]+(:[\w.:-]+)?|eui\.[0-9a-fA-F]{16})"
+    for t in req.get("targets") or []:
+        name = t.get("name", "")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", name):
+            raise Fail("Zielname: Buchstaben, Ziffern, _ -.")
+        iqn = (t.get("iqn") or "iqn.2026-10.local.untrash:%s.%s" % (s["hostname"].lower(), name.lower())).strip()
+        if not re.fullmatch(iqn_re, iqn) or len(iqn) > 223 or iqn in seen:
+            raise Fail("IQN prüfen (iqn.JJJJ-MM.domain:name), nicht doppelt.")
+        seen.add(iqn)
+        luns = [x for x in t.get("luns") or [] if x in lunnames][:10]
+        inis = [x.strip() for x in t.get("initiators") or [] if x.strip()]
+        if any(not re.fullmatch(iqn_re, x) for x in inis):
+            raise Fail("Initiator-IQN prüfen.")
+        a = dict(sec.get(iqn) or (sec.get(old[iqn]["iqn"]) if iqn in old else {}) or {})
+        if t.get("chap"):
+            if t.get("chap_password"):
+                if not 12 <= len(t["chap_password"]) <= 16:
+                    raise Fail("CHAP-Passwort: 12 bis 16 Zeichen.")
+                a["password"] = t["chap_password"]
+            a["user"] = (t.get("chap_user") or "").strip()[:64]
+            if not a.get("user") or not a.get("password"):
+                raise Fail("CHAP: Benutzer und Passwort.")
+            if t.get("mutual"):
+                if t.get("mutual_password"):
+                    a["mutual_password"] = t["mutual_password"]
+                a["mutual_user"] = (t.get("mutual_user") or "").strip()[:64]
+                if not a.get("mutual_user") or not a.get("mutual_password") or a["mutual_password"] == a["password"]:
+                    raise Fail("Gegenseitiges CHAP: eigener Benutzer und ein anderes Passwort.")
+            else:
+                a.pop("mutual_user", None)
+                a.pop("mutual_password", None)
+            newsec[iqn] = a
+        out.append({"name": name, "iqn": iqn, "luns": luns, "initiators": inis, "active": bool(t.get("active", True))})
+    s["iscsi"]["targets"] = out
+    settings_save(s, apply=False)
+    with open(os.open(ISCSI_SECRETS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(newsec, f)
+    iscsi_apply()
+    return {"targets": out}
+
+
+# ------------------------------------------------------------------ UPnP
+
+UPNP = os.environ.get("ZT_UPNP_TOOL", "/usr/lib/untrash/untrash-upnp")
+UPNP_SERVICES = ("HTTP", "HTTPS", "FTP", "SSH", "WEBDAV_HTTP", "WEBDAV_HTTPS", "WEBPUBLISHING_HTTP", "MEDIASERVER")
+
+
+def upnp_state():
+    try:
+        st = json.loads(read([UPNP, "status"], timeout=60) or "{}")
+    except ValueError:
+        st = {}
+    st["services"] = settings_load().get("upnp", {}).get("services", {})
+    st["names"] = list(UPNP_SERVICES)
+    return st
+
+
+def upnp_save(req):
+    want = {}
+    for k, v in (req.get("services") or {}).items():
+        if k not in UPNP_SERVICES:
+            raise Fail("Unbekannter Dienst %s." % k)
+        v = int(v or 0)
+        if v:
+            if not 1 <= v <= 65535:
+                raise Fail("WAN-Port 1 bis 65535.")
+            if v in want.values():
+                raise Fail("WAN-Port %d doppelt." % v)
+            want[k] = v
+    s = settings_load()
+    s.setdefault("upnp", {})["services"] = want
+    settings_save(s)
+    sysrun(["systemctl", "start", "--no-block", "untrash-upnp.service"], check=False)
+    return {"services": want}
+
+
+# ------------------------------------------------------------ certificate
+
+TLS_DIR = R + "/etc/untrash/tls"
+
+
+def cert_info():
+    crt = TLS_DIR + "/untrash.crt"
+    if not os.path.isfile(crt):
+        return {"present": False}
+    out = read(["openssl", "x509", "-in", crt, "-noout", "-subject", "-issuer", "-startdate", "-enddate",
+                "-fingerprint", "-sha256"])
+    info = {"present": True}
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        info[{"subject": "subject", "issuer": "issuer", "notBefore": "from", "notAfter": "until"}.get(k.strip(), "fingerprint"
+             if "Fingerprint" in k else k.strip())] = v.strip()
+    info["self_signed"] = info.get("subject") == info.get("issuer")
+    return info
+
+
+def tls_reload():
+    for u in ("vsftpd.service", "untrash-webdav.service"):
+        sysrun(["systemctl", "try-restart", u], check=False)
+    restart_desk()
+
+
+def restart_desk():
+    if TEST:
+        SYSLOG.append(["systemctl", "restart", "untrash-desk.service"])
+    else:
+        threading.Timer(1.5, lambda: subprocess.run(["systemctl", "restart", "untrash-desk.service"])).start()
+
+
+def cert_regenerate(req):
+    cn = req.get("cn") or settings_load()["hostname"]
+    if not re.fullmatch(r"[A-Za-z0-9.-]{1,64}", cn):
+        raise Fail("Name: Buchstaben, Ziffern, Punkt, Bindestrich.")
+    os.makedirs(TLS_DIR, mode=0o700, exist_ok=True)
+    r = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", "/CN=" + cn,
+                        "-addext", "subjectAltName=DNS:%s,DNS:%s.local" % (cn, cn.split(".")[0]),
+                        "-keyout", TLS_DIR + "/untrash.key.new", "-out", TLS_DIR + "/untrash.crt.new"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if r.returncode:
+        raise Fail("openssl: %s" % r.stdout.decode(errors="replace")[-200:])
+    os.chmod(TLS_DIR + "/untrash.key.new", 0o600)
+    os.replace(TLS_DIR + "/untrash.key.new", TLS_DIR + "/untrash.key")
+    os.replace(TLS_DIR + "/untrash.crt.new", TLS_DIR + "/untrash.crt")
+    tls_reload()
+    return cert_info()
+
+
+def cert_upload(req):
+    """Own certificate (PEM, chain allowed) + unencrypted private key; the key
+    must belong to the certificate."""
+    crt, key = req.get("cert") or "", req.get("key") or ""
+    if "BEGIN CERTIFICATE" not in crt or "PRIVATE KEY" not in key or len(crt) + len(key) > 200000:
+        raise Fail("Zertifikat und Schlüssel im PEM-Format einfügen.")
+    if "ENCRYPTED" in key:
+        raise Fail("Der Schlüssel darf nicht verschlüsselt sein.")
+    os.makedirs(TLS_DIR, mode=0o700, exist_ok=True)
+    tmpc, tmpk = TLS_DIR + "/up.crt", TLS_DIR + "/up.key"
+    open(tmpc, "w").write(crt)
+    with open(os.open(tmpk, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(key)
+    a = read(["openssl", "x509", "-in", tmpc, "-noout", "-pubkey"])
+    b = read(["openssl", "pkey", "-in", tmpk, "-pubout"])
+    if not a or a != b:
+        os.unlink(tmpc)
+        os.unlink(tmpk)
+        raise Fail("Der Schlüssel passt nicht zum Zertifikat.")
+    os.replace(tmpk, TLS_DIR + "/untrash.key")
+    os.replace(tmpc, TLS_DIR + "/untrash.crt")
+    tls_reload()
+    return cert_info()
+
+
+def notify_test(req):
+    """Test mail with the saved settings (rendered first by apply)."""
+    if TEST:
+        SYSLOG.append(["/usr/lib/untrash/untrash-notify", "test"])
+        return {"log": ["test"]}
+    sysrun([CFGTOOL, "render"], check=False)
+    r = subprocess.run(["/usr/lib/untrash/untrash-notify", "test"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, timeout=120)
+    if r.returncode:
+        raise Fail((r.stdout.strip().splitlines() or ["Versand fehlgeschlagen"])[-1])
+    return {"log": r.stdout.splitlines()}
+
+
+# ----------------------------------------------------------------- system
+
+def first(path, default=""):
+    try:
+        return open(R + path).read().strip()
+    except OSError:
+        return default
+
+
+def overview():
+    s = settings_load()
+    up = float((first("/proc/uptime", "0 0").split() or ["0"])[0])
+    mem = {}
+    for line in first("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        mem[k] = int(v.split()[0]) * 1024 if v.split() else 0
+    addrs = []
+    for line in read(["ip", "-4", "-o", "addr", "show"]).splitlines():
+        p = line.split()
+        if len(p) > 3 and p[1] != "lo":
+            addrs.append({"if": p[1], "addr": p[3]})
+    units = {}
+    for u in ("smbd", "ssh", "vsftpd", "nfs-server", "minidlna", "chrony", "hd-idle", "avahi-daemon"):
+        units[u] = read(["systemctl", "is-active", u + ".service"]).strip() or "unknown"
+    md = []
+    stat = first("/proc/mdstat")
+    for m in re.finditer(r"^(md\d+) : (\w+) (\w+) (.*?)\n.*?\[([U_]+)\]", stat, re.M | re.S):
+        if m.group(1) in ("md0", "md1"):     # stock firmware/swap mirrors over 4 bays (untrash-storage)
+            continue
+        md.append({"name": m.group(1), "state": m.group(2), "level": m.group(3), "health": m.group(5),
+                   "degraded": "_" in m.group(5)})
+    return {"hostname": s["hostname"], "version": first("/etc/untrash-version", "?"),
+            "uptime": int(up), "load": first("/proc/loadavg").split()[:3],
+            "mem_total": mem.get("MemTotal", 0), "mem_avail": mem.get("MemAvailable", 0),
+            "addresses": addrs, "services": units, "volumes": volumes(), "arrays": md,
+            "unsupported": s.get("unsupported", []), "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "takeover": os.path.exists(TAKEOVER)}
+
+
+def disks():
+    out = []
+    try:
+        lb = json.loads(read(["lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,TYPE,TRAN,MODEL,SERIAL,FSTYPE,PARTLABEL,MOUNTPOINT"]) or "{}")
+    except ValueError:
+        lb = {}
+    for d in lb.get("blockdevices", []):
+        if d.get("type") != "disk" or (d.get("name") or "").startswith(("mtd", "ram", "zram", "loop", "md")):
+            continue
+        h = read(["smartctl", "-H", "-A", d["path"]], timeout=15)
+        health = "ok" if "PASSED" in h else ("fehler" if "FAILED" in h else "?")
+        temp = next((ln.split()[9] for ln in h.splitlines() if "Temperature_Celsius" in ln and len(ln.split()) > 9), "")
+        out.append({"name": d["name"], "size": d.get("size"), "model": (d.get("model") or "").strip(),
+                    "usb": d.get("tran") == "usb", "smart": health, "temp": temp,
+                    "parts": [{"name": p["name"], "fs": p.get("fstype"), "label": p.get("partlabel"),
+                               "mount": p.get("mountpoint")} for p in d.get("children") or []]})
+    return out
+
+
+def logs(req):
+    unit = req.get("unit", "")
+    cmd = ["journalctl", "-n", "400", "--no-pager", "-o", "short-iso"]
+    if unit:
+        if not re.fullmatch(r"[\w@.-]+", unit):
+            raise Fail("Ungültige Einheit.")
+        cmd += ["-u", unit]
+    return {"lines": read(cmd).splitlines()[-400:]}
+
+
+def power(req):
+    act = req.get("action")
+    if act not in ("reboot", "poweroff"):
+        raise Fail("reboot oder poweroff.")
+    if TEST:
+        SYSLOG.append(["systemctl", act])
+    else:
+        threading.Timer(1.5, lambda: subprocess.run(["systemctl", act])).start()
+    return {}
+
+
+# ------------------------------------------------------- RAID and volumes
+
+STORAGE = os.environ.get("ZT_STORAGE_TOOL", "/usr/sbin/untrash-storage")
+RAIDJOB = {"state": "idle", "op": "", "log": []}
+RAID_OPS = ("create", "repair", "add-disks", "change-level", "add-spare", "remove-spare", "expand", "delete",
+            "lv-create", "lv-extend", "lv-delete", "rename")
+# typed confirmation: partitioning disks erases them, deleting erases a volume
+RAID_CONFIRM = {"create": "FORMATIEREN", "repair": "FORMATIEREN", "add-disks": "FORMATIEREN",
+                "change-level": "FORMATIEREN", "add-spare": "FORMATIEREN", "delete": "LÖSCHEN", "lv-delete": "LÖSCHEN"}
+
+
+def raid_status():
+    try:
+        st = json.loads(read([STORAGE, "status"], timeout=90) or "{}")
+    except ValueError:
+        st = {}
+    st.setdefault("disks", [])
+    st.setdefault("arrays", [])
+    st["job"] = {"state": RAIDJOB["state"], "op": RAIDJOB["op"], "log": RAIDJOB["log"][-300:]}
+    return st
+
+
+def raid_job(req):
+    """Starts one untrash-storage job in the background (stock: storage_main
+    thread + lock file); the log is polled through /api/raid."""
+    op = req.get("op", "")
+    if op not in RAID_OPS:
+        raise Fail("Unbekannter Auftrag.")
+    if RAIDJOB["state"] == "running":
+        raise Fail("Ein Speicherauftrag läuft noch.")
+    need = RAID_CONFIRM.get(op)
+    if need and req.get("confirm") != need:
+        raise Fail("Zum Bestätigen %s eintippen." % need)
+    args = {k: v for k, v in req.items() if k not in ("op", "confirm")}
+    RAIDJOB.update(state="running", op=op, log=[time.strftime("%H:%M:%S ") + "Auftrag " + op])
+
+    def worker():
+        rc = 1
+        try:
+            p = subprocess.Popen([STORAGE, "run", op, json.dumps(args)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True)
+            for line in p.stdout:
+                RAIDJOB["log"].append(line.rstrip("\n"))
+                del RAIDJOB["log"][:-2000]
+            rc = p.wait()
+        except OSError as e:
+            RAIDJOB["log"].append("FEHLER %s" % e)
+        try:
+            with LOCK:
+                resmb()            # shares on a deleted volume left the database
+        except (Fail, OSError) as e:
+            RAIDJOB["log"].append("Samba: %s" % e)
+        RAIDJOB["state"] = "done" if rc == 0 else "failed"
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"op": op}
+
+
+# ------------------------------------------------------------- slot update
+
+UPDATE = {"state": "idle", "log": []}
+
+
+def boot_env():
+    try:
+        return dict(l.rstrip("\n").split("=", 1) for l in open(R + "/run/untrash/boot.env") if "=" in l)
+    except OSError:
+        return {}
+
+
+def update_upload(handler, length):
+    """Body = a slot file (*.utslot, os/install/mk-stick-system.sh); stored,
+    signature + payload hashes checked by zt-loader's rules, written to the
+    inactive slot, boot state prefers it once.  The loader falls back to the
+    old slot if the new one never confirms itself (3 tries)."""
+    if length <= 8192 or length > 1536 * 1024 * 1024:
+        raise Fail("Keine Systemabbild-Datei.")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    tmp = os.path.join(UPLOAD_DIR, "upload.utslot")
+    with open(tmp, "wb") as f:
+        left = length
+        while left:
+            b = handler.rfile.read(min(left, 1 << 20))
+            if not b:
+                raise Fail("Übertragung abgebrochen.")
+            f.write(b)
+            left -= len(b)
+    with open(tmp, "rb") as f:
+        f.seek(length - 8192)
+        man = f.read(4096).rstrip(b"\0").decode("utf-8", "replace")
+        sig = f.read(64)
+    m = dict(l.split("=", 1) for l in man.splitlines() if "=" in l)
+    if m.get("format") != "untrash-slot-2":
+        raise Fail("Kein UntrashOS-Systemabbild (Format).")
+    open(tmp + ".manifest", "w").write(man)
+    open(tmp + ".sig", "wb").write(sig)
+    ok = TEST or any(subprocess.run(["/usr/lib/untrash/zt-sig", "verify", k, tmp + ".manifest", tmp + ".sig"],
+                                    stdout=subprocess.DEVNULL).returncode == 0
+                     for k in glob.glob("/usr/lib/untrash/keys/*.pub"))
+    if not ok:
+        raise Fail("Signatur ungültig: Abbild nicht von UntrashOS.")
+    with open(tmp, "rb") as f:
+        for p in ("kernel", "dtb", "initrd"):
+            if m.get(p + "_off"):
+                f.seek(int(m[p + "_off"]))
+                if hashlib.sha256(f.read(int(m[p + "_len"]))).hexdigest() != m.get(p + "_sha256"):
+                    raise Fail("Abbild beschädigt (%s)." % p)
+    UPDATE.update(state="ready", version=m.get("version", "?"), file=tmp, size=length,
+                  log=["Abbild %s geprüft (Signatur, Kernel, DTB, initrd)" % m.get("version", "?")])
+    return {"version": UPDATE["version"]}
+
+
+def update_install(req):
+    if UPDATE.get("state") != "ready":
+        raise Fail("Erst ein Abbild hochladen.")
+    env = boot_env()
+    slot = env.get("ZT_SLOT") or ""
+    other = "b" if slot == "a" else "a"
+    f = UPDATE["file"]
+    if env.get("ZT_BOOT") == "file":
+        dst = "%s/.untrash/slot-%s.utslot" % (env.get("ZT_HOST", "/run/untrash/host"), other)
+        sysrun(["cp", f, dst + ".new"])
+        sysrun(["sync"])
+        sysrun(["mv", dst + ".new", dst])
+    else:
+        part = read(["findfs", "PARTLABEL=ut-sys-" + other]).strip() or "PARTLABEL=ut-sys-" + other
+        # head at the start of the partition, trailer in its last 8 KiB
+        sysrun(["/usr/lib/untrash/untrash-slot-write", f, part])
+    sysrun(["/usr/lib/untrash/untrash-bootstate", "prefer", other])
+    UPDATE["log"].append("in Slot %s geschrieben; Neustart startet %s" % (other.upper(), UPDATE["version"]))
+    UPDATE["state"] = "installed"
+    return {"slot": other}
+
+
+# ------------------------------------------------------------ system sounds
+
+SOUND = os.environ.get("ZT_SOUND_TOOL", "/usr/lib/untrash/untrash-sound")
+SOUND_USER = os.environ.get("ZT_SOUND_USER", R + "/etc/untrash/sounds.json")
+SOUND_EVENTS = ("boot", "shutdown", "error", "critical", "success", "connect", "disconnect", "warning", "standby")
+
+
+def sound_notes(notes):
+    out = []
+    for n in (notes or [])[:400]:
+        hz, ms = int(n[0]), int(n[1])
+        if not (hz == 0 or 40 <= hz <= 10000) or not 0 < ms <= 5000:
+            raise Fail("Ton außerhalb des Bereichs (40–10000 Hz, 1–5000 ms): %s" % (n,))
+        out.append([hz, ms])
+    if not out:
+        raise Fail("Keine Töne.")
+    return out
+
+
+def sound_state():
+    return json.loads(read([SOUND, "show"]) or "{}")
+
+
+def sound_user():
+    try:
+        return json.load(open(SOUND_USER))
+    except (OSError, ValueError):
+        return {"events": {}}
+
+
+def sound_write(d):
+    os.makedirs(os.path.dirname(SOUND_USER), exist_ok=True)
+    tmp = SOUND_USER + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, SOUND_USER)
+
+
+def sound_save(req):
+    """{"event", "notes": [[hz, ms]], "tempo"} saves; {"event", "reset": true} back to built-in."""
+    ev = req.get("event")
+    if ev not in SOUND_EVENTS:
+        raise Fail("Unbekanntes Ereignis.")
+    d = sound_user()
+    if req.get("reset"):
+        d.setdefault("events", {}).pop(ev, None)
+    else:
+        tempo = float(req.get("tempo") or 1.0)
+        if not 0.25 <= tempo <= 4.0:
+            raise Fail("Tempo 0,25 bis 4.")
+        d.setdefault("events", {})[ev] = {"notes": sound_notes(req.get("notes")), "tempo": tempo}
+    sound_write(d)
+    return sound_state()
+
+
+def sound_play(req):
+    """Play on the NAS buzzer, in the background: a saved event or a score."""
+    if req.get("stop"):
+        subprocess.Popen([SOUND, "stop"])
+        return {}
+    if req.get("event"):
+        if req["event"] not in SOUND_EVENTS:
+            raise Fail("Unbekanntes Ereignis.")
+        subprocess.Popen([SOUND, "play", req["event"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {}
+    body = json.dumps({"notes": sound_notes(req.get("notes")), "tempo": float(req.get("tempo") or 1.0)})
+    p = subprocess.Popen([SOUND, "play-json"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         text=True)
+    threading.Thread(target=p.communicate, args=(body,), daemon=True).start()
+    return {}
+
+
+def sound_import(req):
+    """A sound set (soundset.json: events -> notes [{frequency_hz, duration_ms}])
+    becomes the user scores of the events it names."""
+    ss = req.get("soundset") or {}
+    evs = ss.get("events") if isinstance(ss, dict) else None
+    if not isinstance(evs, dict):
+        raise Fail("Kein Soundset (events fehlt).")
+    d, n = sound_user(), 0
+    for ev, v in evs.items():
+        if ev not in SOUND_EVENTS or not isinstance(v, dict):
+            continue
+        notes = [[x.get("frequency_hz", 0), x.get("duration_ms", 0)] if isinstance(x, dict) else x for x in v.get("notes", [])]
+        d.setdefault("events", {})[ev] = {"notes": sound_notes(notes), "tempo": float(v.get("tempo", 1.0) or 1.0),
+                                         "source": str(ss.get("title", "Import"))[:80]}
+        n += 1
+    if not n:
+        raise Fail("Das Soundset enthält kein bekanntes Ereignis.")
+    sound_write(d)
+    st = sound_state()
+    st["imported"] = n
+    return st
+
+
+# ------------------------------------------------------------ way D (stock)
+
+def stock_backup():
+    """UntrashOS stick with the stock flash backup of this NAS (install run)."""
+    cand = os.environ.get("ZT_DESK_STICK") if TEST else None
+    mnts = [cand] if cand else []
+    if not cand:
+        for line in first("/proc/mounts").splitlines():
+            p = line.split()
+            if len(p) > 2 and p[2] == "vfat" and os.path.isdir(os.path.join(p[1], "UNTRASH")):
+                mnts.append(p[1])
+        if not mnts:
+            dev = read(["blkid", "-L", "UNTRASHPK"]).strip()
+            if dev:
+                os.makedirs(STICK_MNT, exist_ok=True)
+                if subprocess.run(["mount", "-o", "ro", dev, STICK_MNT]).returncode == 0:
+                    mnts.append(STICK_MNT)
+    for m in mnts:
+        runs = []
+        for d in sorted(glob.glob(os.path.join(m, "UNTRASH", "install-*"))):
+            try:
+                dev = dict(l.strip().split("=", 1) for l in open(os.path.join(d, "device.env")) if "=" in l)
+                done = "RESULT DONE" in open(os.path.join(d, "install.log"), errors="replace").read()
+            except OSError:
+                continue
+            if done:
+                runs.append({"name": os.path.basename(d), "dir": d, "device": dev,
+                             "verified": os.path.isfile(os.path.join(d, "flash", "VERIFIED"))})
+        if runs:
+            return {"mnt": m, "run": runs[-1],
+                    "markers": [x for x in ("ROLLBACK", "ROLLBACK_DONE", "ROLLBACK_FAILED")
+                                if os.path.exists(os.path.join(m, "UNTRASH", x))]}
+    return None
+
+
+def stock_rollback(req):
+    if req.get("confirm") != "STOCK":
+        raise Fail("Zum Bestätigen STOCK eintippen.")
+    st = stock_backup()
+    if not st:
+        raise Fail("Kein UntrashOS-Stick mit der Stock-Sicherung dieser NAS gefunden.")
+    d, dev = st["run"]["dir"], st["run"]["device"]
+    for f, key in (("mtd2-before-a.bin", "ENV_OLD_SHA256"), ("mtd%s-before-a.bin" % dev.get("LOADER_MTD", "6"), "KX_OLD_SHA256")):
+        h = hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
+        if h != dev.get(key):
+            raise Fail("Sicherung %s/%s passt nicht zur Prüfsumme der Installation." % (st["run"]["name"], f))
+    u = os.path.join(st["mnt"], "UNTRASH")
+    if not TEST:
+        subprocess.run(["mount", "-o", "remount,rw", st["mnt"]], check=False)
+    for m in ("ROLLBACK_FAILED", "ROLLBACK_DONE", "rollback-stage1.log"):
+        if os.path.exists(os.path.join(u, m)):
+            os.replace(os.path.join(u, m), os.path.join(u, "%s.old-%s" % (m, time.strftime("%Y%m%d-%H%M%S"))))
+    open(os.path.join(u, "ROLLBACK"), "w").close()
+    os.sync()
+    if not TEST:
+        subprocess.run(["mount", "-o", "remount,ro", st["mnt"]], check=False)
+    power({"action": "reboot"})
+    return {"loader_slot": dev.get("LOADER_SLOT")}
+
+
+# ------------------------------------------------------------------ files
+
+def share_access(user):
+    if is_admin(user):
+        return {x["name"]: {"path": x["path"], "access": "rw"} for x in shares() if x["enabled"]}
+    stock = IMP.Stock(CONFIG)
+    gl = [g for _gid, g, _t, _d in stock.groups() if user in stock.members(g)] + [EVERYONE]
+    return IMP.user_access(stock, user, gl)
+
+
+def resolve(user, share, rel, write=False):
+    acc = share_access(user).get(share)
+    if not acc or acc["access"] == "deny":
+        raise Fail("Kein Zugriff auf diese Freigabe.", 403)
+    if write and acc["access"] != "rw":
+        raise Fail("Nur Lesezugriff.", 403)
+    base = os.path.realpath(R + acc["path"])
+    full = os.path.realpath(os.path.join(base, (rel or "").lstrip("/")))
+    if full != base and not full.startswith(base + "/"):
+        raise Fail("Pfad außerhalb der Freigabe.", 403)
+    if os.path.basename(full) in (IMP.RECYCLE_FN, IMP.RECYCLE_RBM_FN):
+        raise Fail("Geschützte Datei.", 403)
+    return base, full
+
+
+def owner_of(user):
+    c = db()
+    try:
+        r = c.execute("SELECT uid FROM smb_user WHERE uname=?", (user,)).fetchone()
+        return r[0] if r else 0
+    finally:
+        c.close()
+
+
+def files_list(user, q):
+    base, full = resolve(user, q.get("share", ""), q.get("path", ""))
+    if not os.path.isdir(full):
+        raise Fail("Kein Ordner.", 404)
+    out = []
+    for e in sorted(os.scandir(full), key=lambda e: (not e.is_dir(), e.name.lower())):
+        if e.name.startswith(".") and e.name in (IMP.RECYCLE_FN, IMP.RECYCLE_RBM_FN, ".system", ".media"):
+            continue
+        try:
+            st = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        out.append({"name": e.name, "dir": e.is_dir(follow_symlinks=False), "size": st.st_size, "mtime": int(st.st_mtime)})
+    return {"entries": out, "path": os.path.relpath(full, base) if full != base else ""}
+
+
+def files_op(user, req):
+    op, share = req.get("op"), req.get("share", "")
+    _b, full = resolve(user, share, req.get("path", ""), write=True)
+    name = req.get("name", "")
+    if op in ("mkdir", "rename") and (not name or "/" in name or name in (".", "..")):
+        raise Fail("Ungültiger Name.")
+    if op == "mkdir":
+        p = os.path.join(full, name)
+        os.mkdir(p)
+        os.chmod(p, 0o777)
+        if not TEST:
+            os.chown(p, owner_of(user), 500)
+    elif op == "delete":
+        if full == _b:
+            raise Fail("Die Freigabe selbst bleibt.")
+        if os.path.isdir(full) and not os.path.islink(full):
+            shutil.rmtree(full)
+        else:
+            os.unlink(full)
+    elif op == "rename":
+        if full == _b:
+            raise Fail("Die Freigabe selbst bleibt.")
+        dst = os.path.join(os.path.dirname(full), name)
+        if os.path.exists(dst):
+            raise Fail("Name existiert schon.")
+        os.rename(full, dst)
+    else:
+        raise Fail("Unbekannte Aktion.")
+    return {}
+
+
+# ------------------------------------------------------------- feedback
+
+PROJECT = os.environ.get("ZT_PROJECT", "/usr/share/untrash/project.json")
+REDACT = [(re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"), "<MAC>"),
+          (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<IP>"),
+          (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<UUID>"),
+          (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "<MAIL>"),
+          (re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b"), "<IPv6>")]
+
+
+def redact(text):
+    """Remove what identifies this NAS or its people from a report."""
+    for rx, rep in REDACT:
+        text = rx.sub(rep, text)
+    words = {settings_load().get("hostname", "")} | {x["name"] for x in shares()}
+    c = db()
+    try:
+        words |= {r[0] for r in c.execute("SELECT uname FROM smb_user")} | {r[0] for r in c.execute("SELECT gname FROM smb_group")}
+    except sqlite3.Error:
+        pass
+    finally:
+        c.close()
+    for w in sorted((w for w in words if w and len(w) > 2 and w not in ("admin", "everyone", "nobody")), key=len, reverse=True):
+        text = re.sub(r"(?<![\w-])%s(?![\w-])" % re.escape(w), "<NAME>", text)
+    return text
+
+
+def feedback_info():
+    """Anonymous system summary for a bug report (shown to the user before
+    anything leaves the browser; the NAS itself sends nothing)."""
+    try:
+        proj = json.load(open(PROJECT))
+    except (OSError, ValueError):
+        proj = {}
+    dl = [d for d in disks() if not d.get("usb")]
+    st = settings_load()
+    on = sorted(k for k, v in st.get("services", {}).items() if (v.get("active") if isinstance(v, dict) else v))
+    errs = read(["journalctl", "-p", "err", "-b", "-n", "25", "--no-pager", "-o", "cat"], timeout=15)
+    info = {"version": first("/etc/untrash-version", "?").strip(), "kernel": os.uname().release,
+            "boot": boot_env().get("ZT_BOOT", "?") + "/" + boot_env().get("ZT_SLOT", "?"),
+            "disks": ", ".join("%.1f TB" % (d["size"] / 1e12) for d in dl if d.get("size")),
+            "raid": ", ".join("%s %s" % (a["level"], a["health"]) for a in overview()["arrays"]) or "–",
+            "language": st.get("language", "de"), "services": ", ".join(on),
+            "errors": redact(errs.strip())[-2500:]}
+    return {"issues": proj.get("issues", ""), "info": info}
+
+
+# ------------------------------------------------------------- share links
+
+LINKS = os.environ.get("ZT_LINKS", R + "/etc/untrash/links.json")
+
+
+def links_load():
+    try:
+        d = json.load(open(LINKS))
+    except (OSError, ValueError):
+        d = {}
+    now = time.time()
+    return {k: v for k, v in d.items() if v.get("expires", 0) > now}
+
+
+def links_write(d):
+    os.makedirs(os.path.dirname(LINKS), exist_ok=True)
+    tmp = LINKS + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, LINKS)
+
+
+def link_create(user, req):
+    """A download link for a file or folder the user may read: expires after
+    1..90 days, optionally with a password (stored as salted SHA-256)."""
+    share, path = req.get("share", ""), req.get("path", "")
+    _b, full = resolve(user, share, path)
+    if not os.path.exists(full):
+        raise Fail("Keine Datei.", 404)
+    days = int(req.get("days") or 7)
+    if not 1 <= days <= 90:
+        raise Fail("Gültigkeit 1 bis 90 Tage.")
+    pw = req.get("password") or ""
+    if pw and len(pw) < 4:
+        raise Fail("Passwort für den Link: mindestens 4 Zeichen.")
+    tok = secrets.token_urlsafe(18)
+    salt = secrets.token_hex(8)
+    d = links_load()
+    d[tok] = {"share": share, "path": path, "owner": user, "dir": os.path.isdir(full), "created": int(time.time()),
+              "expires": int(time.time() + days * 86400), "salt": salt,
+              "pw": hashlib.sha256((salt + pw).encode()).hexdigest() if pw else ""}
+    links_write(d)
+    return {"token": tok, "url": "/s/" + tok, "expires": d[tok]["expires"]}
+
+
+def links_list(user):
+    adm = is_admin(user)
+    return {"links": [{"token": k, "share": v["share"], "path": v["path"], "owner": v["owner"], "dir": v.get("dir"),
+                       "expires": v["expires"], "password": bool(v.get("pw"))}
+                      for k, v in sorted(links_load().items(), key=lambda x: -x[1]["created"]) if adm or v["owner"] == user]}
+
+
+def link_delete(user, req):
+    d = links_load()
+    v = d.get(req.get("token", ""))
+    if not v or not (is_admin(user) or v["owner"] == user):
+        raise Fail("Unbekannter Link.", 404)
+    del d[req["token"]]
+    links_write(d)
+    return {}
+
+
+LINK_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s</title><link rel="stylesheet" href="/ut/untrash.css"><script src="/ut/i18n/i18n.js"></script></head>
+<body class="ut"><main class="ut-login"><form class="ut-login__card" method="post">
+<img class="ut-login__logo" src="/ut/assets/logo-mark-192.png" alt=""><div class="ut-login__host" translate="no">%s</div>%s</form></main></body></html>"""
+
+
+# ------------------------------------------------------------- export
+
+EXPORT_TOOL = os.environ.get("ZT_EXPORT_TOOL", "/usr/lib/untrash/untrash-export")
+USB_STATE = os.environ.get("ZT_USB_STATE", R + "/run/untrash/usb.json")
+EXPORT_DIR = os.environ.get("ZT_EXPORT_DIR", R + "/run/untrash/export")
+EXPORTS = {}            # id -> job state (in memory; the queue runs in one thread)
+EXPORT_Q = []
+EXPORT_LOCK = threading.Lock()
+
+
+def usb_drives():
+    try:
+        st = json.load(open(USB_STATE))
+    except (OSError, ValueError):
+        st = {}
+    out = []
+    for dev, e in sorted(st.items()):
+        if (e.get("label") or "").upper() == "UNTRASHPK":
+            continue                        # the UntrashOS stick holds the stock backup: never an export target
+        try:
+            v = os.statvfs(R + e["mnt"] if TEST else e["mnt"])
+            free = v.f_bavail * v.f_frsize
+        except OSError:
+            continue
+        out.append({"id": e.get("id"), "name": e.get("name") or e.get("label") or dev, "fs": e.get("fs"), "free": free, "mnt": e["mnt"]})
+    return out
+
+
+def export_targets(user):
+    acc = share_access(user)
+    return {"usb": [{k: d[k] for k in ("id", "name", "fs", "free")} for d in usb_drives()],
+            "shares": sorted(k for k, v in acc.items() if v["access"] == "rw" and os.path.isdir(R + v["path"]))}
+
+
+def export_start(user, req):
+    srcs = []
+    for x in req.get("sources") or []:
+        _b, full = resolve(user, x.get("share", ""), x.get("path", ""))
+        if not os.path.exists(full):
+            raise Fail("Keine Datei.", 404)
+        srcs.append(full)
+    if not srcs:
+        raise Fail("Mindestens eine Quelle.")
+    t = req.get("target") or {}
+    name = re.sub(r"[^\w .()-]", "_", (req.get("folder") or "UntrashOS-Export " + time.strftime("%Y-%m-%d %H-%M")))[:80].strip() or "Export"
+    if t.get("usb"):
+        d = next((x for x in usb_drives() if x["id"] == t["usb"]), None)
+        if not d:
+            raise Fail("USB-Ziel wählen.")
+        base = (R + d["mnt"]) if TEST else d["mnt"]
+    else:
+        base = resolve(user, t.get("share", ""), t.get("path", ""), write=True)[1]
+    target = os.path.join(base, name)
+    if any(target == s or target.startswith(s.rstrip("/") + "/") for s in srcs):
+        raise Fail("Das Ziel darf nicht in der Quelle liegen.")
+    mode = "convert" if req.get("mode") == "convert" else "copy"
+    job = {"sources": srcs, "target": target, "mode": mode, "video": req.get("video") or {}, "audio": req.get("audio") or {},
+           "subs": bool(req.get("subs", True)), "container": "mkv" if req.get("container") == "mkv" else "mp4",
+           "music": req.get("music") or {}}
+    jid = secrets.token_hex(4)
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    json.dump(job, open(os.path.join(EXPORT_DIR, jid + ".json"), "w"))
+    with EXPORT_LOCK:
+        EXPORTS[jid] = {"id": jid, "owner": user, "state": "waiting", "percent": 0, "file": "", "eta_s": None, "errors": [],
+                        "target": t.get("usb") and "USB" or t.get("share", ""), "folder": name, "mode": mode,
+                        "files_total": 0, "created": int(time.time()), "proc": None}
+        EXPORT_Q.append(jid)
+        if len(EXPORT_Q) == 1 and not any(e["state"] == "running" for e in EXPORTS.values()):
+            threading.Thread(target=export_worker, daemon=True).start()
+    return {"id": jid}
+
+
+def export_worker():
+    while True:
+        with EXPORT_LOCK:
+            if not EXPORT_Q:
+                return
+            jid = EXPORT_Q.pop(0)
+            e = EXPORTS.get(jid)
+            if not e or e["state"] != "waiting":
+                continue
+            e["state"] = "running"
+        p = subprocess.Popen(["nice", "-n", "10", EXPORT_TOOL, "run", os.path.join(EXPORT_DIR, jid + ".json")],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        e["proc"] = p
+        for line in p.stdout:
+            try:
+                x = json.loads(line)
+            except ValueError:
+                continue
+            if x.get("done"):
+                e["errors"] = x.get("errors", [])
+                e["files_total"] = x.get("files_total", 0)
+            else:
+                e.update(percent=x.get("percent", e["percent"]), file=x.get("file", ""), eta_s=x.get("eta_s"),
+                         files_total=x.get("files_total", 0))
+        rc = p.wait()
+        e["proc"] = None
+        if e["state"] == "running":
+            e["state"] = "done" if rc == 0 else "failed"
+            if rc == 0:
+                e["percent"] = 100
+
+
+def export_jobs(user):
+    adm = is_admin(user)
+    return {"jobs": [{k: v for k, v in e.items() if k != "proc"} for e in sorted(EXPORTS.values(), key=lambda x: -x["created"])
+                     if adm or e["owner"] == user]}
+
+
+def export_cancel(user, req):
+    e = EXPORTS.get(req.get("id", ""))
+    if not e or not (is_admin(user) or e["owner"] == user):
+        raise Fail("Unbekannter Auftrag.", 404)
+    if req.get("remove") and e["state"] in ("done", "failed", "cancelled"):
+        EXPORTS.pop(e["id"], None)
+        return {}
+    if e["state"] in ("waiting", "running"):
+        e["state"] = "cancelled"
+        if e.get("proc"):
+            try:
+                os.killpg(e["proc"].pid, signal.SIGTERM)
+            except OSError:
+                pass
+    return {}
+
+
+# ------------------------------------------------------------- ad filter (DNS)
+
+AB = load_module(os.environ.get("ZT_ADBLOCK_TOOL", "/usr/lib/untrash/untrash-adblock"), "untrash_adblock")
+AB_STATE = {"updating": False, "stats": None, "stats_t": 0}
+
+
+def lan_ip():
+    """Address of the NAS in the home network (what goes into the router as DNS)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))          # no packet is sent
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return ""
+
+
+def adblock_state():
+    s = AB.load()
+    on = os.path.exists(AB.FLAG)
+    running = on if TEST else read(["systemctl", "is-active", "untrash-adblock.service"]).strip() == "active"
+    if time.time() - AB_STATE["stats_t"] > 20 or AB_STATE["stats"] is None:
+        AB.rotate()
+        AB_STATE.update(stats=AB.stats(24), stats_t=time.time())
+    return {"active": on, "running": running, "updating": AB_STATE["updating"], "lists": s["lists"],
+            "allow": s["allow"], "block": s["block"], "count": s["count"], "updated": s["updated"],
+            "errors": s["errors"], "stats": AB_STATE["stats"], "dns_ip": lan_ip()}
+
+
+def adblock_save(req):
+    s = AB.load()
+    restart = rebuild = False
+    if "lists" in req:
+        ls = []
+        for x in req["lists"][:20]:
+            url = str(x.get("url", "")).strip()
+            if not re.fullmatch(r"https?://[^\s]{4,500}", url):
+                raise Fail("Ungültige Listen-Adresse: %s" % url[:80])
+            ls.append({"name": str(x.get("name") or url)[:60], "url": url, "on": bool(x.get("on"))})
+        rebuild = ls != s["lists"]
+        s["lists"] = ls
+    for k in ("allow", "block"):
+        if k in req:
+            vals = []
+            for d in req[k][:500]:
+                c = AB.clean_domain(d)
+                if not c:
+                    raise Fail("Ungültige Domain: %s" % str(d)[:80])
+                if c not in vals:
+                    vals.append(c)
+            restart = restart or vals != s[k]
+            rebuild = rebuild or (k == "allow" and vals != s[k])
+            s[k] = vals
+    AB.save(s)
+    if rebuild:
+        s["count"] = AB.build(s)
+        AB.save(s)
+        AB.reload_hosts()
+    if "active" in req:
+        os.makedirs(AB.DATA, exist_ok=True)
+        if req["active"]:
+            open(AB.FLAG, "w").close()
+            first_lists = not s["updated"]
+            sysrun(["systemctl", "restart", "--no-block", "untrash-adblock.service"], check=False)
+            if first_lists:
+                adblock_update({})
+        else:
+            if os.path.exists(AB.FLAG):
+                os.unlink(AB.FLAG)
+            sysrun(["systemctl", "stop", "--no-block", "untrash-adblock.service"], check=False)
+    elif restart and os.path.exists(AB.FLAG):
+        sysrun(["systemctl", "restart", "--no-block", "untrash-adblock.service"], check=False)
+    AB_STATE["stats"] = None
+    return adblock_state()
+
+
+def adblock_update(_req):
+    """Download the enabled lists in the background (minutes on a slow line)."""
+    if AB_STATE["updating"]:
+        return {}
+
+    def run():
+        try:
+            if not TEST:
+                subprocess.run(["nice", "-n", "10", AB.__file__, "update"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=1800)
+            else:
+                SYSLOG.append([AB.__file__, "update"])
+        finally:
+            AB_STATE["updating"] = False
+    AB_STATE["updating"] = True
+    threading.Thread(target=run, daemon=True).start()
+    return {}
+
+
+def adblock_log(q):
+    n = max(10, min(1000, int(q.get("n") or 200)))
+    f = (q.get("q") or "").strip().lower()
+    rows = AB.last(5000 if f else n)
+    if f:
+        rows = [r for r in rows if f in r["name"] or f in r["client"]][:n]
+    if q.get("blocked") == "1":
+        rows = [r for r in rows if r["status"] == "blocked"]
+    return {"rows": rows}
+
+
+# ------------------------------------------------------------- media server
+
+DLNA_URL = os.environ.get("ZT_DLNA_URL", "http://127.0.0.1:8200/")
+DLNA_DB = os.environ.get("ZT_DLNA_DB", R + "/var/cache/minidlna/files.db")
+
+
+def dlna_page():
+    """minidlna's own status page: library counts and the clients it knows."""
+    import urllib.request
+    try:
+        h = urllib.request.urlopen(DLNA_URL, timeout=3).read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    cells = lambda row: [re.sub(r"<[^>]+>", "", x).strip() for x in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]  # noqa: E731
+    rows = [cells(r) for r in re.findall(r"<tr[^>]*>(.*?)</tr>", h, re.S)]
+    lib = {}
+    for r in rows:
+        if len(r) == 2 and r[1].isdigit():
+            k = r[0].lower()
+            lib["audio" if "audio" in k else "video" if "video" in k else "image" if "image" in k else k] = int(r[1])
+    clients = [{"type": r[1], "ip": r[2], "connections": int(r[4]) if r[4].isdigit() else 0}
+               for r in rows if len(r) >= 5 and r[0].isdigit() and re.fullmatch(r"[\d.:a-fA-F]+", r[2])]
+    return {"library": lib, "clients": clients}
+
+
+def media_state():
+    s = settings_load()
+    cfg = load_module(CFGTOOL, "untrash_config")
+    page = dlna_page()
+    acts = untrash_live.activities(R)["activities"]
+    sh = [{"name": x["name"], "media": x["media"], "present": x["present"],
+           "published": bool(x["media"] and x["enabled"] and x["present"] and cfg.media_dir_used(R + x["path"]))}
+          for x in shares() if x["enabled"]]
+    try:
+        dbsize = os.path.getsize(DLNA_DB)
+        scanned = int(os.path.getmtime(DLNA_DB))
+    except OSError:
+        dbsize = scanned = 0
+    return {"active": s["services"]["mediaserver"]["active"], "name": s["hostname"],
+            "running": page is not None, "library": (page or {}).get("library", {}), "clients": (page or {}).get("clients", []),
+            "indexing": any(a["kind"] == "index" for a in acts),
+            "streams": sum(int(re.match(r"\d+", a.get("text", "")).group()) if re.match(r"\d+", a.get("text", "")) else 1
+                           for a in acts if a["kind"] == "stream"),
+            "db_size": dbsize, "db_time": scanned, "shares": sh, "tv": TV.state()}
+
+
+def media_save(req):
+    """Media server on/off and the media types per share (stock: mdaserv_public_type)."""
+    masks = req.get("shares") or {}
+    if masks:
+        known = {x["name"] for x in shares()}
+        c = db()
+        try:
+            for name, m in masks.items():
+                if name not in known:
+                    raise Fail("Unbekannte Freigabe.", 404)
+                c.execute("UPDATE smb_share SET mdaserv_public_type=? WHERE s_name=?", (int(m) & 7, name))
+            c.commit()
+        finally:
+            c.close()
+        media_sync()
+    s = settings_load()
+    if "active" in req:
+        s["services"]["mediaserver"]["active"] = bool(req["active"])
+    settings_save(s)
+    if "lan_open" in req:
+        TV.set_lan_open(req["lan_open"])
+    return media_state()
+
+
+def media_rescan(_req):
+    """Rebuild the library from scratch (minidlna keeps a stale database otherwise)."""
+    if not settings_load()["services"]["mediaserver"]["active"]:
+        raise Fail("Der Medienserver ist aus.")
+    sysrun(["systemctl", "stop", "minidlna"], check=False)
+    if not TEST:
+        for f in ("files.db", "art_cache"):
+            x = os.path.join(os.path.dirname(DLNA_DB), f)
+            shutil.rmtree(x, ignore_errors=True) if os.path.isdir(x) else (os.path.exists(x) and os.unlink(x))
+    sysrun(["systemctl", "start", "--no-block", "minidlna"], check=False)
+    return {}
+
+
+def tv_resolve(share, path):
+    try:
+        _b, full = resolve("admin", share, path)
+    except Fail:
+        return None
+    return full if os.path.exists(full) else None
+
+
+TV = untrash_tv.TV(os.environ.get("ZT_TV_STORE", R + "/etc/untrash/tv.json"),
+                   os.environ.get("ZT_TV_DIR", R + "/run/untrash/tv"),
+                   os.environ.get("ZT_TV_CACHE", R + "/var/cache/untrash/tv-durations.json"), tv_resolve)
+
+
+def tv_call(fn, *a):
+    try:
+        return fn(*a)
+    except untrash_tv.Fail as e:
+        raise Fail(str(e), e.code)
+
+
+def lan_client(ip):
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip.split("%")[0])
+        if a.version == 6 and a.ipv4_mapped:
+            a = a.ipv4_mapped
+        return a.is_private or a.is_link_local or a.is_loopback
+    except ValueError:
+        return False
+
+
+# ------------------------------------------------------------- media player
+
+FFPROBE = os.environ.get("ZT_FFPROBE", "ffprobe")
+FFMPEG = os.environ.get("ZT_FFMPEG", "ffmpeg")
+# codecs a browser plays without help (Firefox/Chrome); everything else is remuxed
+WEB_VIDEO = {"h264", "vp8", "vp9", "av1"}
+WEB_AUDIO = {"aac", "mp3", "opus", "vorbis", "flac"}
+
+
+def files_probe(user, q):
+    """Duration, container and streams of a media file (ffprobe) and how the
+    player gets it: "direct" (the browser plays the file) or "remux" (ffmpeg
+    copies the video and converts only the sound, live, files_stream)."""
+    _b, full = resolve(user, q.get("share", ""), q.get("path", ""))
+    if not os.path.isfile(full):
+        raise Fail("Keine Datei.", 404)
+    try:
+        j = json.loads(read([FFPROBE, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", full],
+                            timeout=30) or "{}")
+    except ValueError:
+        j = {}
+    fmt = j.get("format", {})
+    vids, auds, subs = [], [], []
+    for st in j.get("streams", []):
+        t, tags = st.get("codec_type"), st.get("tags") or {}
+        info = {"index": st.get("index"), "codec": st.get("codec_name", "?"), "lang": tags.get("language", ""),
+                "title": tags.get("title", "")}
+        if t == "video" and not (st.get("disposition") or {}).get("attached_pic"):
+            info.update(width=st.get("width"), height=st.get("height"))
+            vids.append(info)
+        elif t == "audio":
+            info.update(channels=st.get("channels"))
+            auds.append(info)
+        elif t == "subtitle":
+            subs.append(info)
+    names = fmt.get("format_name", "")
+    # ffprobe names mkv and webm alike ("matroska,webm"): the extension decides
+    ext = os.path.splitext(full)[1].lower()
+    direct = ext in (".mp4", ".m4v", ".m4a", ".mov", ".webm", ".mp3", ".ogg", ".oga", ".opus", ".flac", ".wav", ".aac") \
+        and all(v["codec"] in WEB_VIDEO for v in vids) and all(a["codec"] in WEB_AUDIO | {"pcm_s16le"} for a in auds[:1])
+    playable = not vids or vids[0]["codec"] in WEB_VIDEO
+    return {"duration": float(fmt.get("duration") or 0), "container": names, "video": vids, "audio": auds,
+            "subtitles": subs, "mode": "direct" if direct else "remux" if playable else "none",
+            "note": "" if playable else "Videoformat %s spielt kein Browser; Umkodieren kommt mit dem Export." % (
+                vids[0]["codec"] if vids else "?")}
+
+
+def files_upload(user, q, handler, length):
+    name = q.get("name", "")
+    if not name or "/" in name or name in (".", "..") or length > 64 * 1024 ** 3:
+        raise Fail("Ungültiger Dateiname.")
+    _b, full = resolve(user, q.get("share", ""), q.get("path", ""), write=True)
+    dst = os.path.join(full, name)
+    tmp = os.path.join(full, ".%s.untrash-upload" % name)
+    with open(tmp, "wb") as f:
+        left = length
+        while left:
+            b = handler.rfile.read(min(left, 1 << 20))
+            if not b:
+                os.unlink(tmp)
+                raise Fail("Übertragung abgebrochen.")
+            f.write(b)
+            left -= len(b)
+    os.chmod(tmp, 0o777)
+    if not TEST:
+        os.chown(tmp, owner_of(user), 500)
+    os.replace(tmp, dst)
+    return {}
+
+
+# ------------------------------------------------------------- first setup
+
+def setup(req):
+    """Way A (or any system without users): admin password + name."""
+    if initialized():
+        raise Fail("Bereits eingerichtet.", 409)
+    check_password(req.get("password", ""))
+    name = (req.get("name") or "zyxel-untrash").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,14}", name):
+        raise Fail("Name: bis 15 Zeichen, Buchstaben, Ziffern, Bindestrich.")
+    c = db()
+    try:
+        c.executemany("INSERT INTO smb_user VALUES (?,?,?,?,?,?)",
+                      [(501, "admin", "bulit-in", "admin", "", ""), (502, GUEST, "bulit-in", "guest", "", "")])
+        c.execute("INSERT OR IGNORE INTO smb_group VALUES (500, ?, 'local', 'System default group')", (EVERYONE,))
+        c.commit()
+    finally:
+        c.close()
+    for cmd in (["groupadd", "-g", "500", EVERYONE], ["useradd", "-u", "501", "-g", "500", "-M", "-d", "/nonexistent",
+                                                       "-s", "/bin/bash", "admin"],
+                ["useradd", "-u", "502", "-g", "500", "-M", "-d", "/nonexistent", "-s", "/usr/sbin/nologin", GUEST]):
+        sysrun(cmd, check=False)
+    smb_set_password("admin", 501, req["password"])
+    s = settings_load()
+    s["hostname"] = name.lower()
+    s["netbios"]["name"] = name.upper()[:15]
+    settings_save(s)
+    mark_takeover()
+    vols = [v for v in volumes() if v["kind"] == "intern"]
+    if vols:
+        for share in ("public",):
+            try:
+                share_save({"new": True, "name": share, "volume": vols[0]["id"], "users": {"admin": "rw"},
+                            "groups": {EVERYONE: "rw"}})
+            except Fail:
+                pass
+    resmb()
+    return {}
+
+
+RESET_MARK = R + "/run/untrash/admin-reset"
+
+
+def reset_window():
+    """Seconds left to set the admin password without login after the RESET
+    button (physical access proves the right, untrash-config reset-network)."""
+    try:
+        left = 900 - (time.time() - os.path.getmtime(RESET_MARK))
+    except OSError:
+        return 0
+    return int(left) if left > 0 and initialized() else 0
+
+
+def reset_admin(req):
+    if not reset_window():
+        raise Fail("Kein Zurücksetzen aktiv (RESET-Taste 2 Sekunden halten).", 403)
+    check_password(req.get("password", ""))
+    c = db()
+    try:
+        r = c.execute("SELECT uid FROM smb_user WHERE uname='admin'").fetchone()
+    finally:
+        c.close()
+    smb_set_password("admin", r[0], req["password"])
+    if not TEST:
+        sysrun(["usermod", "-U", "admin"], check=False)
+    os.unlink(RESET_MARK)
+    FAILS.clear()
+    return {}
+
+
+# ---------------------------------------------------------------- sessions
+
+SESSIONS = {}          # token -> (user, expiry)
+FAILS = {}             # address -> (count, until)
+SESSION_S = 8 * 3600
+
+
+def session_user(handler):
+    ck = handler.headers.get("Cookie") or ""
+    m = re.search(r"(?:^|;\s*)utsess=([A-Za-z0-9_-]{20,})", ck)
+    if not m:
+        return None
+    s = SESSIONS.get(m.group(1))
+    if not s or s[1] < time.time():
+        SESSIONS.pop(m.group(1), None)
+        return None
+    SESSIONS[m.group(1)] = (s[0], time.time() + SESSION_S)
+    return s[0]
+
+
+def login(handler, req):
+    ip = handler.client_address[0]
+    n, until = FAILS.get(ip, (0, 0))
+    if until > time.time():
+        raise Fail("Zu viele Fehlversuche, bitte %d s warten." % int(until - time.time()), 429)
+    user, pw = req.get("user", ""), req.get("password", "")
+    c = db()
+    try:
+        known = c.execute("SELECT 1 FROM smb_user WHERE uname=? AND uname != ?", (user, GUEST)).fetchone()
+    finally:
+        c.close()
+    ok = known and auth_ok(user, pw)
+    if not ok:
+        n += 1
+        FAILS[ip] = (n, time.time() + min(300, 2 ** n) if n >= 3 else 0)
+        raise Fail("Benutzername oder Passwort falsch.", 401)
+    FAILS.pop(ip, None)
+    tok = secrets.token_urlsafe(32)
+    SESSIONS[tok] = (user, time.time() + SESSION_S)
+    return tok
+
+
+# ------------------------------------------------------------------- HTTP
+
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css",
+                ".png": "image/png", ".svg": "image/svg+xml", ".jpg": "image/jpeg", ".ico": "image/x-icon",
+                ".json": "application/json; charset=utf-8", ".webp": "image/webp", ".pdf": "application/pdf"}
+
+
+def static(base, rel):
+    rel = urllib.parse.unquote(rel.split("?", 1)[0])
+    b = os.path.realpath(base)
+    full = os.path.realpath(os.path.join(b, rel))
+    if not full.startswith(b + "/") or not os.path.isfile(full):
+        return None
+    t = STATIC_TYPES.get(os.path.splitext(full)[1])
+    return (open(full, "rb").read(), t) if t else None
+
+
+ADMIN_GET = {"/api/adblock", "/api/adblock/log", "/api/overview", "/api/live", "/api/activity", "/api/sound", "/api/volumes/dirs", "/api/feedback/info", "/api/storage", "/api/users", "/api/settings", "/api/logs", "/api/update", "/api/stock",
+             "/api/timezones", "/api/raid", "/api/printers", "/api/cloud", "/api/downloads", "/api/copybtn", "/api/backup", "/api/users/quota", "/api/cert", "/api/upnp", "/api/iscsi", "/api/power/next",
+             "/api/backup/versions"}
+ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete,
+              "/api/groups/create": group_create, "/api/groups/delete": group_delete,
+              "/api/groups/members": group_set_members, "/api/shares/save": share_save,
+              "/api/shares/delete": share_delete, "/api/settings": settings_update, "/api/power": power,
+              "/api/update/install": update_install, "/api/stock/rollback": stock_rollback, "/api/raid/job": raid_job,
+              "/api/notify/test": notify_test, "/api/printers/cancel": printer_cancel,
+              "/api/cloud/auth-start": cloud_auth_start, "/api/cloud/auth-finish": cloud_auth_finish,
+              "/api/cloud/ftp": cloud_ftp, "/api/cloud/delete": cloud_delete, "/api/cloud/jobs": cloud_jobs,
+              "/api/sound/save": sound_save, "/api/adblock/save": adblock_save, "/api/adblock/update": adblock_update, "/api/media/save": media_save, "/api/media/rescan": media_rescan, "/api/sound/play": sound_play, "/api/sound/import": sound_import,
+              "/api/cloud/run": cloud_run, "/api/downloads/add": downloads_add, "/api/downloads/ctl": downloads_ctl,
+              "/api/copybtn/run": copybtn_run,
+              "/api/backup/jobs": backup_jobs, "/api/users/quota": user_quota_set,
+              "/api/cert/regenerate": cert_regenerate, "/api/upnp": upnp_save,
+              "/api/iscsi/lun": iscsi_lun, "/api/iscsi/lun-delete": iscsi_lun_delete, "/api/iscsi/targets": iscsi_targets, "/api/cert/upload": cert_upload, "/api/backup/run": backup_run, "/api/backup/restore": backup_restore}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "UntrashDesk"
+
+    def reply(self, code, obj, ctype="application/json", headers=()):
+        body = obj if isinstance(obj, bytes) else (obj.encode() if isinstance(obj, str) else json.dumps(obj).encode())
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if not any(k == "X-Frame-Options" for k, _v in headers):
+            self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if not any(k == "Cache-Control" for k, _v in headers):
+            self.send_header("Cache-Control", "no-store" if ctype == "application/json" or ctype.startswith("text/html")
+                             else "max-age=3600")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def json_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1 << 20:
+            raise Fail("Anfrage zu groß.", 413)
+        try:
+            return json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except ValueError:
+            raise Fail("Ungültiges JSON.")
+
+    def handle_any(self, method):
+        url = urllib.parse.urlsplit(self.path)
+        p, q = url.path, dict(urllib.parse.parse_qsl(url.query))
+        hs = HTTPS_STATE
+        if hs.get("force") and not getattr(self.server, "tls", False):
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0] or "localhost"
+            self.send_response(301)
+            self.send_header("Location", "https://%s%s%s" % (host, "" if hs["port"] == 443 else ":%d" % hs["port"], self.path))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if method == "GET" and p in ("/", "/index.html"):
+            f = static(STATIC, "index.html")
+            if not f:
+                return self.reply(500, "desk files missing", "text/plain")
+            # system language for i18n.js (a browser's own choice wins)
+            lang = settings_load().get("language", "de")
+            page = f[0].replace(b'<html lang="de">', b'<html lang="de" data-lang="%s">' % lang.encode())
+            # cache busting: scripts and styles are cached for an hour, an
+            # update (new slot) or a changed file must reach the browser at once
+            ver = hashlib.sha1(("%s|%s" % (first("/etc/untrash-version", "?").strip(), "|".join(
+                str(int(os.path.getmtime(x))) for x in (os.path.join(STATIC, "desk.js"), os.path.join(STATIC, "desk.css"),
+                                                        os.path.join(DESIGN, "i18n", "i18n.js"), os.path.join(DESIGN, "untrash.css"))
+                if os.path.exists(x)))).encode()).hexdigest()[:10].encode()
+            page = re.sub(rb'((?:src|href)="/(?:desk|ut)/[^"?]+\.(?:js|css))"', rb'\1?v=' + ver + b'"', page)
+            return self.reply(200, page, f[1])
+        if method == "GET" and p.startswith("/desk/"):
+            f = static(STATIC, p[len("/desk/"):])
+            return self.reply(200, *f) if f else self.reply(404, {"error": "not found"})
+        if method == "GET" and p.startswith("/ut/"):
+            f = static(DESIGN, p[len("/ut/"):])
+            return self.reply(200, *f) if f else self.reply(404, {"error": "not found"})
+        if method == "GET" and p in ("/manual", "/manual/"):
+            # readable without signing in, like the login page itself
+            # static, no scripts: the Desk's "Manual" window shows it in a frame
+            f = static(MANUAL, "index.html") or static(MANUAL, "manual.html")
+            return self.reply(200, *f, headers=MANUAL_HDR) if f else self.reply(404, {"error": "not found"})
+        if method == "GET" and p.startswith("/manual/"):
+            f = static(MANUAL, p[len("/manual/"):])
+            return self.reply(200, *f, headers=MANUAL_HDR) if f else self.reply(404, {"error": "not found"})
+        if method == "GET" and p.lower().startswith("/myweb"):
+            return self.webpublish(p)
+        if p.startswith("/s/") and method in ("GET", "POST"):
+            return self.share_link(p[3:], method)
+        if p.startswith("/tv/") and method == "GET":
+            return self.tv(p[4:])
+        if not p.startswith("/api/"):
+            return self.reply(404, {"error": "not found"})
+        if method == "POST" and self.headers.get("X-UT") != "1":
+            raise Fail("Fehlender Kopf X-UT (CSRF-Schutz).", 403)
+        if p == "/api/state":
+            return self.reply(200, {"initialized": initialized(), "hostname": settings_load()["hostname"],
+                                    "language": settings_load().get("language", "de"),
+                                    "user": session_user(self), "reset_window": reset_window()})
+        if p == "/api/reset-admin" and method == "POST":
+            with LOCK:
+                return self.reply(200, reset_admin(self.json_body()))
+        if p == "/api/setup" and method == "POST":
+            with LOCK:
+                return self.reply(200, setup(self.json_body()))
+        if p == "/api/login" and method == "POST":
+            tok = login(self, self.json_body())
+            return self.reply(200, {"ok": True}, headers=[("Set-Cookie", "utsess=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (tok, SESSION_S))])
+        user = session_user(self)
+        if not user:
+            raise Fail("Bitte anmelden.", 401)
+        admin = is_admin(user)
+        if p == "/api/logout" and method == "POST":
+            ck = re.search(r"utsess=([A-Za-z0-9_-]+)", self.headers.get("Cookie") or "")
+            SESSIONS.pop(ck.group(1) if ck else "", None)
+            return self.reply(200, {}, headers=[("Set-Cookie", "utsess=; Path=/; Max-Age=0")])
+        if p == "/api/me":
+            return self.reply(200, {"user": user, "admin": admin})
+        if p == "/api/password" and method == "POST":
+            with LOCK:
+                return self.reply(200, user_password(self.json_body(), user))
+        if p == "/api/shares" and method == "GET":
+            if admin:
+                return self.reply(200, {"shares": shares(), "volumes": volumes()})
+            return self.reply(200, {"shares": [{"name": k, "access": v["access"], "present": os.path.isdir(R + v["path"])}
+                                               for k, v in share_access(user).items() if v["access"] != "deny"], "volumes": []})
+        if p == "/api/files" and method == "GET":
+            return self.reply(200, files_list(user, q))
+        if p == "/api/files/download" and method == "GET":
+            _b, full = resolve(user, q.get("share", ""), q.get("path", ""))
+            if not os.path.isfile(full):
+                raise Fail("Keine Datei.", 404)
+            return self.send_file(full, inline=q.get("inline") == "1")
+        if p == "/api/export/targets" and method == "GET":
+            return self.reply(200, export_targets(user))
+        if p == "/api/export/start" and method == "POST":
+            return self.reply(200, export_start(user, self.json_body()))
+        if p == "/api/export/jobs" and method == "GET":
+            return self.reply(200, export_jobs(user))
+        if p == "/api/export/cancel" and method == "POST":
+            return self.reply(200, export_cancel(user, self.json_body()))
+        if p == "/api/links" and method == "GET":
+            return self.reply(200, links_list(user))
+        if p == "/api/links/create" and method == "POST":
+            return self.reply(200, link_create(user, self.json_body()))
+        if p == "/api/links/delete" and method == "POST":
+            return self.reply(200, link_delete(user, self.json_body()))
+        if p == "/api/files/probe" and method == "GET":
+            return self.reply(200, files_probe(user, q))
+        if p == "/api/files/stream" and method == "GET":
+            _b, full = resolve(user, q.get("share", ""), q.get("path", ""))
+            if not os.path.isfile(full):
+                raise Fail("Keine Datei.", 404)
+            return self.stream_media(full, q)
+        if p == "/api/files/op" and method == "POST":
+            return self.reply(200, files_op(user, self.json_body()))
+        if p == "/api/files/upload" and method == "POST":
+            return self.reply(200, files_upload(user, q, self, int(self.headers.get("Content-Length") or 0)))
+        if p == "/api/tv" and method == "GET":
+            st = TV.state()
+            return self.reply(200, st if admin else {"channels": [{k: c[k] for k in ("id", "name", "profile", "now", "running")}
+                                                                  for c in st["channels"]]})
+        if not admin:
+            raise Fail("Nur für Administratoren.", 403)
+        if p == "/api/media" and method == "GET":
+            return self.reply(200, media_state())
+        if p == "/api/tv/save" and method == "POST":
+            return self.reply(200, tv_call(TV.save_channel, self.json_body()))
+        if p == "/api/tv/delete" and method == "POST":
+            return self.reply(200, tv_call(TV.delete, self.json_body().get("id", "")) or {})
+        if p == "/api/tv/stop" and method == "POST":
+            TV.stop(self.json_body().get("id", ""))
+            return self.reply(200, {})
+        if p == "/api/term" and method == "GET":
+            # web terminal: a login shell of this admin over a WebSocket
+            # (sudo for root; untrash_live.terminal checks Origin == Host)
+            if TEST:
+                raise Fail("Terminal im Testmodus nicht verfügbar.", 501)
+            untrash_live.terminal(self, user)
+            return
+        if method == "GET" and p in ADMIN_GET:
+            if p == "/api/overview":
+                return self.reply(200, overview())
+            if p == "/api/sound":
+                return self.reply(200, sound_state())
+            if p == "/api/adblock":
+                return self.reply(200, adblock_state())
+            if p == "/api/adblock/log":
+                return self.reply(200, adblock_log(q))
+            if p == "/api/feedback/info":
+                return self.reply(200, feedback_info())
+            if p == "/api/volumes/dirs":
+                return self.reply(200, volume_dirs(q))
+            if p == "/api/live":
+                return self.reply(200, untrash_live.live(R))
+            if p == "/api/activity":
+                a = untrash_live.activities(R)
+                for name, n in TV.running():
+                    a["activities"].append({"kind": "tv", "text": "Sender %s: %d Zuschauer" % (name, n)})
+                return self.reply(200, a)
+            if p == "/api/storage":
+                return self.reply(200, {"disks": disks(), "volumes": volumes(), "arrays": overview()["arrays"],
+                                        "usb": json.loads(first("/run/untrash/usb.json", "{}") or "{}")})
+            if p == "/api/raid":
+                return self.reply(200, raid_status())
+            if p == "/api/printers":
+                return self.reply(200, printers())
+            if p == "/api/cloud":
+                return self.reply(200, cloud_state())
+            if p == "/api/downloads":
+                return self.reply(200, downloads())
+            if p == "/api/users/quota":
+                return self.reply(200, user_quota(q.get("name", "")))
+            if p == "/api/power/next":
+                return self.reply(200, json.loads(read([os.environ.get("ZT_POWER_TOOL", "/usr/lib/untrash/untrash-power"), "next"])
+                                                  or "{}"))
+            if p == "/api/upnp":
+                return self.reply(200, upnp_state())
+            if p == "/api/iscsi":
+                return self.reply(200, iscsi_state())
+            if p == "/api/cert":
+                return self.reply(200, cert_info())
+            if p == "/api/backup":
+                return self.reply(200, backup_state())
+            if p == "/api/backup/versions":
+                return self.reply(200, {"versions": json.loads(backup_tool("versions", q.get("id", "")) or "[]")})
+            if p == "/api/copybtn":
+                return self.reply(200, json.loads(first("/run/untrash/copybtn.json", "{}") or "{}"))
+            if p == "/api/users":
+                return self.reply(200, {"users": users(), "groups": groups()})
+            if p == "/api/settings":
+                return self.reply(200, settings_public())
+            if p == "/api/logs":
+                return self.reply(200, logs(q))
+            if p == "/api/update":
+                env = boot_env()
+                return self.reply(200, {"state": UPDATE["state"], "log": UPDATE["log"],
+                                        "version": first("/etc/untrash-version", "?"), "slot": env.get("ZT_SLOT", "?")})
+            if p == "/api/stock":
+                st = stock_backup()
+                return self.reply(200, {"stick": bool(st), "run": st and {k: st["run"][k] for k in ("name", "verified")},
+                                        "markers": st and st["markers"]})
+            if p == "/api/timezones":
+                zi = (R + "/usr/share/zoneinfo") if TEST else "/usr/share/zoneinfo"
+                tz = sorted(os.path.relpath(f, zi) for f in glob.glob(zi + "/*/*")
+                            if re.match(r"(Europe|America|Asia|Africa|Australia|Atlantic|Pacific|Indian)/", os.path.relpath(f, zi)))
+                return self.reply(200, {"zones": tz})
+        if method == "POST" and p == "/api/downloads/torrent":
+            return self.reply(200, downloads_torrent(self, int(self.headers.get("Content-Length") or 0)))
+        if method == "POST" and p == "/api/update/upload":
+            with LOCK:
+                return self.reply(200, update_upload(self, int(self.headers.get("Content-Length") or 0)))
+        if method == "POST" and p in ADMIN_POST:
+            with LOCK:
+                return self.reply(200, ADMIN_POST[p](self.json_body()))
+        raise Fail("Unbekannt.", 404)
+
+    def webpublish(self, p):
+        """Stock Web Publishing on port 80: http://NAS/MyWeb/<share>/... for
+        shares with web_public=y, public and read-only (index.html if
+        present, otherwise a file list)."""
+        # published pages are user content on the Desk's origin: a CSP sandbox
+        # gives them an opaque origin (no Desk cookies, no API calls)
+        sb = [("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups allow-downloads")]
+        wp = settings_load()["services"]["webpublish"]
+        parts = urllib.parse.unquote(p).split("/")[2:]
+        pub = {}
+        if wp["active"] and int(wp["port"]) == 80:
+            c = db()
+            try:
+                pub = {n.lower(): (n, path) for n, path in c.execute(
+                    "SELECT s_name, s_path FROM smb_share WHERE s_enable='y' AND web_public='y'")}
+            finally:
+                c.close()
+        if not pub:
+            return self.reply(404, "Web Publishing ist aus.", "text/plain; charset=utf-8", sb)
+        if not parts or not parts[0]:
+            body = "".join('<li><a href="/MyWeb/%s/">%s</a></li>' % (urllib.parse.quote(n), html.escape(n))
+                           for n, _p in sorted(pub.values()))
+            return self.reply(200, "<!doctype html><meta charset=utf-8><title>MyWeb</title><ul>%s</ul>" % body,
+                              "text/html; charset=utf-8", sb)
+        share = pub.get(parts[0].lower())
+        if not share:
+            return self.reply(404, "Nicht gefunden.", "text/plain; charset=utf-8", sb)
+        base = os.path.realpath(R + share[1])
+        full = os.path.realpath(os.path.join(base, *[x for x in parts[1:] if x]))
+        if full != base and not full.startswith(base + "/"):
+            return self.reply(403, "Verboten.", "text/plain; charset=utf-8", sb)
+        if os.path.isdir(full):
+            if not p.endswith("/"):
+                self.send_response(301)
+                self.send_header("Location", urllib.parse.quote(urllib.parse.unquote(p)) + "/")
+                self.send_header("Content-Length", "0")
+                self.send_header(*sb[0])
+                self.end_headers()
+                return
+            if os.path.isfile(os.path.join(full, "index.html")):
+                full = os.path.join(full, "index.html")
+            else:
+                ents = sorted(e for e in os.listdir(full) if not e.startswith("."))
+                body = "".join('<li><a href="%s%s">%s%s</a></li>' % (
+                    urllib.parse.quote(e), "/" if os.path.isdir(os.path.join(full, e)) else "", html.escape(e),
+                    "/" if os.path.isdir(os.path.join(full, e)) else "") for e in ents)
+                return self.reply(200, "<!doctype html><meta charset=utf-8><title>%s</title><h1>%s</h1><ul>%s</ul>" % (
+                    html.escape(share[0]), html.escape(urllib.parse.unquote(p)), body), "text/html; charset=utf-8", sb)
+        if not os.path.isfile(full):
+            return self.reply(404, "Nicht gefunden.", "text/plain; charset=utf-8", sb)
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        size = os.path.getsize(full)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
+        self.send_header("Content-Length", str(size))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(*sb[0])
+        self.end_headers()
+        if self.command != "HEAD":
+            with open(full, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 1 << 20)
+
+    def tv(self, rel):
+        """Broadcast channels: /tv/channels.m3u, /tv/<id>/index.m3u8, /tv/<id>/segNNNNNN.ts.
+        Open in the home network without login when "lan_open" (TVs, VLC and
+        Kodi cannot log in); otherwise only for signed-in users."""
+        ip = self.client_address[0]
+        if not (session_user(self) or (TV.load()["lan_open"] and lan_client(ip))):
+            raise Fail("Bitte anmelden.", 401)
+        if rel == "channels.m3u":
+            host = self.headers.get("Host") or "untrash.local"
+            proto = "https" if getattr(self.server, "tls", False) else "http"
+            lines = ["#EXTM3U"] + sum((["#EXTINF:-1 tvg-id=\"%s\" group-title=\"UntrashOS\"%s,%s" % (
+                c["id"], " radio=\"true\"" if c.get("profile") == "radio" else "", c["name"]),
+                "%s://%s/tv/%s/index.m3u8" % (proto, host, c["id"])] for c in TV.load()["channels"]), [])
+            return self.reply(200, "\n".join(lines) + "\n", "audio/x-mpegurl; charset=utf-8",
+                              headers=[("Content-Disposition", 'inline; filename="untrash-sender.m3u"')])
+        m = re.fullmatch(r"([0-9a-f]{6})/(index\.m3u8|seg\d{6}\.ts)", rel)
+        if not m:
+            return self.reply(404, {"error": "not found"})
+        cid, f = m.groups()
+        if f == "index.m3u8":
+            d = tv_call(TV.wait_ready, cid)
+        else:
+            r = TV.run.get(cid)
+            if not r:
+                return self.reply(404, {"error": "not found"})
+            d = r["dir"]
+        TV.touch(cid, ip)
+        try:
+            data = open(os.path.join(d, f), "rb").read()
+        except OSError:
+            return self.reply(404, {"error": "not found"})
+        if f.endswith(".m3u8"):
+            return self.reply(200, data, "application/vnd.apple.mpegurl", headers=[("Cache-Control", "no-cache")])
+        return self.reply(200, data, "video/mp2t", headers=[("Cache-Control", "max-age=20")])
+
+    def share_link(self, tok, method):
+        """Public download of a share link: the file, or a folder as a ZIP
+        (stored, streamed).  A password link asks for it first (POST form)."""
+        v = links_load().get(tok.split("/")[0])
+        if not v:
+            return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>Dieser Link ist abgelaufen oder gelöscht.</p>"),
+                              "text/html; charset=utf-8")
+        if v.get("pw"):
+            pw = ""
+            if method == "POST":
+                n = min(int(self.headers.get("Content-Length") or 0), 4096)
+                pw = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace")).get("pw", [""])[0]
+            if not hmac.compare_digest(hashlib.sha256((v["salt"] + pw).encode()).hexdigest(), v["pw"]):
+                form = ('<p>Dieser Link ist mit einem Passwort geschützt.</p>%s<div class="ut-field"><label for="pw">Passwort</label>'
+                        '<input class="ut-input" id="pw" name="pw" type="password" autofocus></div>'
+                        '<button class="ut-btn ut-btn--primary ut-btn--lg" style="width:100%%">Herunterladen</button>') % (
+                            '<div class="ut-callout ut-callout--danger">Falsches Passwort.</div>' if method == "POST" else "")
+                return self.reply(200 if method == "GET" else 403, LINK_PAGE % ("Link", html.escape(os.path.basename(v["path"]) or v["share"]), form),
+                                  "text/html; charset=utf-8")
+        try:
+            _b, full = resolve(v["owner"], v["share"], v["path"])     # the owner's rights still apply
+        except Fail:
+            return self.reply(410, LINK_PAGE % ("Link", "UntrashOS", "<p>Kein Zugriff mehr auf diese Datei.</p>"), "text/html; charset=utf-8")
+        if os.path.isfile(full):
+            return self.send_file(full)
+        if not os.path.isdir(full):
+            return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>Die Datei gibt es nicht mehr.</p>"), "text/html; charset=utf-8")
+        import zipfile
+        name = os.path.basename(full.rstrip("/")) or "download"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''%s.zip" % urllib.parse.quote(name))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.close_connection = True
+
+        class Out:            # unseekable sink: zipfile writes data descriptors
+            def __init__(s, w):
+                s.w, s.n = w, 0
+
+            def write(s, b):
+                s.w.write(b)
+                s.n += len(b)
+                return len(b)
+
+            def tell(s):
+                return s.n
+
+            def flush(s):
+                s.w.flush()
+        try:
+            with zipfile.ZipFile(Out(self.wfile), "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+                for d, dirs, files in os.walk(full):
+                    dirs[:] = [x for x in dirs if not x.startswith(".") and x not in (IMP.RECYCLE_FN,)]
+                    for f in files:
+                        fp = os.path.join(d, f)
+                        if os.path.islink(fp) or f.startswith("."):
+                            continue
+                        z.write(fp, os.path.join(name, os.path.relpath(fp, full)))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def stream_media(self, full, q):
+        """Remux for the player: video copied, sound to AAC unless the browser
+        plays it, fragmented MP4 piped as it is produced.  t = start second
+        (seeking restarts the stream), a = audio stream index (ffprobe)."""
+        t = max(0.0, float(q.get("t") or 0))
+        a = q.get("a", "")
+        amap = ["-map", "0:%d" % int(a)] if a.isdigit() else ["-map", "0:a:0?"]
+        cmd = [FFMPEG, "-nostdin", "-v", "error", "-ss", "%.3f" % t, "-i", full, "-map", "0:v:0?"] + amap + [
+            "-sn", "-dn", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                b = p.stdout.read(1 << 16)
+                if not b:
+                    break
+                self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            p.kill()
+            p.wait()
+
+    def send_file(self, full, inline=False):
+        """Download; inline (photo/music/video viewer) only for media types a
+        browser cannot run as a page, with Range for seeking in audio/video."""
+        size = os.path.getsize(full)
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        inline = inline and (ctype in INLINE_TYPES or ctype.startswith(("audio/", "video/")))
+        start, end = 0, size - 1
+        rng = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range") or "") if inline else None
+        if rng and (rng.group(1) or rng.group(2)):
+            if rng.group(1):
+                start = int(rng.group(1))
+                end = min(int(rng.group(2)), size - 1) if rng.group(2) else size - 1
+            else:
+                start = max(0, size - int(rng.group(2)))
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        self.send_response(206 if rng and (rng.group(1) or rng.group(2)) else 200)
+        self.send_header("Content-Type", ctype if inline else "application/octet-stream")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Content-Disposition", "%s; filename*=UTF-8''%s" % ("inline" if inline else "attachment",
+                                                                           urllib.parse.quote(os.path.basename(full))))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if inline:
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self'; media-src 'self'")
+            if start or end != size - 1:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(full, "rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                b = f.read(min(left, 1 << 20))
+                if not b:
+                    break
+                self.wfile.write(b)
+                left -= len(b)
+
+    def run(self, method):
+        try:
+            self.handle_any(method)
+        except Fail as e:
+            self.reply(e.code, {"error": str(e)})
+        except (OSError, sqlite3.Error, ValueError, KeyError) as e:
+            self.reply(500, {"error": "%s: %s" % (type(e).__name__, e)})
+        except Exception as e:  # noqa: BLE001 - any bug: answer and log, never drop the connection
+            # (an unanswered request shows up as "NetworkError" in the browser)
+            import traceback
+            sys.stderr.write("untrash-desk: %s %s failed:\n%s" % (method, self.path.split("?")[0], traceback.format_exc()))
+            sys.stderr.flush()
+            try:
+                self.reply(500, {"error": "Interner Fehler (%s: %s), Details im Systemprotokoll" % (type(e).__name__, e)})
+            except OSError:
+                pass
+
+    def do_GET(self):
+        self.run("GET")
+
+    def do_HEAD(self):
+        self.run("GET")
+
+    def do_POST(self):
+        self.run("POST")
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+HTTPS_STATE = {}
+INLINE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "application/pdf"}
+
+
+def main():
+    import ssl
+    bind = os.environ.get("ZT_DESK_BIND", "")
+    hs = settings_load()["services"]["https"]
+    crt, key = TLS_DIR + "/untrash.crt", TLS_DIR + "/untrash.key"
+    if hs.get("active") and os.path.isfile(crt) and os.path.isfile(key):
+        port = int(os.environ.get("ZT_DESK_TLS_PORT") or hs["port"])
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(crt, key)
+        srv = ThreadingHTTPServer((bind, port), Handler)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        srv.tls = True
+        HTTPS_STATE.update(port=port, force=bool(hs.get("force")))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print("untrash-desk https on port %d%s" % (port, ", http redirects" if hs.get("force") else ""), flush=True)
+    print("untrash-desk on port %d%s" % (PORT, " (TEST)" if TEST else ""), flush=True)
+    ThreadingHTTPServer((bind, PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+[Unit]
+Description=UntrashOS NAS542 system sound (%i)
+ConditionKernelCommandLine=!untrash.installer=1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/untrash/untrash-sound play %i

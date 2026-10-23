@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashOS: send the system log to a syslog server
+ConditionPathExists=/etc/untrash/syslog-forward.env
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-syslog-forward
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

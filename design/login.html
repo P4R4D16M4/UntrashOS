@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UntrashOS Anmeldung</title>
+<link rel="icon" href="assets/favicon.ico">
+<link rel="stylesheet" href="untrash.css">
+</head>
+<body class="ut">
+<main class="ut-login">
+  <form class="ut-login__card" onsubmit="event.preventDefault(); location.href='desk.html'">
+    <img class="ut-login__logo" src="assets/logo-mark-192.png" alt="">
+    <img class="ut-login__word" src="assets/wordmark-300.png" alt="UntrashOS">
+    <div class="ut-login__host">zyxel-untrash.local · NAS542</div>
+    <div class="ut-field"><label for="u">Benutzer</label><input class="ut-input" id="u" autocomplete="username" value="admin"></div>
+    <div class="ut-field"><label for="p">Passwort</label><input class="ut-input" id="p" type="password" autocomplete="current-password"></div>
+    <label class="ut-switch" style="margin:2px 0 18px;font-size:var(--ut-fs-sm);color:var(--ut-fg-2)"><input type="checkbox"><i></i>Angemeldet bleiben</label>
+    <button class="ut-btn ut-btn--primary ut-btn--lg" style="width:100%">Anmelden</button>
+    <div class="ut-login__foot">UntrashOS · Slot A · Debian 13 · Linux 6.6</div>
+  </form>
+</main>
+</body>
+</html>

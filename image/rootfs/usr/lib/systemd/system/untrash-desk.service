@@ -1,0 +1,12 @@
+[Unit]
+Description=UntrashOS: Untrash Desk (web interface, port 80)
+ConditionKernelCommandLine=!untrash.installer=1
+After=network.target untrash-settings.service untrash-zyxel.service untrash-data.service
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-desk
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

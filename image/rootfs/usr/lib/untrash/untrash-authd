@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""Password check service for unprivileged front ends (WebDAV).  Socket
+activated (untrash-authd.socket, Accept=yes, group www-data): reads
+"user\\0password\\0" from stdin, answers OK or NO (pylib/untrash_auth.py)."""
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "pylib"))
+import untrash_auth  # noqa: E402
+
+data = sys.stdin.buffer.read(8192).split(b"\0")
+user, pw = (data + [b"", b""])[:2]
+ok = bool(user) and untrash_auth.check(user.decode("utf-8", "replace"), pw.decode("utf-8", "replace"))
+sys.stdout.write("OK\n" if ok else "NO\n")
+sys.stdout.flush()

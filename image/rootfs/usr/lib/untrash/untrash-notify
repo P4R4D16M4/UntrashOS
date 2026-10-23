@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+"""untrash-notify - mail notifications (stock maintenance.log.mail).
+
+  untrash-notify test                  test mail to the alert and log recipients
+  untrash-notify alert SUBJECT [TEXT]  alert mail (if alerts are on)
+  untrash-notify report                journal since the last report -> log_to
+                                       (untrash-log-report.timer, stock schedule)
+  untrash-notify check                 volumes 95 % full -> alert, once a day
+                                       (untrash-notify-check.timer)
+  mdadm --monitor PROGRAM:  untrash-notify EVENT MD [COMPONENT]
+  smartd -M exec:           untrash-notify   (SMARTD_* environment)
+
+Settings: /etc/untrash/notify.json (untrash-config render: server, port 0 =
+587 STARTTLS / 465 TLS / 25, auth, username, password, from, alerts_to,
+log_to, subject, alerts, report_all, hostname).
+"""
+import datetime
+import glob
+import json
+import os
+import smtplib
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+
+CONF = os.environ.get("ZT_NOTIFY_CONF", "/etc/untrash/notify.json")
+STATE = os.environ.get("ZT_NOTIFY_STATE", "/var/lib/untrash/notify")
+VOLROOTS = os.environ.get("ZT_NOTIFY_VOLROOTS", "/i-data /e-data").split()
+FULL_PCT = 95
+MD_ALERT = {"Fail": "Platte in %s ausgefallen", "FailSpare": "Reserveplatte in %s ausgefallen",
+            "DegradedArray": "RAID %s beeinträchtigt", "SparesMissing": "RAID %s: Reserveplatte fehlt",
+            "DeviceDisappeared": "RAID %s verschwunden", "TestMessage": "Testnachricht für %s"}
+MD_INFO = {"RebuildStarted": "Wiederherstellung von %s begonnen", "RebuildFinished": "Wiederherstellung von %s beendet",
+           "SpareActive": "Reserveplatte in %s übernommen", "NewArray": "neues RAID %s"}
+
+
+def conf():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def send(c, to, subject, text):
+    """One mail; raises on failure (the caller logs it)."""
+    rcpt = [x.strip() for x in to.replace(";", ",").split(",") if x.strip()]
+    if not c.get("server") or not rcpt:
+        raise RuntimeError("kein Mailserver oder Empfänger eingestellt")
+    host = c.get("hostname") or socket.gethostname()
+    msg = EmailMessage()
+    msg["From"] = c.get("from") or "untrash@%s" % host
+    msg["To"] = ", ".join(rcpt)
+    msg["Subject"] = "%s%s" % ((c.get("subject") + " ") if c.get("subject") else "[%s] " % host, subject)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=host if "." in host else None)
+    msg.set_content("%s\n\n-- \nUntrashOS auf %s, %s\n" % (text, host, datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+    ports = [int(c["port"])] if int(c.get("port") or 0) else [587, 465, 25]
+    ctx = ssl.create_default_context()
+    last = None
+    for port in ports:
+        try:
+            if port == 465:
+                s = smtplib.SMTP_SSL(c["server"], port, timeout=30, context=ctx)
+            else:
+                s = smtplib.SMTP(c["server"], port, timeout=30)
+                s.ehlo()
+                if s.has_extn("starttls"):
+                    s.starttls(context=ctx)
+                    s.ehlo()
+            with s:
+                if c.get("auth") and c.get("username"):
+                    s.login(c["username"], c.get("password", ""))
+                s.send_message(msg)
+            return port
+        except (OSError, smtplib.SMTPException) as e:
+            last = e
+    raise RuntimeError("Versand an %s fehlgeschlagen: %s" % (c["server"], last))
+
+
+def alert(subject, text):
+    c = conf()
+    log("ALERT %s: %s" % (subject, text))
+    if not (c.get("active") and c.get("alerts") and c.get("alerts_to")):
+        return 0
+    try:
+        send(c, c["alerts_to"], subject, text)
+        log("mail sent to %s" % c["alerts_to"])
+        return 0
+    except RuntimeError as e:
+        log("MAIL FAILED %s" % e)
+        return 1
+
+
+def stamp(name, value=None):
+    os.makedirs(STATE, exist_ok=True)
+    p = os.path.join(STATE, name)
+    if value is None:
+        try:
+            return open(p).read().strip()
+        except OSError:
+            return ""
+    with open(p + ".tmp", "w") as f:
+        f.write(str(value))
+    os.replace(p + ".tmp", p)
+
+
+def cmd_report():
+    c = conf()
+    if not (c.get("active") and c.get("log_to")):
+        return 0
+    since = stamp("report.last") or str(int(time.time()) - 86400)
+    now = int(time.time())
+    cmd = ["journalctl", "--no-pager", "-o", "short-iso", "--since", "@" + since, "--until", "@%d" % now]
+    if not c.get("report_all"):
+        cmd += ["-p", "warning"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    lines = [l for l in r.stdout.splitlines() if not l.startswith("-- ")]
+    if len(lines) > 3000:
+        lines = ["(%d ältere Zeilen ausgelassen)" % (len(lines) - 3000)] + lines[-3000:]
+    try:
+        send(c, c["log_to"], "Protokoll", "\n".join(lines) or "Keine Einträge seit dem letzten Bericht.")
+        stamp("report.last", now)
+        log("report sent (%d lines)" % len(lines))
+        return 0
+    except RuntimeError as e:
+        log("MAIL FAILED %s" % e)
+        return 1
+
+
+def cmd_check():
+    today = datetime.date.today().isoformat()
+    rc = 0
+    for root in VOLROOTS:
+        for m in sorted(glob.glob(root + "/*")):
+            if os.path.islink(m) or not os.path.ismount(m):
+                continue
+            st = os.statvfs(m)
+            if not st.f_blocks:
+                continue
+            pct = 100 - 100 * st.f_bavail // st.f_blocks
+            key = "full." + m.strip("/").replace("/", "_")
+            if pct >= FULL_PCT and stamp(key) != today:
+                try:
+                    label = open(m + "/.system/name_label").read().strip()
+                except OSError:
+                    label = os.path.basename(m)
+                rc |= alert("Volume %s fast voll" % label, "%s ist zu %d %% belegt." % (m, pct))
+                stamp(key, today)
+    return rc
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["test"]:
+        c = conf()
+        rc = 0
+        for to in {c.get("alerts_to"), c.get("log_to")} - {None, ""}:
+            try:
+                port = send(c, to, "Testnachricht", "Die E-Mail-Benachrichtigung funktioniert.")
+                log("test mail sent to %s (port %d)" % (to, port))
+            except RuntimeError as e:
+                log("MAIL FAILED %s" % e)
+                rc = 1
+        return rc
+    if a[:1] == ["alert"] and len(a) >= 2:
+        return alert(a[1], " ".join(a[2:]) or a[1])
+    if a[:1] == ["report"]:
+        return cmd_report()
+    if a[:1] == ["check"]:
+        return cmd_check()
+    if len(a) >= 2 and (a[0] in MD_ALERT or a[0] in MD_INFO):
+        md = os.path.basename(a[1])
+        comp = " (%s)" % a[2] if len(a) > 2 else ""
+        if a[0] in MD_ALERT:
+            return alert(MD_ALERT[a[0]] % md, "mdadm meldet %s für %s%s." % (a[0], a[1], comp))
+        log("md %s %s%s" % (a[0], a[1], comp))
+        return 0
+    if not a and os.environ.get("SMARTD_MESSAGE"):
+        e = os.environ
+        return alert("SMART-Warnung %s" % e.get("SMARTD_DEVICE", "?"),
+                     "%s\n\nGerät: %s (%s)\nArt: %s\nErstmals: %s" % (
+                         e.get("SMARTD_FULLMESSAGE") or e["SMARTD_MESSAGE"], e.get("SMARTD_DEVICE", "?"),
+                         e.get("SMARTD_DEVICEINFO", ""), e.get("SMARTD_FAILTYPE", ""), e.get("SMARTD_TFIRST", "")))
+    if len(a) >= 2 and a[0][:1].isupper():
+        log("md %s" % " ".join(a))         # other mdadm events: journal only
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

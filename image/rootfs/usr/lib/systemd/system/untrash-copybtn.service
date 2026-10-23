@@ -1,0 +1,12 @@
+[Unit]
+Description=UntrashOS: COPY/SYNC button (stock USB copy and sync)
+ConditionKernelCommandLine=!untrash.installer=1
+After=untrash-zyxel.service untrash-data.service
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-copybtn
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

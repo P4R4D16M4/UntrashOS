@@ -1,0 +1,10 @@
+# UntrashOS NAS542 platform services, started when their device appears.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="untrash-fan.service"
+SUBSYSTEM=="rtc", KERNEL=="rtc0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="untrash-rtc.service"
+# USB volumes like stock (/e-data/<id>); never the UntrashOS stick itself
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd*", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", ENV{ID_FS_LABEL}!="UNTRASHPK", TAG+="systemd", ENV{SYSTEMD_WANTS}+="untrash-usb@%k.service"
+# APC UPS on USB (vendor 051d): start apcupsd like the stock hotplug script;
+# apcupsd.service.d/untrash.conf only lets it run if the UPS setting is on
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="051d", TAG+="systemd", ENV{SYSTEMD_WANTS}+="apcupsd.service"
+# USB printers (usblp, /dev/usb/lpN): CUPS raw queue like the stock hotplug
+ACTION=="add", SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="untrash-printer@%k.service"

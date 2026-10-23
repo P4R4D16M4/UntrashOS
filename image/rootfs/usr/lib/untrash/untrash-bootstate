@@ -1,0 +1,65 @@
+#!/bin/sh
+# UntrashOS boot state (same format as os/loader/zt-loader, GPT partition
+# ut-bootstate, first 512 bytes): "ZTBS1 pref= a= b= good= booting=".
+# Slot file boot: the file /.untrash/bootstate on the container.
+#   untrash-bootstate [show]     print the state
+#   untrash-bootstate mark-good  confirm the running slot (tries back to 3)
+#   untrash-bootstate prefer a|b after an update: start that slot next (3
+#                                tries; the loader falls back if it never
+#                                confirms itself)
+set -e
+ACTION=${1:-show}
+ARG=${2:-}	# keep it: "set -- $STATE" below replaces the positional parameters
+BS=/dev/disk/by-partlabel/ut-bootstate
+ZT_BOOT=partition
+[ -f /run/untrash/boot.env ] && . /run/untrash/boot.env
+if [ "$ZT_BOOT" = file ] && [ "$ZT_SLOT" = stick ]; then
+	echo "started from the installer stick: no boot state"; exit 0
+elif [ "$ZT_BOOT" = file ]; then
+	BS=$ZT_HOST/.untrash/bootstate
+	[ "$ZT_HOST_RW" = 1 ] && [ -f "$BS" ] || { echo "no boot state for slot '$ZT_SLOT' (file boot)" >&2; exit 1; }
+else
+	[ -b "$BS" ] || { echo "no ut-bootstate partition" >&2; exit 1; }
+fi
+pref=a; ta=3; tb=3; good=-; booting=-
+STATE=$(dd if="$BS" bs=512 count=1 status=none | tr -d '\000' | head -1)
+set -- $STATE
+if [ "$1" = ZTBS1 ]; then
+	shift
+	for kv in "$@"; do
+		case $kv in
+		pref=a|pref=b) pref=${kv#pref=} ;;
+		a=[0-9]) ta=${kv#a=} ;;
+		b=[0-9]) tb=${kv#b=} ;;
+		good=*) good=${kv#good=} ;;
+		booting=*) booting=${kv#booting=} ;;
+		esac
+	done
+fi
+case "$ACTION" in
+mark-good)
+	stage=$(tr -d '\000' </proc/device-tree/chosen/untrash,stage 2>/dev/null || true)
+	[ "$stage" = system ] || { echo "not started by the loader" >&2; exit 1; }
+	case $booting in
+	a) ta=3 ;;
+	b) tb=3 ;;
+	*) echo "unknown booting slot '$booting'" >&2; exit 1 ;;
+	esac
+	pref=$booting; good=$booting
+	line="ZTBS1 pref=$pref a=$ta b=$tb good=$good booting=$booting"
+	{ printf '%s\n' "$line"; head -c $((511 - ${#line})) /dev/zero; } |
+		dd of="$BS" bs=512 count=1 conv=notrunc,fsync status=none
+	echo "UNTRASH: boot state $line" >/dev/kmsg
+	echo "$line" ;;
+prefer)
+	case $ARG in a) ta=3 ;; b) tb=3 ;; *) echo "usage: untrash-bootstate prefer a|b" >&2; exit 2 ;; esac
+	pref=$ARG
+	line="ZTBS1 pref=$pref a=$ta b=$tb good=$good booting=$booting"
+	{ printf '%s\n' "$line"; head -c $((511 - ${#line})) /dev/zero; } |
+		dd of="$BS" bs=512 count=1 conv=notrunc,fsync status=none
+	echo "$line" ;;
+show)
+	echo "pref=$pref a=$ta b=$tb good=$good booting=$booting" ;;
+*)
+	echo "usage: untrash-bootstate [show|mark-good|prefer a|b]" >&2; exit 2 ;;
+esac

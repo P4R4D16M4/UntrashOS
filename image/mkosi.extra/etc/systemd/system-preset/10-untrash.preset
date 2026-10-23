@@ -1,0 +1,5 @@
+enable systemd-networkd.service
+enable ssh.service
+enable chrony.service
+enable untrash-sound.service
+enable systemd-resolved.service

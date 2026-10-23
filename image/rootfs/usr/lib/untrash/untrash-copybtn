@@ -1,0 +1,234 @@
+#!/usr/bin/python3
+"""untrash-copybtn - the COPY/SYNC button like the stock firmware
+(copy_sync_btn_main_model, usbzync.sh, /etc/zyxel/storage/usbcopy.table and
+usbzync.table).
+
+  untrash-copybtn             daemon: KEY_PROG1 released before 3 s = COPY,
+                              held 3 s = SYNC (the COPY LED blinks while it runs,
+                              red on error)
+  untrash-copybtn copy|sync   the same once (Untrash Desk "Jetzt ausführen")
+  untrash-copybtn status      JSON of the last run
+
+USB source: the partitions of the USB disk mounted last under /e-data; if one
+of them carries .ZyXELchooseCopy.txt / .ZyXELchooseSync.txt (stock "choose
+this volume"), only those.
+COPY  cp2Vol: USB -> <share>/<YYYYMMDDhhmmss>/Extvolume<N> (new folder, stock
+      default) or straight into <share>; cp2USB: <share> -> USB (dated folder).
+      Nothing is deleted; with a backup folder, overwritten files go there.
+SYNC  sync2USB / sync2Vol: mirror (deletions included, replaced and deleted
+      files to the backup folder if set); twoWay: rclone bisync.
+Settings: /etc/untrash/settings.json "copybtn" (untrash-config).
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+import time
+
+SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
+EDATA = os.environ.get("ZT_COPYBTN_EDATA", "/e-data")
+STATUS = os.environ.get("ZT_COPYBTN_STATUS", "/run/untrash/copybtn.json")
+LEDS = os.environ.get("ZT_COPYBTN_LEDS", "/sys/class/leds")
+MOUNTS = os.environ.get("ZT_COPYBTN_MOUNTS", "/proc/mounts")
+NOTIFY = os.environ.get("ZT_NOTIFY_TOOL", "/usr/lib/untrash/untrash-notify")
+WORK = os.environ.get("ZT_COPYBTN_WORK", "/var/lib/untrash/copybtn-bisync")
+KEY_PROG1 = 148
+KEY_RESTART = 408               # RESET button (stock: 2 s network/password, 7 s factory defaults)
+CFGTOOL = os.environ.get("ZT_CONFIG_TOOL", "/usr/sbin/untrash-config")
+HOLD_S = 3.0
+FLAGS = {"copy": ".ZyXELchooseCopy.txt", "sync": ".ZyXELchooseSync.txt"}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def led(color, mode, which="copy"):
+    """copy-/sys- green / red: on, off or blink (timer trigger)."""
+    p = os.path.join(LEDS, "%s-%s" % (which, color))
+    try:
+        if mode == "blink":
+            open(p + "/trigger", "w").write("timer")
+        else:
+            open(p + "/trigger", "w").write("none")
+            open(p + "/brightness", "w").write("1" if mode == "on" else "0")
+    except OSError:
+        pass
+
+
+def conf():
+    try:
+        return (json.load(open(SETTINGS)).get("copybtn") or {})
+    except (OSError, ValueError):
+        return {}
+
+
+def usb_sources(kind):
+    """Mount points of the last USB disk's partitions (stock get_last_usb_info)."""
+    mounts = []
+    for line in open(MOUNTS):
+        p = line.split()
+        if len(p) > 1 and p[1].startswith(EDATA + "/"):
+            mounts.append((p[0], p[1].replace("\\040", " ")))
+    if not mounts:
+        return []
+    disk = re.sub(r"p?\d+$", "", mounts[-1][0])
+    parts = [(dev, m) for dev, m in mounts if re.sub(r"p?\d+$", "", dev) == disk]
+    chosen = [(dev, m) for dev, m in parts if os.path.exists(os.path.join(m, FLAGS[kind]))]
+    return chosen or parts
+
+
+def partnum(dev):
+    m = re.search(r"(\d+)$", dev)
+    return int(m.group(1)) if m else 1
+
+
+def rsync(src, dst, delete, bak):
+    cmd = ["rsync", "-rlt", "--no-perms", "--chmod=ugo=rwX", "--exclude", ".ZyXELchoose*.txt"]
+    if delete:
+        cmd.append("--delete")
+    if bak:
+        # own prefix: rsync protects a destination entry named like the backup dir
+        cmd += ["--backup", "--backup-dir", os.path.join(bak, datetime.datetime.now().strftime("backup-%Y%m%d%H%M%S"))]
+    os.makedirs(dst, exist_ok=True)
+    log("$ " + " ".join(cmd + [src.rstrip("/") + "/", dst.rstrip("/") + "/"]))
+    r = subprocess.run(cmd + [src.rstrip("/") + "/", dst.rstrip("/") + "/"], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if r.stdout.strip():
+        log(r.stdout.strip()[-2000:])
+    return r.returncode
+
+
+def run(kind):
+    c = conf().get(kind) or {}
+    share = c.get("share_path") or ""
+    started = time.time()
+    res = {"kind": kind, "time": int(started), "ok": False, "log": []}
+    srcs = usb_sources(kind)
+    if not share or not os.path.isdir(share):
+        res["log"].append("Keine NAS-Freigabe für %s eingestellt (Desk: Einstellungen → COPY-Taste)." % kind.upper())
+    elif not srcs:
+        res["log"].append("Kein USB-Datenträger eingehängt.")
+    elif c.get("bak_path") and not os.path.isdir(c["bak_path"]):
+        res["log"].append("Sicherungsordner %s fehlt." % c["bak_path"])
+    else:
+        os.umask(0)
+        led("red", "off")
+        led("green", "blink")
+        stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        rc = 0
+        for dev, m in srcs:
+            if kind == "copy":
+                d = c.get("direction", "cp2Vol")
+                newdir = c.get("newdir", True) and not c.get("bak_path")
+                if d == "cp2USB":
+                    rc |= rsync(share, os.path.join(m, stamp) if newdir else m, False, c.get("bak_path"))
+                else:
+                    rc |= rsync(m, os.path.join(share, stamp, "Extvolume%d" % partnum(dev)) if newdir else share,
+                                False, c.get("bak_path"))
+            else:
+                d = c.get("direction", "twoWay")
+                if d == "sync2USB":
+                    rc |= rsync(share, m, True, c.get("bak_path"))
+                elif d == "sync2Vol":
+                    rc |= rsync(m, share, True, c.get("bak_path"))
+                else:
+                    work = WORK
+                    first = not os.path.exists(os.path.join(work, re.sub(r"\W", "_", m + share)))
+                    cmd = ["rclone", "bisync", m, share, "--workdir", work,   # 1.60: no --create-empty-src-dirs
+                           "--exclude", ".ZyXELchoose*.txt"] + (["--resync"] if first else [])
+                    log("$ " + " ".join(cmd))
+                    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    log(r.stdout.strip()[-2000:])
+                    if r.returncode == 0:
+                        os.makedirs(work, exist_ok=True)
+                        open(os.path.join(work, re.sub(r"\W", "_", m + share)), "w").close()
+                    rc |= r.returncode
+        res["ok"] = rc == 0
+        res["log"].append("%s %s: %s" % (kind.upper(), ", ".join(m for _d, m in srcs), "fertig" if rc == 0 else "Fehler %d" % rc))
+    res["seconds"] = int(time.time() - started)
+    for line in res["log"]:
+        log(line)
+    led("green", "on" if res["ok"] else "off")
+    led("red", "off" if res["ok"] else "on")
+    os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+    json.dump(res, open(STATUS, "w"))
+    if not res["ok"]:
+        subprocess.run([NOTIFY, "alert", "COPY-Taste: %s fehlgeschlagen" % kind.upper(),
+                        "\n".join(res["log"])], check=False)
+    return 0 if res["ok"] else 1
+
+
+def daemon():
+    fmt = "llHHi"
+    size = struct.calcsize(fmt)
+    devs = []
+    for ev in sorted(glob.glob("/dev/input/event*")):
+        try:
+            devs.append(open(ev, "rb", buffering=0))
+        except OSError:
+            pass
+    log("untrash-copybtn: watching %d input devices" % len(devs))
+    down = rdown = None
+    while True:
+        r, _, _ = select.select(devs, [], [], 0.25)
+        if down and time.time() - down >= HOLD_S:
+            led("green", "blink")             # stock: second beep = sync
+        if rdown:                             # no buzzer: the system LED shows the stage
+            held = time.time() - rdown
+            if held >= 7:
+                led("red", "blink", "sys")
+            elif held >= 2:
+                led("green", "blink", "sys")
+        for f in r:
+            data = f.read(size * 64)
+            for i in range(0, len(data) - size + 1, size):
+                _s, _u, typ, code, val = struct.unpack(fmt, data[i:i + size])
+                if typ == 1 and code == KEY_RESTART:
+                    if val == 1:
+                        rdown = time.time()
+                    elif val == 0 and rdown:
+                        held, rdown = time.time() - rdown, None
+                        led("red", "off", "sys")
+                        led("green", "on", "sys")
+                        if held >= 7:
+                            log("RESET held %.0f s: factory defaults" % held)
+                            subprocess.run([CFGTOOL, "factory-reset"], check=False)
+                        elif held >= 2:
+                            log("RESET held %.0f s: network + admin password" % held)
+                            subprocess.run([CFGTOOL, "reset-network"], check=False)
+                    continue
+                if typ != 1 or code != KEY_PROG1:
+                    continue
+                if val == 1:
+                    down = time.time()
+                    led("green", "on")
+                elif val == 0 and down:
+                    held, down = time.time() - down, None
+                    run("sync" if held >= HOLD_S else "copy")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        daemon()
+        return 0
+    if a[0] in ("copy", "sync"):
+        return run(a[0])
+    if a[0] == "status":
+        try:
+            print(open(STATUS).read())
+        except OSError:
+            print("{}")
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

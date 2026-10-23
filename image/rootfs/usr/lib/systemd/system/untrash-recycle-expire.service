@@ -1,0 +1,9 @@
+[Unit]
+Description=UntrashOS: empty old files from the share recycle bins (stock rbm_expire_day)
+ConditionPathExists=/etc/untrash/recycle.env
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/lib/untrash/untrash-recycle-expire

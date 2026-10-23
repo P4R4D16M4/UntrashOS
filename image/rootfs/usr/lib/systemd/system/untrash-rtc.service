@@ -1,0 +1,10 @@
+[Unit]
+Description=UntrashOS: system clock from the RTC (UTC)
+# started by 60-untrash.rules when rtc0 appears; chrony (rtcsync) writes it back
+DefaultDependencies=no
+Before=time-set.target sysinit.target
+Wants=time-set.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/untrash/untrash-rtc

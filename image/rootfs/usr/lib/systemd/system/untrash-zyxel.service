@@ -1,0 +1,19 @@
+[Unit]
+Description=UntrashOS: stock Zyxel volumes and shares (after takeover)
+ConditionPathExists=/etc/untrash/zyxel/takeover.json
+After=local-fs.target systemd-udev-settle.service
+Before=smbd.service nmbd.service
+Wants=smbd.service nmbd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/untrash-import-zyxel volumes --mount --rw
+ExecStart=/usr/sbin/untrash-import-zyxel render /etc/untrash/zyxel/stock-config --out /etc/samba/smb.conf
+# system files that depend on mounted volumes (DLNA media folders): render
+# again now and let the media server pick them up
+ExecStartPost=-/usr/sbin/untrash-config render
+ExecStartPost=-/usr/bin/systemctl try-restart --no-block minidlna.service
+
+[Install]
+WantedBy=multi-user.target

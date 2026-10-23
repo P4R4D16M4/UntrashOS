@@ -1,0 +1,11 @@
+[Unit]
+Description=UntrashOS: confirm the running slot to the loader once its network works
+ConditionPathExists=/proc/device-tree/chosen/untrash,stage
+After=multi-user.target
+
+[Service]
+Type=oneshot
+# waits up to 10 minutes for a working network (untrash-boot-health)
+TimeoutStartSec=15min
+ExecStart=/usr/lib/untrash/untrash-boot-health
+ExecStartPost=/usr/lib/untrash/untrash-sound --optional play success

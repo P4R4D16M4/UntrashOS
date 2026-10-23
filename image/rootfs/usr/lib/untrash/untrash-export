@@ -1,0 +1,209 @@
+#!/usr/bin/python3
+"""untrash-export - copy or convert files for another device (Desk "Export").
+
+  untrash-export run JOB.json     one job; progress as JSON lines on stdout
+  untrash-export plan JOB.json    print the ffmpeg commands only (tests)
+
+JOB = {"sources": [absolute paths], "target": absolute dir,
+       "mode": "copy" | "convert",
+       "video": {"height": 0|1080|720|480|360, "quality": 23, "size_mb": 0, "keep": false},
+       "audio": {"codec": "aac"|"mp3"|"opus"|"copy", "kbps": 160, "stereo": true,
+                 "tracks": null (all) | [stream index, ...]},
+       "subs": true, "container": "mp4"|"mkv",
+       "music": {"codec": "mp3"|"aac"|"opus"|"flac"|"copy", "kbps": 192}}
+
+Video is H.264 (libx264, preset veryfast: the NAS has no hardware encoder);
+size_mb picks the video bitrate so the file ends near that size.  Folders are
+exported recursively with their structure; other files are copied as they are.
+Progress: {"file", "files_done", "files_total", "percent", "eta_s"}; the last
+line is {"done": true, "errors": [...]}.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+FFMPEG = os.environ.get("ZT_FFMPEG", "ffmpeg")
+FFPROBE = os.environ.get("ZT_FFPROBE", "ffprobe")
+VIDEO = {".mp4", ".m4v", ".mkv", ".avi", ".mov", ".webm", ".ts", ".mts", ".m2ts", ".wmv", ".flv", ".mpg", ".mpeg",
+         ".vob", ".3gp", ".ogv"}
+AUDIO = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".ac3", ".dts", ".mka", ".alac"}
+ACODEC = {"aac": ("aac", ".m4a"), "mp3": ("libmp3lame", ".mp3"), "opus": ("libopus", ".opus"), "flac": ("flac", ".flac")}
+
+
+def out(**k):
+    print(json.dumps(k), flush=True)
+
+
+def probe(path):
+    try:
+        j = json.loads(subprocess.run([FFPROBE, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path],
+                                      stdout=subprocess.PIPE, text=True, timeout=60).stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        j = {}
+    return float((j.get("format") or {}).get("duration") or 0), j.get("streams", [])
+
+
+def files_of(sources):
+    """(source file, path relative to the export root)."""
+    for s in sources:
+        s = s.rstrip("/")
+        if os.path.isfile(s):
+            yield s, os.path.basename(s)
+        elif os.path.isdir(s):
+            base = os.path.dirname(s)
+            for d, dirs, files in os.walk(s):
+                dirs[:] = sorted(x for x in dirs if not x.startswith(".") and x != "@Recycle")
+                for f in sorted(files):
+                    if not f.startswith("."):
+                        p = os.path.join(d, f)
+                        if not os.path.islink(p):
+                            yield p, os.path.relpath(p, base)
+
+
+def video_cmd(src, dst, job, dur, streams):
+    v, a = job.get("video") or {}, job.get("audio") or {}
+    vids = [s for s in streams if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")]
+    auds = [s for s in streams if s.get("codec_type") == "audio"]
+    subs = [s for s in streams if s.get("codec_type") == "subtitle"]
+    mp4 = job.get("container", "mp4") == "mp4"
+    cmd = [FFMPEG, "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", src, "-map_metadata", "0"]
+    if vids:
+        cmd += ["-map", "0:%d" % vids[0]["index"]]
+    tracks = a.get("tracks")
+    for s in auds:
+        if tracks is None or s["index"] in tracks:
+            cmd += ["-map", "0:%d" % s["index"]]
+    n_audio = sum(1 for s in auds if tracks is None or s["index"] in tracks)
+    if job.get("subs", True):
+        for s in subs:
+            # MP4 only holds text subtitles; picture subtitles (DVD/Blu-ray) need MKV
+            if not mp4 or s.get("codec_name") in ("subrip", "ass", "ssa", "mov_text", "webvtt", "text"):
+                cmd += ["-map", "0:%d" % s["index"]]
+    h = int(v.get("height") or 0)
+    src_h = int(vids[0].get("height") or 0) if vids else 0
+    keep = v.get("keep") and vids and vids[0].get("codec_name") == "h264" and not (h and src_h > h) and not v.get("size_mb")
+    if not vids:
+        pass
+    elif keep:
+        cmd += ["-c:v", "copy"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", os.environ.get("ZT_X264_PRESET", "veryfast"), "-pix_fmt", "yuv420p",
+                "-profile:v", "high"]
+        if h and src_h > h:
+            cmd += ["-vf", "scale=-2:%d" % h]
+        size = float(v.get("size_mb") or 0)
+        akbps = int(a.get("kbps") or 160) if a.get("codec", "aac") != "copy" else 192
+        if size and dur > 0:
+            vk = max(150, int(size * 8192 / dur - akbps * max(n_audio, 1) - 30))   # 30 kbit/s container overhead
+            cmd += ["-b:v", "%dk" % vk, "-maxrate", "%dk" % int(vk * 1.5), "-bufsize", "%dk" % (vk * 2)]
+        else:
+            cmd += ["-crf", str(int(v.get("quality") or 23))]
+    codec = a.get("codec", "aac")
+    if codec == "copy":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", ACODEC.get(codec, ACODEC["aac"])[0], "-b:a", "%dk" % int(a.get("kbps") or 160)]
+        if a.get("stereo", True):
+            cmd += ["-ac", "2"]
+    if job.get("subs", True) and subs:
+        cmd += ["-c:s", "mov_text" if mp4 else "copy"]
+    if mp4:
+        cmd += ["-movflags", "+faststart"]
+    return cmd + ["-progress", "pipe:1", "-nostats", dst]
+
+
+def audio_cmd(src, dst, job):
+    m = job.get("music") or {}
+    codec = m.get("codec", "mp3")
+    cmd = [FFMPEG, "-nostdin", "-hide_banner", "-v", "error", "-y", "-i", src, "-map", "0:a:0", "-map_metadata", "0"]
+    if codec == "copy":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", ACODEC[codec][0]] + ([] if codec == "flac" else ["-b:a", "%dk" % int(m.get("kbps") or 192)])
+    return cmd + ["-progress", "pipe:1", "-nostats", dst]
+
+
+def target_of(rel, job, kind):
+    base, ext = os.path.splitext(rel)
+    if job.get("mode") != "convert" or kind == "other":
+        return rel
+    if kind == "video":
+        return base + (".mkv" if job.get("container") == "mkv" else ".mp4")
+    codec = (job.get("music") or {}).get("codec", "mp3")
+    return rel if codec == "copy" else base + ACODEC[codec][1]
+
+
+def main(argv):
+    if len(argv) != 2 or argv[0] not in ("run", "plan"):
+        sys.stderr.write(__doc__)
+        return 2
+    job = json.load(open(argv[1]))
+    files = list(files_of(job["sources"]))
+    items = []
+    for src, rel in files:
+        ext = os.path.splitext(src)[1].lower()
+        kind = "video" if ext in VIDEO else "audio" if ext in AUDIO else "other"
+        dur = probe(src)[0] if job.get("mode") == "convert" and kind != "other" else 0
+        items.append((src, rel, kind, dur))
+    total = sum(d for *_x, d in items) or 1
+    copy_bytes = sum(os.path.getsize(s) for s, _r, k, _d in items if job.get("mode") != "convert" or k == "other") or 1
+    errors, done_t, done_b, t0 = [], 0.0, 0, time.time()
+    for i, (src, rel, kind, dur) in enumerate(items):
+        dst = os.path.join(job["target"], target_of(rel, job, kind))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if job.get("mode") == "convert" and kind != "other":
+            streams = probe(src)[1]
+            cmd = video_cmd(src, dst + ".part", job, dur, streams) if kind == "video" else audio_cmd(src, dst + ".part", job)
+            cmd.insert(cmd.index(dst + ".part"), "-f")
+            cmd.insert(cmd.index(dst + ".part"), "mp4" if dst.endswith((".mp4", ".m4a")) else "matroska" if dst.endswith(".mkv")
+                       else {".mp3": "mp3", ".opus": "opus", ".flac": "flac"}.get(os.path.splitext(dst)[1], "matroska"))
+            if argv[0] == "plan":
+                print(" ".join(cmd))
+                continue
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for line in p.stdout:
+                if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                    try:
+                        t = int(line.split("=")[1]) / 1e6
+                    except ValueError:
+                        continue
+                    frac = (done_t + min(t, dur)) / total
+                    el = time.time() - t0
+                    out(file=rel, files_done=i, files_total=len(items), percent=round(100 * frac, 1),
+                        eta_s=int(el / frac - el) if frac > 0.01 else None)
+            err = p.stderr.read().strip()
+            if p.wait() == 0:
+                os.replace(dst + ".part", dst)
+            else:
+                errors.append("%s: %s" % (rel, err.splitlines()[-1] if err else "ffmpeg %d" % p.returncode))
+                try:
+                    os.unlink(dst + ".part")
+                except OSError:
+                    pass
+            done_t += dur
+        else:
+            if argv[0] == "plan":
+                print("copy %s %s" % (src, dst))
+                continue
+            try:
+                shutil.copy2(src, dst + ".part")
+                os.replace(dst + ".part", dst)
+            except OSError as e:
+                errors.append("%s: %s" % (rel, e.strerror))
+            done_b += os.path.getsize(src)
+            if job.get("mode") != "convert":
+                el = time.time() - t0
+                frac = done_b / copy_bytes
+                out(file=rel, files_done=i + 1, files_total=len(items), percent=round(100 * frac, 1),
+                    eta_s=int(el / frac - el) if frac > 0.01 else None)
+    if argv[0] == "run":
+        os.sync()
+        out(done=True, files_total=len(items), errors=errors)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

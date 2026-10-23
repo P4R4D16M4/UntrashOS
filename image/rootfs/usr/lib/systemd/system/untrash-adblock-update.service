@@ -1,0 +1,10 @@
+[Unit]
+Description=UntrashOS: ad filter, update the block lists
+ConditionPathExists=/var/lib/untrash/adblock/enabled
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/lib/untrash/untrash-adblock update

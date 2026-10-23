@@ -1,0 +1,805 @@
+#!/usr/bin/python3
+"""untrash-import-zyxel - take over a stock Zyxel NAS542 installation.
+
+Format reference: docs/architecture/stock-takeover.md (decompiled stock
+web_framework models of firmware 5.21(ABAG.15)).
+
+  config-from-nand DEST     copy stock /etc/zyxel out of NAND "config"
+                            (UBI attached read-only, UBIFS mounted ro)
+  volumes [--mount] [--rw]  find stock data arrays; --mount assembles them
+                            read-only and mounts the volumes under /i-data
+                            (ro,noload); --rw only after a takeover (apply)
+  release                   unmount stock volumes, stop their VGs/arrays
+  plan CONFIG               users, groups, shares and their paths
+  render CONFIG [--out F]   smb.conf with the stock share/permission rules
+  apply CONFIG --yes-take-over
+                            create users/groups with the stock UIDs/GIDs,
+                            import the SMB password hashes, write smb.conf,
+                            remember the takeover (volumes then mount rw)
+  access CONFIG USER        JSON {share: {"path", "access": rw|ro|deny}} of
+                            USER, as Samba decides it from the stock rules
+                            (FTP view, Untrash Desk)
+
+render takes the NetBIOS name/description/workgroup and the Time Machine
+share from /etc/untrash/smb-extra.json (untrash-config) when it exists.
+
+Nothing here writes to a foreign volume unless the operator ran apply.
+Slot file boot (installer ways B/C, docs/architecture/installer-plan.md): the
+volume holding /.untrash is already mounted rw at /run/untrash/host by the
+slot initrd; it is bind-mounted to its /i-data path and its LV/array are
+never deactivated or stopped here.
+CONFIG is a directory holding a copy of stock /etc/zyxel (ugs_conf.db,
+py_conf, storage/...), as produced by config-from-nand.
+"""
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+STATE_DIR = "/etc/untrash/zyxel"           # persistent (/etc overlay)
+STATE_CONFIG = STATE_DIR + "/stock-config"  # copy of the imported /etc/zyxel
+STATE_FILE = STATE_DIR + "/takeover.json"
+INTERN_ROOT = os.environ.get("ZT_IMPORT_IDATA", "/i-data")   # tests: elsewhere
+EXTERN_ROOT = os.environ.get("ZT_IMPORT_EDATA", "/e-data")
+SMBCONF = "/etc/samba/smb.conf"
+SMB_EXTRA = os.environ.get("ZT_SMB_EXTRA", "/etc/untrash/smb-extra.json")   # untrash-config
+
+# storage_def / ugs_comm_def
+FW_PART_SECTORS = 3997696      # p1 (md0, firmware), 512-byte sectors
+SWAP_PART_SECTORS = 3999744    # p2 (md1, swap)
+DEFAULT_GID = 500              # group "everyone"
+GUEST = "pc-guest"
+RECYCLE_FN = ".THIS_IS_RECYCLE_BIN"
+RECYCLE_RBM_FN = ".RBM"
+VG_INFO_AREA = "vg_info_area"
+ACCESS_RW, ACCESS_RO, ACCESS_DENY = "rw", "ro", "deny"
+# smb_user.passwd "LM:NT"; LM "X"*32 = no LM hash (smbpasswd convention; the
+# installer's way C writes only the NT hash)
+SMB_HASH = r"(?:[0-9A-Fa-f]{32}|X{32}):[0-9A-Fa-f]{32}"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def die(msg):
+    print("untrash-import-zyxel: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, check=True, **kw):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, **kw)
+    if check and r.returncode != 0:
+        die("%s failed (%d): %s" % (" ".join(cmd), r.returncode, r.stdout.strip()))
+    return r
+
+
+def is_mountpoint(path):
+    return run(["mountpoint", "-q", path], check=False).returncode == 0
+
+
+HOST_MNT = "/run/untrash/host"
+
+
+def devnum(dev):
+    try:
+        return os.stat(dev).st_rdev
+    except OSError:
+        return None
+
+
+def host_devnum():
+    """Block device of the slot-file container (slot file boot), else None."""
+    try:
+        with open("/run/untrash/boot.env") as f:
+            env = dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
+    except OSError:
+        return None
+    if env.get("ZT_BOOT") != "file" or not is_mountpoint(HOST_MNT):
+        return None
+    return devnum(env.get("ZT_HOST_DEV", ""))
+
+
+def holds_host(dev):
+    """True if dev is the container device or an array/LV below it."""
+    h = host_devnum()
+    if h is None:
+        return False
+    if devnum(dev) == h:
+        return True
+    name = os.path.basename(os.path.realpath(dev))
+    hname = os.path.basename(os.path.realpath("/sys/dev/block/%d:%d" % (os.major(h), os.minor(h))))
+    return os.path.exists("/sys/class/block/%s/slaves/%s" % (hname, name))
+
+
+# ---------------------------------------------------------------- NAND config
+
+def mtd_by_name(name):
+    with open("/proc/mtd") as f:
+        for line in f:
+            m = re.match(r'mtd(\d+): \S+ \S+ "(.*)"', line)
+            if m and m.group(2) == name:
+                return int(m.group(1))
+    return None
+
+
+def cmd_config_from_nand(args):
+    dest = args[0] if args else die("usage: config-from-nand DEST")
+    mtd = mtd_by_name("config")
+    if mtd is None:
+        die('no NAND partition "config" (kernel without the NAND config partition?)')
+    with open("/sys/class/mtd/mtd%d/flags" % mtd) as f:
+        flags = int(f.read(), 0)
+    if flags & 0x400:  # MTD_WRITEABLE
+        die("mtd%d is writable - refusing (the stock config must stay untouched)" % mtd)
+    before = set(os.listdir("/sys/class/ubi")) if os.path.isdir("/sys/class/ubi") else set()
+    run(["ubiattach", "-m", str(mtd), "-O", "2048"])
+    ubi = sorted(set(os.listdir("/sys/class/ubi")) - before - {"version", "ubi_ctrl"})
+    ubi = [u for u in ubi if re.fullmatch(r"ubi\d+", u)]
+    if len(ubi) != 1:
+        die("could not identify the new UBI device: %s" % ubi)
+    ubi = ubi[0]
+    mnt = tempfile.mkdtemp(prefix="zyxel-config.")
+    try:
+        run(["mount", "-t", "ubifs", "-o", "ro", "%s:ubi_config" % ubi, mnt])
+        try:
+            if os.path.exists(dest):
+                die("%s already exists" % dest)
+            shutil.copytree(mnt, dest, symlinks=True)
+        finally:
+            run(["umount", mnt], check=False)
+    finally:
+        os.rmdir(mnt)
+        run(["ubidetach", "-m", str(mtd)], check=False)
+    os.chmod(dest, 0o700)
+    log("CONFIG %s (from mtd%d via %s, read-only)" % (dest, mtd, ubi))
+
+
+# -------------------------------------------------------------------- volumes
+
+def examine(dev):
+    r = run(["mdadm", "--examine", "--export", dev], check=False)
+    if r.returncode != 0:
+        return None
+    return dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+
+
+def blkid(dev):
+    r = run(["blkid", "-p", "-o", "export", dev], check=False)
+    return dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+
+
+def part_sectors(dev):
+    name = os.path.basename(dev)
+    with open("/sys/class/block/%s/size" % name) as f:
+        return int(f.read())
+
+
+def find_arrays():
+    """Group stock md members by array UUID; classify fw/swap/data."""
+    arrays = {}
+    # ZT_IMPORT_DEVGLOB: tests use loop partitions (/dev/loop*p*)
+    for dev in sorted(glob.glob(os.environ.get("ZT_IMPORT_DEVGLOB", "/dev/sd[a-z]*[0-9]"))):
+        info = examine(dev)
+        if not info or "MD_UUID" not in info:
+            continue
+        a = arrays.setdefault(info["MD_UUID"], {
+            "uuid": info["MD_UUID"], "level": info.get("MD_LEVEL"),
+            "devices": int(info.get("MD_DEVICES", 0)), "name": info.get("MD_NAME", ""),
+            "metadata": info.get("MD_METADATA", ""), "members": []})
+        a["members"].append(dev)
+    for a in arrays.values():
+        num = {re.sub(r"^.*?(\d+)$", r"\1", m) for m in a["members"]}
+        sizes = {part_sectors(m) for m in a["members"]}
+        if num == {"1"} and sizes == {FW_PART_SECTORS}:
+            a["role"] = "stock-firmware"
+        elif num == {"2"} and sizes == {SWAP_PART_SECTORS}:
+            a["role"] = "stock-swap"
+        elif num == {"3"}:
+            a["role"] = "stock-data"
+        else:
+            a["role"] = "foreign"
+        a["uuid8"] = a["uuid"].replace(":", "")[:8]
+    return sorted(arrays.values(), key=lambda a: a["uuid"])
+
+
+def active_md_for(uuid):
+    for d in glob.glob("/dev/md*"):
+        r = run(["mdadm", "--detail", "--export", d], check=False)
+        if "MD_UUID=%s" % uuid in r.stdout:
+            return d
+    return None
+
+
+def md_array_state(dev):
+    try:
+        with open("/sys/block/%s/md/array_state" % os.path.basename(os.path.realpath(dev))) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def assemble(a, rw):
+    dev = active_md_for(a["uuid"])
+    if dev:
+        # Only a read-only array needs --readwrite.  The array that carries
+        # the running system (/.untrash, assembled by the slot initrd) is
+        # already writable, and mdadm refuses it with EBUSY.
+        if rw and md_array_state(dev) in ("readonly", "read-auto"):
+            r = run(["mdadm", "--readwrite", dev], check=not holds_host(dev))
+            if r.returncode != 0:
+                log("WARN %s stays %s: %s" % (dev, md_array_state(dev), r.stdout.strip()))
+        return dev
+    dev = "/dev/md/zyx-" + a["uuid8"]
+    ro = [] if rw else ["--readonly"]
+    run(["mdadm", "--assemble"] + ro + ["--run", dev] + a["members"])
+    return dev
+
+
+def lvm_config(read_only, vg=None):
+    # metadata_read_only: LVM never rewrites the stock VG metadata;
+    # read_only_volume_list: the VG's LVs are activated as read-only devices.
+    c = "global { metadata_read_only = %d }" % (1 if read_only else 0)
+    if read_only and vg:
+        c += ' activation { read_only_volume_list = [ "%s" ] }' % vg
+    return c
+
+
+def lvm_report_names(cmd, report_key, field):
+    """Extract one LVM report column without treating diagnostics as names.
+
+    LVM can emit warnings on stdout before its normal report (notably while
+    discovering old stock PV metadata).  Splitting human-readable output made
+    words such as ``WARNING:`` appear to be VG names and then turned a
+    read-only probe into a misleading vgchange failure.  The JSON report is
+    machine-readable; tolerate a diagnostic prefix, but require a valid
+    report afterwards.
+    """
+    out = run(cmd + ["--reportformat", "json", "-o", field]).stdout
+    start = out.find("{")
+    if start < 0:
+        die("LVM %s report missing JSON: %s" % (field, out.strip()))
+    try:
+        report, _rest = json.JSONDecoder().raw_decode(out[start:])
+        rows = report["report"][0][report_key]
+        names = [row[field] for row in rows if row.get(field)]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        die("cannot parse LVM %s report: %s" % (field, e))
+    if not all(isinstance(name, str) for name in names):
+        die("invalid LVM %s report" % field)
+    # Some LVM versions insert their diagnostic token as an otherwise normal
+    # report cell (for example ``vg_name: WARNING:``) when they encounter old
+    # stock metadata.  It is not a valid LVM name and must never reach
+    # vgchange/lvchange.  Filtering it here retains actual report rows while
+    # making the read-only importer safe against that mixed output.
+    valid = re.compile(r"[A-Za-z0-9+_.-]+")
+    return [name for name in names if valid.fullmatch(name)]
+
+
+def volumes_on(mddev, read_only):
+    """[(volume id, block device, kind)] for one stock data array."""
+    t = blkid(mddev).get("TYPE", "")
+    if t == "ext4":
+        return [("md", mddev, "ext4")]
+    if t != "LVM2_member":
+        return [("unknown", mddev, t or "none")]
+    cfg = lvm_config(read_only)
+    vols = []
+    for vg in lvm_report_names(["pvs", "--config", cfg, mddev], "pv", "vg_name"):
+        run(["vgchange", "--config", lvm_config(read_only, vg), "-ay", vg])
+        # an LV the slot initrd mapped itself (the running system) has no
+        # /dev/VG/LV link from udev; vgmknodes adds it (otherwise "Can't
+        # lookup blockdev" stops the mount)
+        run(["vgmknodes", "--config", lvm_config(read_only, vg), vg], check=False)
+        for lv in lvm_report_names(["lvs", "--config", cfg, vg], "lv", "lv_name"):
+            vols.append((lv, "/dev/%s/%s" % (vg, lv), "lvm"))
+    return vols
+
+
+def ensure_idata():
+    for root in (INTERN_ROOT, EXTERN_ROOT):
+        if not os.path.isdir(root):
+            die("%s missing in the image" % root)
+        if not is_mountpoint(root):
+            run(["mount", "-t", "tmpfs", "-o", "mode=0755,size=1m", "tmpfs", root])
+
+
+def mount_volume(dev, mnt, rw):
+    if is_mountpoint(mnt):
+        return "already"
+    os.makedirs(mnt, exist_ok=True)
+    if host_devnum() is not None and devnum(dev) == host_devnum():
+        # the running system's container: already mounted rw by the initrd
+        run(["mount", "--bind", HOST_MNT, mnt])
+        if rw:
+            run(["mount", "-o", "remount,usrquota", HOST_MNT], check=False)
+            run(["quotaon", "-u", mnt], check=False)
+            return "host"
+        run(["mount", "-o", "remount,bind,ro", mnt])
+        return "host-ro"
+    if rw:
+        r = run(["e2fsck", "-p", dev], check=False)
+        if r.returncode >= 4:
+            log("WARN %s needs a manual e2fsck (rc %d), mounting read-only" % (dev, r.returncode))
+            rw = False
+    if rw:
+        run(["mount", "-t", "ext4", "-o", "rw,noatime,usrquota", dev, mnt])
+        run(["quotaon", "-u", mnt], check=False)
+        return "rw"
+    run(["mount", "-t", "ext4", "-o", "ro,noload", dev, mnt])
+    return "ro"
+
+
+def link_sysvol(mounted):
+    marks = [m for m in mounted if glob.glob(m + "/.system/sysvol_*")]
+    if not marks:
+        return None
+    if len(marks) > 1:
+        log("WARN several volumes carry a sysvol marker: %s, using %s" % (marks, sorted(marks)[0]))
+    target = sorted(marks)[0]
+    for name, sub in (("sysvol", ""), (".system", "/.system"), (".media", "/.media")):
+        link = os.path.join(INTERN_ROOT, name)
+        if not os.path.lexists(link):
+            os.symlink(target + sub, link)
+    return target
+
+
+def takeover_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def cmd_volumes(args):
+    do_mount = "--mount" in args
+    rw = "--rw" in args
+    if rw and not takeover_state().get("rw"):
+        die("--rw only after 'apply' (takeover not confirmed)")
+    report = []
+    mounted = []
+    if do_mount:
+        ensure_idata()
+        run(["modprobe", "-a", "md_mod", "raid1", "raid456", "raid0", "raid10", "linear"], check=False)
+    for a in find_arrays():
+        entry = {k: a[k] for k in ("uuid", "uuid8", "level", "devices", "metadata", "role", "members")}
+        if a["role"] == "stock-data" and do_mount:
+            dev = assemble(a, rw)
+            entry["md"] = dev
+            vols = []
+            for vid, vdev, kind in volumes_on(dev, read_only=not rw):
+                if kind == "ext4" and vid == "md":
+                    mnt = os.path.join(INTERN_ROOT, a["uuid8"])
+                elif kind == "lvm" and vid.startswith("lv_"):
+                    mnt = os.path.join(INTERN_ROOT, vid[3:])
+                elif kind == "lvm" and vid == VG_INFO_AREA:
+                    mnt = "/run/untrash/vg_info_area/" + os.path.basename(os.path.dirname(vdev))
+                else:
+                    vols.append({"id": vid, "dev": vdev, "type": kind, "mounted": None})
+                    continue
+                try:
+                    how = mount_volume(vdev, mnt, rw and vid != VG_INFO_AREA)
+                except SystemExit:
+                    # one volume that cannot be mounted must not hide the others
+                    log("WARN %s (%s) not mounted, continuing with the other volumes" % (vid, vdev))
+                    vols.append({"id": vid, "dev": vdev, "mnt": mnt, "mounted": None})
+                    continue
+                label = ""
+                try:
+                    with open(mnt + "/.system/name_label") as f:
+                        label = f.read().strip()
+                except OSError:
+                    pass
+                if vid != VG_INFO_AREA:
+                    mounted.append(mnt)
+                vols.append({"id": vid, "dev": vdev, "mnt": mnt, "mounted": how, "name": label})
+            entry["volumes"] = vols
+        report.append(entry)
+    if do_mount:
+        sysvol = link_sysvol(mounted)
+        report.append({"sysvol": sysvol})
+    print(json.dumps(report, indent=2))
+
+
+def cmd_release(args):
+    """Unmount the stock volumes, deactivate their VGs, stop their arrays."""
+    with open("/proc/mounts") as f:
+        mnts = [l.split()[1] for l in f]
+    for m in reversed(mnts):
+        if (m.startswith(INTERN_ROOT + "/") and re.fullmatch(r"[0-9a-f]{8}", os.path.basename(m))) \
+                or m.startswith("/run/untrash/vg_info_area/"):
+            run(["umount", m])
+    for a in find_arrays():
+        if a["role"] != "stock-data":
+            continue
+        dev = active_md_for(a["uuid"])
+        if not dev:
+            continue
+        if holds_host(dev):
+            log("KEEP %s: holds the running system (/.untrash)" % dev)
+            continue
+        if blkid(dev).get("TYPE") == "LVM2_member":
+            cfg = lvm_config(True)
+            # Use the same JSON parser and validation as the read-only mount
+            # path.  Plain pvs output can contain WARNING: tokens from old
+            # stock metadata, which must never be passed to vgchange.
+            for vg in lvm_report_names(["pvs", "--config", cfg, dev], "pv", "vg_name"):
+                run(["vgchange", "--config", cfg, "-an", vg])
+        run(["mdadm", "--stop", dev])
+    for name in ("sysvol", ".system", ".media"):
+        link = os.path.join(INTERN_ROOT, name)
+        if os.path.islink(link):
+            os.unlink(link)
+    log("RELEASED")
+
+
+# ------------------------------------------------------------- stock config
+
+def read_pyconf(path):
+    """Minimal ConfigObj reader: {'system.servername.workgroupname': value}."""
+    vals, stack = {}, []
+    try:
+        f = open(path)
+    except OSError:
+        return vals
+    with f:
+        for line in f:
+            s = line.strip()
+            m = re.fullmatch(r"(\[+)\s*([^\]]+?)\s*\]+", s)
+            if m:
+                depth = len(m.group(1))
+                stack = stack[:depth - 1] + [m.group(2)]
+                continue
+            m = re.fullmatch(r"([^=]+?)\s*=\s*(.*)", s)
+            if m and stack:
+                vals[".".join(stack + [m.group(1)])] = m.group(2).strip().strip('"')
+    return vals
+
+
+class Stock:
+    def __init__(self, cfgdir):
+        db = os.path.join(cfgdir, "ugs_conf.db")
+        if not os.path.isfile(db):
+            die("%s not found" % db)
+        # read-only, never modify the operator's copy
+        self.db = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        self.py = read_pyconf(os.path.join(cfgdir, "py_conf"))
+
+    def q(self, sql, *a):
+        return self.db.execute(sql, a).fetchall()
+
+    def users(self):
+        return self.q("SELECT uid, uname, create_type, utype, passwd, description FROM smb_user ORDER BY uid")
+
+    def groups(self):
+        return self.q("SELECT gid, gname, gtype, description FROM smb_group ORDER BY gid")
+
+    def members(self, gname):
+        return [r[0] for r in self.q("SELECT uname FROM group_member WHERE gname=? ORDER BY uid", gname)]
+
+    def admin_shadow(self):
+        r = self.q("SELECT value FROM ugs_misc WHERE key='admin_shadow_passwd'")
+        return r[0][0] if r else None
+
+    def shares(self):
+        return self.q("SELECT s_name, s_path, create_type, s_desc, s_enable, browseable, recycle "
+                      "FROM smb_share ORDER BY s_name")
+
+    def privileges(self, s_name):
+        u = self.q("SELECT uname, privilege FROM share_user_privilege WHERE s_name=?", s_name)
+        g = self.q("SELECT gname, privilege FROM share_group_privilege WHERE s_name=?", s_name)
+        return u, g
+
+
+def smb_quote(names):
+    return "".join(' "%s"' % n for n in names)
+
+
+def smb_extra():
+    try:
+        with open(SMB_EXTRA) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def render_share(stock, s_name, s_path, s_desc, browseable, recycle, time_machine=False):
+    """Stock share_func.get_share_smbconf() semantics on current Samba."""
+    users, grps = stock.privileges(s_name)
+    valid_u = [u for u, p in users if p in (ACCESS_RO, ACCESS_RW)]
+    valid_g = sorted({g for g, p in grps if p in (ACCESS_RO, ACCESS_RW)})
+    ro = [u for u, p in users if p == ACCESS_RO] + ["+" + g for g, p in grps if p == ACCESS_RO]
+    deny = [u for u, p in users if p == ACCESS_DENY] + ["+" + g for g, p in grps if p == ACCESS_DENY]
+    valid = valid_u + ["+" + g for g in valid_g]
+    out = ["", "[%s]" % s_name,
+           "\tpath = %s" % s_path,
+           '\tcomment = "%s"' % s_desc,
+           "\tbrowseable = %s" % ("yes" if browseable == "y" else "no"),
+           "\tread only = no",
+           "\tfollow symlinks = yes"]
+    vfs = (["catia", "fruit", "streams_xattr"] if time_machine else []) + (["recycle"] if recycle == "y" else [])
+    if vfs:
+        out.append("\tvfs objects = " + " ".join(vfs))
+    if time_machine:
+        out += ["\tfruit:time machine = yes", "\tfruit:metadata = stream"]
+    if recycle == "y":
+        out += ["\trecycle:repository = recycle",
+                "\trecycle:exclude = .test.permission.file.*",
+                "\trecycle:directory_mode = 0777",
+                "\trecycle:subdir_mode = 0777",
+                "\trecycle:keeptree = yes",
+                "\trecycle:versions = yes",
+                "\trecycle:touch = yes",
+                "\trecycle:touch_mtime = no",
+                "\trecycle:maxsize = 0"]
+    if valid and (valid != [GUEST] or ro or deny):
+        out.append("\tvalid users =%s" % smb_quote(valid))
+    if ro:
+        out.append("\tread list =%s" % smb_quote(ro))
+    if deny:
+        out.append("\tinvalid users =%s" % smb_quote(deny))
+    if GUEST in valid_u:
+        out.append("\tguest ok = yes")
+    elif not (valid or ro or deny):
+        out.append("\tvalid users = nobody")
+        out.append("\tinvalid users = +everyone")
+    return out
+
+
+def render_smbconf(stock, path_exists=os.path.isdir):
+    py = stock.py
+    extra = smb_extra()
+    nb = extra.get("netbios") or {}
+    workgroup = nb.get("workgroup") or py.get("system.servername.workgroupname", "WORKGROUP")
+    nbname = nb.get("name") or py.get("system.servername.servername", "UNTRASH")
+    desc = nb.get("description", py.get("system.servername.description", "UntrashOS"))
+    tm_share = extra.get("time_machine") or ""
+    out = ["# Generated by untrash-import-zyxel render from the stock Zyxel",
+           "# user/share database; regenerate instead of editing.",
+           "[global]",
+           "\tworkgroup = %s" % workgroup,
+           "\tnetbios name = %s" % nbname,
+           '\tserver string = "%s"' % desc,
+           "\tserver role = standalone server",
+           "\tsecurity = user",
+           "\tpassdb backend = tdbsam",
+           "\tguest account = %s" % GUEST,
+           "\tmap to guest = Bad User",
+           "\tunix charset = UTF-8",
+           "\tstore dos attributes = yes",
+           "\t# stock: every file 0777, rights enforced per share by Samba",
+           "\tforce create mode = 0777",
+           "\tforce directory mode = 0777",
+           "\tcreate mask = 0777",
+           "\tdirectory mask = 0777",
+           "\tveto files = /.grive*/.dropbox*/%s/%s/" % (RECYCLE_FN, RECYCLE_RBM_FN),
+           ]
+    if extra.get("printers"):
+        # stock smb.conf: CUPS raw queues, clients bring their own driver
+        out += ["\tprinting = cups", "\tprintcap name = cups", "\tload printers = yes"]
+    else:
+        out += ["\tload printers = no", "\tdisable spoolss = yes"]
+    if tm_share:
+        out += ["\t# Time Machine (stock: AFP; here SMB with vfs_fruit, announced by Avahi)",
+                "\tfruit:aapl = yes", "\tfruit:model = MacSamba", "\tmulticast dns register = yes"]
+    if nb.get("nomaster", py.get("system.servername.nomaster") == "true") in (True, "true"):
+        out += ["\tdomain master = no", "\tlocal master = no",
+                "\tpreferred master = no", "\tos level = 0"]
+    skipped = []
+    for s_name, s_path, _ct, s_desc, enable, browseable, recycle in stock.shares():
+        if enable != "y":
+            continue
+        if not path_exists(os.path.realpath(s_path)):
+            skipped.append((s_name, s_path))
+            continue
+        out += render_share(stock, s_name, s_path, s_desc, browseable, recycle, s_name == tm_share)
+    if extra.get("printers"):
+        out += ["", "[printers]", "\tpath = /var/spool/samba", "\tpublic = yes", "\tguest ok = yes",
+                "\tbrowseable = yes", "\twritable = no", "\tprintable = yes", "\tuse client driver = yes"]
+    return "\n".join(out) + "\n", skipped
+
+
+def user_access(stock, user, groups):
+    """Access of USER (member of GROUPS) per enabled share, as Samba applies
+    the rendered valid users / read list / invalid users / guest ok."""
+    out = {}
+    for s_name, s_path, _ct, _d, enable, _b, _r in stock.shares():
+        if enable != "y":
+            continue
+        users, grps = stock.privileges(s_name)
+        mine = lambda p: [u for u, q in users if q == p and u == user] + [g for g, q in grps if q == p and g in groups]  # noqa: E731
+        valid_u = [u for u, p in users if p in (ACCESS_RO, ACCESS_RW)]
+        valid_g = [g for g, p in grps if p in (ACCESS_RO, ACCESS_RW)]
+        any_ro_deny = any(p in (ACCESS_RO, ACCESS_DENY) for _u, p in users + grps)
+        if mine(ACCESS_DENY):
+            acc = ACCESS_DENY
+        elif not (valid_u or valid_g or any_ro_deny):
+            acc = ACCESS_DENY                      # valid users = nobody
+        elif (valid_u + valid_g) == [GUEST] and not any_ro_deny:
+            acc = ACCESS_RW                        # no valid users line: everybody
+        elif mine(ACCESS_RO):
+            acc = ACCESS_RO
+        elif mine(ACCESS_RW):
+            acc = ACCESS_RW
+        else:
+            acc = ACCESS_DENY
+        out[s_name] = {"path": s_path, "access": acc}
+    return out
+
+
+def cmd_access(args):
+    if len(args) != 2:
+        die("usage: access CONFIG USER")
+    stock = Stock(args[0])
+    user = args[1]
+    groups = [g for _gid, g, _t, _d in stock.groups() if user in stock.members(g)]
+    if user != GUEST:
+        groups.append("everyone")      # primary group of every stock user
+    print(json.dumps(user_access(stock, user, groups), indent=1, sort_keys=True))
+
+
+def cmd_plan(args):
+    stock = Stock(args[0] if args else die("usage: plan CONFIG"))
+    log("GROUPS")
+    for gid, gname, gtype, _d in stock.groups():
+        log("  %5d %-20s %s members=%s" % (gid, gname, gtype, ",".join(stock.members(gname))))
+    log("USERS")
+    for uid, uname, ctype, utype, pw, _d in stock.users():
+        ok = bool(re.fullmatch(SMB_HASH, pw or ""))
+        log("  %5d %-20s %-12s %-6s smb-hash=%s" % (uid, uname, ctype, utype, "yes" if ok else "NO"))
+    log("SHARES")
+    for s_name, s_path, ctype, _d, enable, _b, recycle in stock.shares():
+        real = os.path.realpath(s_path)
+        here = "present" if os.path.isdir(real) else "MISSING"
+        u, g = stock.privileges(s_name)
+        acl = " ".join("%s:%s" % x for x in u) + " " + " ".join("+%s:%s" % x for x in g)
+        log("  %-30s %-8s enable=%s recycle=%s %s %s  [%s]" % (
+            s_name, ctype, enable, recycle, s_path, here, acl.strip()))
+
+
+def cmd_render(args):
+    stock = Stock(args[0] if args else die("usage: render CONFIG [--out FILE]"))
+    text, skipped = render_smbconf(stock)
+    for s, p in skipped:
+        log("# skipped share %s: %s not present" % (s, p))
+    if "--out" in args:
+        out = args[args.index("--out") + 1]
+        tmp = out + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, out)
+        log("WROTE %s" % out)
+    else:
+        sys.stdout.write(text)
+
+
+# ---------------------------------------------------------------------- apply
+
+def getent(db, key):
+    r = run(["getent", db, str(key)], check=False)
+    return r.stdout.strip().split(":") if r.returncode == 0 else None
+
+
+def tree_digest(top):
+    """SHA-256 over all relative paths and file contents below top."""
+    h = hashlib.sha256()
+    for d, dirs, files in sorted(os.walk(top)):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            h.update(os.path.relpath(p, top).encode() + b"\0")
+            if os.path.islink(p):
+                h.update(b"L" + os.readlink(p).encode())
+            else:
+                with open(p, "rb") as fh:
+                    h.update(hashlib.sha256(fh.read()).digest())
+    return h.hexdigest()
+
+
+def check_conflicts(stock):
+    problems = []
+    for gid, gname, _t, _d in stock.groups():
+        byid, byname = getent("group", gid), getent("group", gname)
+        if byid and byid[0] != gname:
+            problems.append("gid %d is %s on this system (stock: %s)" % (gid, byid[0], gname))
+        if byname and int(byname[2]) != gid:
+            problems.append("group %s has gid %s (stock: %d)" % (gname, byname[2], gid))
+    for uid, uname, *_ in stock.users():
+        byid, byname = getent("passwd", uid), getent("passwd", uname)
+        if byid and byid[0] != uname:
+            problems.append("uid %d is %s on this system (stock: %s)" % (uid, byid[0], uname))
+        if byname and int(byname[2]) != uid:
+            problems.append("user %s has uid %s (stock: %d)" % (uname, byname[2], uid))
+    return problems
+
+
+def cmd_apply(args):
+    if "--yes-take-over" not in args:
+        die("apply changes users, Samba and lets the stock volumes mount read-write; "
+            "run 'plan' first, then add --yes-take-over")
+    cfg = args[0]
+    if os.path.exists(STATE_FILE) and os.path.isdir(STATE_CONFIG):
+        # an earlier run created users, groups and Samba passwords and recorded
+        # the takeover; STATE_CONFIG is the Desk's working copy since then, so it
+        # is not compared again (it differs by design)
+        log("RESUME takeover: recorded in %s; users, groups and shares stay as they are" % STATE_FILE)
+        r = run(["systemctl", "enable", "--now", "untrash-zyxel.service"], check=False)
+        if r.returncode != 0:
+            log("WARN untrash-zyxel.service failed (%d): %s" % (r.returncode, r.stdout.strip()))
+        return
+    stock = Stock(cfg)
+    problems = check_conflicts(stock)
+    if problems:
+        die("conflicts, nothing changed:\n  " + "\n  ".join(problems))
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    if os.path.abspath(cfg) != STATE_CONFIG:
+        if os.path.exists(STATE_CONFIG):
+            # copied by a run that stopped before the takeover was recorded
+            if tree_digest(STATE_CONFIG) != tree_digest(cfg):
+                die("%s exists from an earlier takeover of another configuration" % STATE_CONFIG)
+            log("RESUME takeover: %s already holds this stock configuration" % STATE_CONFIG)
+        else:
+            shutil.copytree(cfg, STATE_CONFIG, symlinks=True)
+    stock = Stock(STATE_CONFIG)
+    for gid, gname, _t, _d in stock.groups():
+        if not getent("group", gname):
+            run(["groupadd", "-g", str(gid), gname])
+    admin_hash = stock.admin_shadow()
+    smbpw = []
+    for uid, uname, _ct, utype, pw, desc in stock.users():
+        if not getent("passwd", uname):
+            groups = [g for _gid, g, _t, _d in stock.groups() if uname in stock.members(g)]
+            cmd = ["useradd", "-u", str(uid), "-g", str(DEFAULT_GID), "-M",
+                   "-d", "/nonexistent", "-s", "/usr/sbin/nologin", "-c", (desc or "")[:60]]
+            if groups:
+                cmd += ["-G", ",".join(groups)]
+            run(cmd + [uname])
+        if uname == "admin" and admin_hash:
+            # stock: md5-crypt of the web/SSH admin password
+            run(["usermod", "-p", admin_hash, "-s", "/bin/bash", uname])
+            run(["usermod", "-a", "-G", "sudo", uname], check=False)    # web terminal / SSH
+        if re.fullmatch(SMB_HASH, pw or ""):
+            lm, nt = pw.split(":")
+            smbpw.append("%s:%d:%s:%s:[U          ]:LCT-00000000:" % (uname, uid, lm.upper(), nt.upper()))
+    with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, delete=False) as f:
+        f.write("\n".join(smbpw) + "\n")
+        tmp = f.name
+    try:
+        run(["pdbedit", "-i", "smbpasswd:" + tmp, "-e", "tdbsam"])
+    finally:
+        os.unlink(tmp)
+    if os.path.exists(SMBCONF) and not os.path.exists(SMBCONF + ".untrash-orig"):
+        shutil.copy2(SMBCONF, SMBCONF + ".untrash-orig")
+    with open(STATE_FILE + ".tmp", "w") as f:
+        json.dump({"rw": True, "config": STATE_CONFIG}, f)
+    os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    log("TAKEOVER recorded; mounting the stock volumes read-write and starting Samba")
+    cmd_release([])
+    # A failing volume mount must not stop the rest of the takeover (settings,
+    # services, web interface): untrash-zyxel.service stays enabled and runs
+    # again at every start; its own log says why.
+    r = run(["systemctl", "enable", "--now", "untrash-zyxel.service"], check=False)
+    if r.returncode != 0:
+        log("WARN untrash-zyxel.service failed (%d): %s; see journalctl -u untrash-zyxel"
+            % (r.returncode, r.stdout.strip()))
+
+
+def main():
+    cmds = {"config-from-nand": cmd_config_from_nand, "volumes": cmd_volumes, "release": cmd_release,
+            "plan": cmd_plan, "render": cmd_render, "apply": cmd_apply, "access": cmd_access}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    cmds[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()
