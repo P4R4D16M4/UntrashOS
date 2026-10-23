@@ -77,21 +77,21 @@ class TV:
         d = self.load()
         name = (req.get("name") or "").strip()[:40]
         if not name:
-            raise Fail("Name des Senders fehlt.")
+            raise Fail("Channel name missing.")
         items = [{"share": str(x.get("share", "")), "path": str(x.get("path", ""))} for x in req.get("items") or []][:500]
         if not items:
-            raise Fail("Die Playlist ist leer.")
+            raise Fail("The playlist is empty.")
         for x in items:
             if not self.resolve(x["share"], x["path"]):
-                raise Fail("Nicht gefunden: %s/%s" % (x["share"], x["path"]), 404)
+                raise Fail("Not found: %s/%s" % (x["share"], x["path"]), 404)
         prof = req.get("profile") if req.get("profile") in PROFILES else "480"
         cid = req.get("id") or ""
         c = next((c for c in d["channels"] if c["id"] == cid), None)
         if cid and not c:
-            raise Fail("Unbekannter Sender.", 404)
+            raise Fail("Unknown channel.", 404)
         if not c:
             if len(d["channels"]) >= 20:
-                raise Fail("Höchstens 20 Sender.")
+                raise Fail("At most 20 channels.")
             c = {"id": secrets.token_hex(3), "epoch": int(time.time())}
             d["channels"].append(c)
         c.update(name=name, items=items, profile=prof, shuffle=bool(req.get("shuffle")))
@@ -116,7 +116,7 @@ class TV:
         n = len(d["channels"])
         d["channels"] = [c for c in d["channels"] if c["id"] != cid]
         if len(d["channels"]) == n:
-            raise Fail("Unbekannter Sender.", 404)
+            raise Fail("Unknown channel.", 404)
         self._save(d)
         self.stop(cid)
 
@@ -267,22 +267,22 @@ class TV:
                 return r["dir"]
         c = self.channel(cid)
         if not c:
-            raise Fail("Unbekannter Sender.", 404)
+            raise Fail("Unknown channel.", 404)
         paths = self.paths(c)
         known, n = self.prepare(c, paths)
         if known < n:
-            raise Fail("Sender wird vorbereitet: %d von %d Dateien gelesen." % (known, n), 503)
+            raise Fail("Channel is being prepared: %d of %d files read." % (known, n), 503)
         with self.lock:
             files = self.files(c, paths)
             i, off, total = self.now_playing(c, files)
             if i is None:
-                raise Fail("Keine abspielbaren Dateien in der Playlist.")
+                raise Fail("No playable files in the playlist.")
             r = self.run.get(cid)
             if r and r["proc"].poll() is None:      # another request started it meanwhile
                 r["last"] = time.time()
                 return r["dir"]
             if sum(1 for x in self.run.values() if x["proc"].poll() is None) >= MAX_RUNNING:
-                raise Fail("Es laufen schon %d Sender, mehr schafft die NAS nicht gleichzeitig." % MAX_RUNNING, 503)
+                raise Fail("%d channels are already running; the NAS cannot handle more at once." % MAX_RUNNING, 503)
             d = os.path.join(self.rundir, cid)
             shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d)
@@ -322,7 +322,7 @@ class TV:
         except (OSError, IndexError):
             pass
         self.stop(cid)
-        raise Fail("Der Sender startet nicht%s" % (": " + log if log else "."), 500)
+        raise Fail("The channel does not start%s" % (": " + log if log else "."), 500)
 
     def touch(self, cid, ip):
         r = self.run.get(cid)

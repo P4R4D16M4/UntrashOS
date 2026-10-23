@@ -76,7 +76,7 @@ DSN="$OS/design"; DD="$W/root/usr/share/untrash/design"
 mkdir -p "$DD/assets/icons"
 cp "$DSN/untrash.css" "$DD/"
 # UI translations (design/i18n, built by tools/i18n/build.py)
-mkdir -p "$DD/i18n" && cp "$DSN"/i18n/{i18n.js,en.json,fr.json} "$DD/i18n/"
+mkdir -p "$DD/i18n" && cp "$DSN"/i18n/{i18n.js,de.json,fr.json} "$DD/i18n/"
 cp "$DSN"/assets/{favicon.ico,logo-mark-48.png,logo-mark-96.png,logo-mark-192.png,wordmark-300.png,wallpaper.jpg,wallpaper-blur.jpg} "$DD/assets/"
 cp "$DSN"/assets/icons/*-64.png "$DSN"/assets/icons/*-128.png "$DSN"/assets/icons/*.svg "$DD/assets/icons/"
 # user manual (docs/user-guide, built by tools/manual/build.py): Desk app and

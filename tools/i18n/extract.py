@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Collect the German UI texts of Untrash Desk, the installer page and the
-messages the Desk backend shows (Fail(...)), for the EN/FR catalogs.
+"""Collect the English UI texts of Untrash Desk, the installer page and the
+messages the Desk backend shows (Fail(...)), for the DE/FR catalogs.
 
   extract.py            print the texts (one per line, sorted)
   extract.py --missing  only those without an entry in every catalog
@@ -18,8 +18,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 F = os.path.join(ROOT, "image/rootfs")
 SOURCES = ["usr/share/untrash/desk/desk.js", "usr/lib/untrash/untrash-installer", "usr/lib/untrash/untrash-desk"]
 CAT = os.path.join(ROOT, "design/i18n")
-WORD = re.compile(r"[A-Za-zÄÖÜäöüß]{2,}")
-GERMAN = re.compile(r"[äöüÄÖÜß]|\b(der|die|das|den|dem|des|und|oder|nicht|kein|keine|ein|eine|einen|mit|für|auf|von|zu|zum|zur|im|in|ist|sind|wird|werden|bitte|Bitte|alle|nur|noch|neu|neue|neuer|als|wie|bei|nach|vor|aus|an|ab|aus|über|unter|bis|jetzt|hier|dieser|diese|dieses|sich|wenn|dann|Sie|du|dein|deine|ihr|ihre)\b")
+WORD = re.compile(r"[A-Za-z]{2,}")
+# English UI text: a function word (code rarely has one between spaces)
+ENGLISH = re.compile(r"\b(the|a|an|and|or|not|no|to|of|for|on|in|is|are|be|been|will|with|without|from|by|at|as|this|that|these|it|its|your|you|all|only|new|now|here|first|then|when|if|can|cannot|has|have|was|were|than|more|less|per|into|out|off|up|down|yet|still|again|please|Please|there|which|what|after|before|until|each|every|other|same|any|none|one|two|least)\b")
 CODEY = re.compile(r"^[\w.#:/-]+$|^[a-z]+[A-Z]\w*$|^ut-|\[data-|[{}<>=;\\]|^\$|^https?:|^/|\.(js|css|png|svg|json|ko|img|utslot)$")
 
 
@@ -104,8 +105,8 @@ def pieces(lit):
 
 def literals(src, py=False):
     if py:
-        for m in re.finditer(r'(?:Fail|JOB\.add|problems\.append|steps\.append)\(\s*"((?:[^"\\]|\\.)*)"', src):
-            yield m.group(1)
+        for m in re.finditer(r'(?:Fail|JOB\.add|problems\.append|steps\.append)\(\s*((?:"(?:[^"\\]|\\.)*"\s*)+)', src):
+            yield "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)))     # "a " "b" (implicit concatenation)
         m = re.search(r'PAGE = r?"""(.*?)"""', src, re.S)
         if not m:
             return
@@ -118,11 +119,12 @@ def literals(src, py=False):
 
 
 def clean(t):
-    t = html.unescape(t)          # the browser shows "<Freigabe>", not "&lt;Freigabe&gt;"
+    t = html.unescape(t)          # the browser shows "<share>", not "&lt;share&gt;"
     t = re.sub(r"\\r|\\x1b\[[0-9;]*m", "", t)
+    t = re.sub(r"\\(['\"`])", r"\1", t)      # 'This share\'s' is shown as "This share's"
     t = t.replace("\\n", " ").strip()
     t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"^[\s·,:;()%–—+•*-]+|[\s·,:(–—•*]+$", "", t)
+    t = re.sub(r"^(?:[\s·,:;()–—+•*-]|%(?![sdf]))+|[\s·,:(–—•*]+$", "", t)     # keep a leading %s
     return t
 
 
@@ -132,14 +134,17 @@ def collect():
         src = open(os.path.join(F, rel), encoding="utf-8").read()
         py = not rel.endswith(".js")
         for lit in literals(src, py):
-            if py and "%" in lit and not GERMAN.search(lit):
+            if py and "%" in lit and not ENGLISH.search(lit):
                 continue
             for p in pieces(lit):
                 t = clean(p)
-                capword = re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß]{2,}", t) and t not in CODE_NAMES
-                if re.fullmatch(r"ut-[\w-]+", t) or len(WORD.findall(t)) == 0 or CODEY.search(t) and not GERMAN.search(t) and not capword:
+                capword = re.fullmatch(r"[A-Z][a-z]{2,}", t) and t not in CODE_NAMES
+                # markup and attribute lists, not text ("<a class=", 'type=password autocomplete=...')
+                if t.startswith("<") or '="' in t or re.search(r"(^|\s)[\w-]+=[\w\"]", t) or "translate=" in t:
                     continue
-                if not GERMAN.search(t) and len(t) < 4:
+                if re.fullmatch(r"ut-[\w-]+", t) or len(WORD.findall(t)) == 0 or CODEY.search(t) and not ENGLISH.search(t) and not capword:
+                    continue
+                if not ENGLISH.search(t) and len(t) < 4:
                     continue
                 if re.fullmatch(r"[A-Z0-9_ -]+", t) or re.fullmatch(r"[a-z_]+", t):
                     continue

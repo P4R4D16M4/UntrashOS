@@ -1,6 +1,6 @@
-/* UntrashOS UI translation (Untrash Desk and installer), German is the source.
+/* UntrashOS UI translation (Untrash Desk and installer), English is the source.
  *
- * Catalogs /ut/i18n/<lang>.json: {"text": {"<German>": "<translation>"}}.
+ * Catalogs /ut/i18n/<lang>.json: {"text": {"<English>": "<translation>"}}.
  * Every visible text is translated where it appears (MutationObserver): text
  * nodes and the title/placeholder/aria-label/alt attributes.  Order:
  *   1. the whole text (trimmed) is a catalog key
@@ -8,22 +8,22 @@
  *   3. otherwise every catalog phrase (2+ words) inside the text is replaced
  * Nothing inside [translate="no"] (file, share and user names, logs, the
  * terminal) is touched.  Language: ?lang=, localStorage "ut-lang", the
- * system default (<html data-lang>), the browser, German.
+ * system default (<html data-lang>), the browser, English.
  */
 (function () {
   'use strict';
-  const LANGS = { de: 'Deutsch', en: 'English', fr: 'Français' };
+  const LANGS = { en: 'English', de: 'Deutsch', fr: 'Français' };
   const SKIP = 'script,style,textarea,code,[translate="no"],.xterm';
   const ATTRS = ['title', 'placeholder', 'aria-label', 'alt'];
-  let lang = 'de', exact = null, pats = [], frag = null;
+  let lang = 'en', exact = null, pats = [], frag = null;
   const done = new WeakMap();
 
   const pick = () => {
     const q = new URLSearchParams(location.search).get('lang');
     let st = null; try { st = localStorage.getItem('ut-lang'); } catch (e) { }
     const sys = document.documentElement.dataset.lang;
-    const nav = (navigator.language || 'de').slice(0, 2);
-    return [q, st, sys, nav, 'de'].find(l => l && LANGS[l]);
+    const nav = (navigator.language || 'en').slice(0, 2);
+    return [q, st, sys, nav, 'en'].find(l => l && LANGS[l]);
   };
   const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -95,10 +95,10 @@
   });
 
   async function set(l, remember) {
-    lang = LANGS[l] ? l : 'de';
+    lang = LANGS[l] ? l : 'en';
     if (remember) try { localStorage.setItem('ut-lang', lang); } catch (e) { }
     document.documentElement.lang = lang;
-    if (lang === 'de') { exact = null; return; }
+    if (lang === 'en') { exact = null; return; }
     try { build(await (await fetch('/ut/i18n/' + lang + '.json', { cache: 'no-cache' })).json()); }
     catch (e) { exact = null; return; }
     if (document.body) node(document.body);
@@ -106,8 +106,8 @@
 
   window.UTI18N = {
     langs: LANGS, tr, get lang() { return lang; },
-    get locale() { return { de: 'de-DE', en: 'en-GB', fr: 'fr-FR' }[lang] || 'de-DE'; },
-    // switch: German needs the original texts again, so the page reloads
+    get locale() { return { de: 'de-DE', en: 'en-GB', fr: 'fr-FR' }[lang] || 'en-GB'; },
+    // switch: English needs the original texts again, so the page reloads
     set: l => { try { if (l) localStorage.setItem('ut-lang', l); else localStorage.removeItem('ut-lang'); } catch (e) { } location.reload(); },
     get own() { try { return localStorage.getItem('ut-lang') || ''; } catch (e) { return ''; } },
     ready: (async () => {

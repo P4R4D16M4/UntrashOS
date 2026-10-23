@@ -302,7 +302,7 @@ def run(cmd, input=None):
 def wait_copy_key():
     """True when the COPY button is pressed within COPY_WAIT seconds."""
     if DRYRUN or os.environ.get("ZT_INSTALLER_NOKEY") == "1" and TEST:
-        JOB.add("(Probelauf: COPY-Taste als gedrückt angenommen)")
+        JOB.add("(Dry run: COPY button assumed pressed)")
         return True
     devs = []
     for ev in glob.glob("/dev/input/event*"):
@@ -347,7 +347,7 @@ def backup_disk_meta(stick, disk, tag):
         with open(os.path.join(out, "sgdisk-backup.txt"), "w") as f:
             f.write(sh(["sgdisk", "-p", disk["path"]], check=False))
         sh(["sh", "-c", "cd %s && sha256sum *.bin > SHA256SUMS" % shlex.quote(out)])
-    JOB.add("Sicherung der Plattenmetadaten: %s" % out)
+    JOB.add("Disk metadata backup: %s" % out)
 
 
 def write_slot(slot, part):
@@ -377,8 +377,8 @@ def write_slot(slot, part):
         f.seek((blocks - 2) * 4096)
         t = hashlib.sha256(f.read(8192)).hexdigest()
     if h.hexdigest() != want_head or t != slot["sums"]["slot.trailer"]:
-        raise RuntimeError("Rücklesen von %s stimmt nicht (Kopf %s, Trailer %s)" % (part, h.hexdigest()[:12], t[:12]))
-    JOB.add("Slot %s zurückgelesen: identisch (%d MB)" % (part, hlen // 1000000))
+        raise RuntimeError("Read-back of %s does not match (head %s, trailer %s)" % (part, h.hexdigest()[:12], t[:12]))
+    JOB.add("Slot %s read back: identical (%d MB)" % (part, hlen // 1000000))
 
 
 def clear_install_marker(stick):
@@ -391,7 +391,7 @@ def clear_install_marker(stick):
         run(["rm", "-f", marker])
     finally:
         stick_rw(stick, False)
-    JOB.add("Marker UNTRASH/INSTALL entfernt: der nächste Start bootet das installierte System")
+    JOB.add("Marker UNTRASH/INSTALL removed: the next start boots the installed system")
 
 
 def part_of(disk_path, n):
@@ -427,12 +427,12 @@ def do_wipe_install(req, info):
     if rec:
         run(["dd", "of=" + part_of(disk["path"], 6), "bs=4096", "seek=1", "count=1", "conv=fsync,sync",
              "status=none"], input=rec)
-        JOB.add("Stock-MAC-Adressen übernommen")
+        JOB.add("Stock MAC addresses taken over")
     else:
-        JOB.add("Keine Stock-MAC-Adressen auf dem Stick: UntrashOS nimmt die des Treibers")
+        JOB.add("No stock MAC addresses on the stick: UntrashOS uses the driver's")
     run(["mkfs.btrfs", "-f", "-L", "ut-data", part_of(disk["path"], 5)])
     clear_install_marker(stick)
-    JOB.add("Fertig: Neustart startet UntrashOS %s von %s" % (slot["version"], disk["name"]))
+    JOB.add("Done: restarting starts UntrashOS %s from %s" % (slot["version"], disk["name"]))
 
 
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
@@ -467,13 +467,13 @@ def do_stock_restore(req, info):
     stick = info["stick"]
     b = next(x for x in info["backups"] if x["name"] == req["backup"])
     dev = b["device"]
-    JOB.add("Prüfe Sicherung %s ..." % b["name"])
+    JOB.add("Checking backup %s ..." % b["name"])
     run(["sh", "-c", "cd %s && sha256sum -c --quiet SHA256SUMS" % shlex.quote(b["flash"])])
     for f, key in (("mtd2-before-a.bin", "ENV_OLD_SHA256"), ("mtd%s-before-a.bin" % dev["LOADER_MTD"], "KX_OLD_SHA256")):
         got = sha256_file(os.path.join(b["dir"], f)) if not DRYRUN else dev[key]
         if got != dev[key]:
-            raise RuntimeError("%s/%s passt nicht zur Prüfsumme der Installation" % (b["name"], f))
-    JOB.add("Sicherung geprüft: Env und kernel%s (Stock-Zustand vor der Installation)" % dev["LOADER_SLOT"])
+            raise RuntimeError("%s/%s does not match the installation checksum" % (b["name"], f))
+    JOB.add("Backup checked: env and kernel%s (stock state before the installation)" % dev["LOADER_SLOT"])
     u = os.path.join(stick["mnt"], "UNTRASH")
     stick_rw(stick, True)
     try:
@@ -484,10 +484,10 @@ def do_stock_restore(req, info):
         run(["sync"])
     finally:
         stick_rw(stick, False)
-    JOB.add("Marker UNTRASH/ROLLBACK gesetzt. Die NAS startet jetzt neu, startet einmal die Stock-Firmware, "
-            "schreibt Env und kernel%s aus der Sicherung zurück und schaltet sich dann aus (einige Minuten; "
-            "der Stick muss stecken bleiben). Danach einschalten: die NAS startet die Stock-Firmware wie vor "
-            "der Installation." % dev["LOADER_SLOT"])
+    JOB.add("Marker UNTRASH/ROLLBACK set. The NAS now restarts, starts the stock firmware once, "
+            "writes env and kernel%s back from the backup and then powers off (a few minutes; "
+            "the stick must stay in). Then power on: the NAS starts the stock firmware as before "
+            "the installation." % dev["LOADER_SLOT"])
     if not DRYRUN and not TEST:
         threading.Timer(8.0, lambda: subprocess.run(["systemctl", "reboot"])).start()
 
@@ -512,9 +512,9 @@ def stock_volumes():
             detail = r.stdout.decode("utf-8", "replace").strip()
         # Keep the web response readable and never turn arbitrary command
         # output into markup (the client escapes every problem string).
-        detail = " ".join(detail.split())[-600:] or "keine Detailmeldung erhalten"
+        detail = " ".join(detail.split())[-600:] or "none Detailmeldung erhalten"
         print("importer volumes --mount failed (rc %d): %s" % (r.returncode, detail), flush=True)
-        return [], "Read-only-Prüfung von RAID/LVM/Dateisystem fehlgeschlagen: " + detail
+        return [], "Read-only-Prüfung of RAID/LVM/Dateisystem fehlgeschlagen: " + detail
     out = []
     for a in arrays:
         for v in a.get("volumes") or []:
@@ -533,7 +533,7 @@ def stock_volumes():
         for a in arrays:
             for v in a.get("volumes") or []:
                 if not v.get("mounted"):
-                    unknown.append("%s (%s)" % (v.get("dev", "?"), v.get("type", "unbekannt")))
+                    unknown.append("%s (%s)" % (v.get("dev", "?"), v.get("type", "unknown")))
         if unknown:
             return [], "Kein einhängbares ext4-Stock-Volume: " + ", ".join(unknown[:4])
     return sorted(out, key=lambda v: (not v["sysvol"], v["name"])), None
@@ -570,8 +570,8 @@ def copy_verified(src, dst, want):
         for b in iter(lambda: f.read(1 << 20), b""):
             h.update(b)
     if h.hexdigest() != want:
-        raise RuntimeError("Rücklesen von %s stimmt nicht (%s)" % (dst, h.hexdigest()[:12]))
-    JOB.add("%s zurückgelesen: identisch" % dst)
+        raise RuntimeError("Read-back of %s does not match (%s)" % (dst, h.hexdigest()[:12]))
+    JOB.add("%s read back: identical" % dst)
 
 
 # ------------------------------------------------- way C: new configuration
@@ -638,11 +638,11 @@ def new_config_problems(req):
     name = (req.get("netname") or "").strip()
     p = []
     if len(pw) < 8:
-        p.append("Das Passwort für admin braucht mindestens 8 Zeichen.")
+        p.append("The password for admin needs at least 8 characters.")
     elif pw != pw2:
-        p.append("Die beiden Passwörter stimmen nicht überein.")
+        p.append("The two passwords do not match.")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,14}", name):
-        p.append("Name im Netz: 1–15 Zeichen, Buchstaben, Ziffern und Bindestrich.")
+        p.append("Network name: 1–15 characters, letters, digits and hyphen.")
     return p
 
 
@@ -672,7 +672,7 @@ def write_new_config(req, vol, dst, root):
         f.write("[system]\n    hostname = %s\n    [[servername]]\n        servername = %s\n"
                 "        description = UntrashOS\n        workgroupname = WORKGROUP\n        nomaster = false\n" % (
                     req["netname"].strip().lower(), req["netname"].strip()))
-    JOB.add("Neue Konfiguration: Benutzer admin, %d Freigabe(n), Name %s" % (
+    JOB.add("Neue Konfiguration: Users admin, %d Share(n), Name %s" % (
         len(shares), req["netname"].strip()))
 
 
@@ -699,7 +699,7 @@ def do_keep_install(req, info, takeover):
             dev = vol["dev"]
         r = subprocess.run(["e2fsck", "-p", dev]) if not DRYRUN else None
         if r is not None and r.returncode >= 4:
-            raise RuntimeError("e2fsck %s meldet Fehler (rc %d); bitte zuerst prüfen" % (dev, r.returncode))
+            raise RuntimeError("e2fsck %s reports errors (rc %d); please check first" % (dev, r.returncode))
         run(["mkdir", "-p", TARGET_MNT])
         run(["mount", "-t", "ext4", "-o", "rw,noatime", dev, TARGET_MNT])
         try:
@@ -710,7 +710,7 @@ def do_keep_install(req, info, takeover):
             if DRYRUN or not os.path.exists(os.path.join(u, "state.img")):
                 run(["fallocate", "-l", str(STATE_IMG), os.path.join(u, "state.img")])
             else:
-                JOB.add("state.img vorhanden: bleibt erhalten")
+                JOB.add("state.img present: kept")
             if DRYRUN or not os.path.exists(os.path.join(u, "swap.img")):
                 run(["fallocate", "-l", str(SWAP_IMG), os.path.join(u, "swap.img")])
                 run(["chmod", "600", os.path.join(u, "swap.img")])
@@ -720,7 +720,7 @@ def do_keep_install(req, info, takeover):
             rec = device_record(info)
             if rec:
                 run(["dd", "of=" + os.path.join(u, "device.env"), "conv=fsync", "status=none"], input=rec)
-                JOB.add("Stock-MAC-Adressen übernommen")
+                JOB.add("Stock MAC addresses taken over")
             # B: the stock config from the stick; C: a new one (same format)
             cfg = info["stock_config"]
             if not takeover:
@@ -733,7 +733,7 @@ def do_keep_install(req, info, takeover):
             run(["chmod", "700", os.path.join(u, "stock-config")])
             run(["touch", os.path.join(u, "takeover-pending")])
             # language chosen on this page: the installed system starts with it
-            lang = req.get("lang") if req.get("lang") in ("de", "en", "fr") else "de"
+            lang = req.get("lang") if req.get("lang") in ("en", "de", "fr") else "en"
             run(["sh", "-c", 'printf "%s\\n" "$1" >"$2"', "-", lang, os.path.join(u, "language")])
             run(["sync"])
         finally:
@@ -744,19 +744,19 @@ def do_keep_install(req, info, takeover):
         run(["mdadm", "--stop", md])
     clear_install_marker(stick)
     # two whole sentences, so the EN/FR catalogs can translate each (i18n.js patterns)
-    JOB.add(("Fertig: Neustart startet UntrashOS %s aus /.untrash auf „%s“ und richtet beim ersten Start die alten "
-             "Benutzer und Freigaben ein" if takeover else
-             "Fertig: Neustart startet UntrashOS %s aus /.untrash auf „%s“ und richtet beim ersten Start admin und "
-             "die Freigaben ein") % (slot["version"], vol["name"]))
+    JOB.add(("Done: Restart startet UntrashOS %s off /.untrash auf „%s“ und richtet beim ersten Start die alten "
+             "Users und Shares ein" if takeover else
+             "Done: Restart startet UntrashOS %s off /.untrash auf „%s“ und richtet beim ersten Start admin und "
+             "die Shares ein") % (slot["version"], vol["name"]))
 
 
 MODES = {
-    "A": {"title": "Neuinstallation – Platte löschen", "fn": do_wipe_install, "copy": True},
-    "B": {"title": "Neuinstallation – Daten behalten, alte Benutzer und Freigaben übernehmen",
+    "A": {"title": "Neuinstallation – Disk löschen", "fn": do_wipe_install, "copy": True},
+    "B": {"title": "Neuinstallation – Daten behalten, alte Users und Shares übernehmen",
           "fn": lambda req, info: do_keep_install(req, info, True), "copy": True},
-    "C": {"title": "Neuinstallation – Daten behalten, neue Benutzer und Einstellungen",
+    "C": {"title": "Neuinstallation – Daten behalten, neue Users und Settings",
           "fn": lambda req, info: do_keep_install(req, info, False), "copy": True},
-    "D": {"title": "Stock-Firmware aus der Sicherung auf dem Stick wiederherstellen", "fn": do_stock_restore,
+    "D": {"title": "Stock-Firmware off der Backup auf dem Stick wiederherstellen", "fn": do_stock_restore,
           "copy": True},
 }
 
@@ -768,56 +768,56 @@ def plan(req, info):
     if m == "A":
         disk = next((d for d in info["disks"] if d["name"] == req.get("disk")), None)
         if not disk:
-            problems.append("Keine Platte gewählt.")
+            problems.append("No disk selected.")
             return steps, problems, None
         if disk["system"]:
-            problems.append("%s trägt das laufende System und kann von hier nicht gelöscht werden." % disk["name"])
+            problems.append("%s holds the running system and cannot be erased from here." % disk["name"])
         if disk["size"] < MIN_DISK:
-            problems.append("%s ist kleiner als 16 GiB." % disk["name"])
+            problems.append("%s is smaller than 16 GiB." % disk["name"])
         if not info["stick"]:
-            problems.append("Kein UntrashOS-Stick gefunden (Sicherung der Plattenmetadaten nötig).")
+            problems.append("No UntrashOS stick found (needed for the disk metadata backup).")
         if not info["slot"]:
-            problems.append("Auf dem Stick fehlt UNTRASH/system/ (Systemabbild).")
-        steps = ["Partitionstabelle und RAID/LVM-Metadaten von %s auf den Stick sichern" % disk["name"],
-                 "Stock-Volumes freigeben, RAID-Verbände der Platte stoppen",
-                 "ALLE Partitionen und Daten auf %s (%s, %.0f GB) löschen" % (
+            problems.append("UNTRASH/system/ (system image) is missing on the stick.")
+        steps = ["Back up the partition table and RAID/LVM metadata of %s to the stick" % disk["name"],
+                 "Release the stock volumes, stop the RAID arrays of the disk",
+                 "Erase ALL partitions and data on %s (%s, %.0f GB)" % (
                      disk["name"], disk["model"] or "?", disk["size"] / 1e9),
-                 "UntrashOS-Layout anlegen: ut-sys-a/b, ut-state, ut-swap, ut-data, ut-bootstate",
-                 "Systemabbild %s nach ut-sys-a und ut-sys-b schreiben und zurücklesen" % (
+                 "Create the UntrashOS layout: ut-sys-a/b, ut-state, ut-swap, ut-data, ut-bootstate",
+                 "Write system image %s to ut-sys-a and ut-sys-b and read it back" % (
                      info["slot"] or {}).get("version", "?"),
-                 "Datenbereich ut-data mit btrfs formatieren",
-                 "Bestätigung an der NAS: COPY-Taste drücken"]
+                 "Format the data area ut-data with btrfs",
+                 "Confirm at the NAS: press the COPY button"]
         for a in info["stock_arrays"]:
             names = {os.path.basename(m) for m in a.get("members") or []}
             others = {p["name"] for p in disk["parts"]}
             if a.get("role") == "stock-data" and names & others and names - others:
-                steps.insert(2, "Achtung: Der Stock-Verband %s (%s) verliert damit eine Platte und ist danach "
-                                "unvollständig" % (a.get("level"), a["uuid"][:8]))
-        phrase = "LÖSCHEN %s" % disk["name"]
+                steps.insert(2, "Achtung: Der Stock-Verband %s (%s) verliert damit eine Disk und ist danach "
+                                "incomplete" % (a.get("level"), a["uuid"][:8]))
+        phrase = "DELETE %s" % disk["name"]
     elif m == "D":
         b = next((x for x in info["backups"] if x["name"] == req.get("backup")), None)
         if not b:
-            problems.append("Keine Stock-Sicherung auf dem Stick gewählt.")
+            problems.append("No stock backup on the stick selected.")
             return steps, problems, None
         if not b["stock"]:
-            problems.append("%s ist keine abgeschlossene Installations-Sicherung; der Stock-Zustand steht in der "
-                            "install-*-Sicherung mit device.env." % b["name"])
+            problems.append("%s is not a completed installation backup; the stock state is in the "
+                            "install-* backup with device.env." % b["name"])
         # two whole sentences, so the EN/FR catalogs can translate each (i18n.js patterns)
-        steps = [("Prüfsummen der Sicherung %s prüfen (%d Dateien, beim Anlegen zurückgelesen)" if b["verified"]
-                  else "Prüfsummen der Sicherung %s prüfen (%d Dateien)") % (b["name"], b["files"]),
-                 "Marker UNTRASH/ROLLBACK auf den Stick schreiben und neu starten",
-                 "Die NAS startet einmal die Stock-Firmware; diese schreibt Env und kernel%s aus der Sicherung "
-                 "zurück und schaltet aus (Stick stecken lassen)" % b["device"].get("LOADER_SLOT", "?"),
-                 "Danach einschalten: Stock-Firmware wie vor der Installation; Daten auf den Platten bleiben, "
-                 "UntrashOS-Dateien in /.untrash bzw. die UntrashOS-Platte bleiben liegen",
-                 "Bestätigung an der NAS: COPY-Taste drücken"]
+        steps = [("Check the checksums of backup %s (%d files, read back when it was made)" if b["verified"]
+                  else "Check the checksums of backup %s (%d files)") % (b["name"], b["files"]),
+                 "Write the marker UNTRASH/ROLLBACK to the stick and restart",
+                 "Die NAS startet einmal die Stock-Firmware; diese schreibt Env und kernel%s off der Backup "
+                 "zurück und schaltet off (Stick stecken lassen)" % b["device"].get("LOADER_SLOT", "?"),
+                 "Danach einschalten: Stock-Firmware wie vor der Installation; Daten auf den Disks bleiben, "
+                 "UntrashOS-Files in /.untrash bzw. die UntrashOS-Disk bleiben liegen",
+                 "Confirm at the NAS: press the COPY button"]
         phrase = "STOCK"
     elif m in ("B", "C"):
         vols, volume_error = stock_volumes()
         info["volumes"] = vols
         slot = info["slot"] or {}
         if not vols:
-            problems.append("Kein Stock-Volume gefunden.")
+            problems.append("No stock volume found.")
             if volume_error:
                 problems.append(volume_error)
             return steps, problems, None
@@ -825,48 +825,48 @@ def plan(req, info):
         # error, never silently another volume
         vol = next((v for v in vols if v["key"] == req.get("volume")), None if req.get("volume") else vols[0])
         if not vol:
-            problems.append("Das gewählte Volume ist nicht mehr vorhanden; bitte neu wählen.")
+            problems.append("The selected volume no longer exists; please choose again.")
             return steps, problems, None
         req["volume"] = vol["key"]
         if not info["stick"]:
-            problems.append("Kein UntrashOS-Stick gefunden (Sicherung der Plattenmetadaten nötig).")
+            problems.append("No UntrashOS stick found (needed for the disk metadata backup).")
         if "utslot" not in slot:
-            problems.append("Auf dem Stick fehlt UNTRASH/system/slot.utslot (Systemabbild für Wege B/C).")
+            problems.append("UNTRASH/system/slot.utslot (system image for ways B/C) is missing on the stick.")
         if vol["free"] < need_bytes(slot, vol):
-            problems.append("Auf „%s“ sind nur %.1f GB frei, nötig sind %.1f GB." % (
+            problems.append("Only %2 GB free on “%1”, %3 GB needed." % (
                 vol["name"], vol["free"] / 1e9, need_bytes(slot, vol) / 1e9))
         if m == "B" and not info["stock_config"]:
-            problems.append("Stock-Konfiguration fehlt auf dem Stick (UNTRASH/*/etc-zyxel).")
+            problems.append("Stock configuration missing on the stick (UNTRASH/*/etc-zyxel).")
         if vol["degraded"]:
-            problems.append("Der Verband von „%s“ ist unvollständig (%d Platte(n) gefunden); erst alle Platten "
-                            "einsetzen – der Loader schreibt auf unvollständige Verbände nie." % (
+            problems.append("The array of “%s” is incomplete (%d disk(s) found); insert all disks first "
+                            "– the loader never writes to incomplete arrays." % (
                                 vol["name"], len(vol["members"])))
         if any(d["kind"] == "untrash" for d in info["disks"]):
-            problems.append("Eine Platte trägt UntrashOS-Partitionen (Weg A); der Loader startet diese vor "
-                            "/.untrash. Diese Platte zuerst entfernen.")
+            problems.append("A disk carries UntrashOS partitions (way A); the loader starts these before "
+                            "/.untrash. Remove this disk first.")
         if any(v["untrash"] for v in vols if v["key"] != vol["key"]):
-            problems.append("Ein anderes Volume trägt schon UntrashOS (/.untrash); der Loader nähme das erste.")
-        steps = ["Partitionstabellen und RAID/LVM-Metadaten der Platten von „%s“ auf den Stick sichern" % vol["name"],
-                 "Volume „%s“ (%s, %s) beschreibbar einbinden; keine Partition und kein Verband wird verändert" % (
+            problems.append("Another volume already carries UntrashOS (/.untrash); the loader would take the first.")
+        steps = ["Back up the partition tables and RAID/LVM metadata of the disks of “%s” to the stick" % vol["name"],
+                 "Mount volume “%s” (%s, %s) writable; no partition and no array is changed" % (
                      vol["name"], vol["kind"], vol["level"]),
-                 "Systemabbild %s zweimal als /.untrash/slot-a/b.utslot ablegen und zurücklesen (%.1f GB)" % (
+                 "Store system image %s twice as /.untrash/slot-a/b.utslot and read it back (%.1f GB)" % (
                      slot.get("version", "?"), 2 * slot.get("size", 0) / 1e9),
-                 "Zustand (/.untrash/state.img, 4 GiB) und Auslagerung (/.untrash/swap.img, 1 GiB) anlegen"
-                 + (" – vorhandener Zustand bleibt" if vol["untrash"] else ""),
-                 "Boot-Zähler /.untrash/bootstate schreiben, Marker UNTRASH/INSTALL vom Stick entfernen"]
+                 "Create the state (/.untrash/state.img, 4 GiB) and swap (/.untrash/swap.img, 1 GiB)"
+                 + (" – vorhandener Zustand stays" if vol["untrash"] else ""),
+                 "Write the boot counter /.untrash/bootstate, remove the marker UNTRASH/INSTALL from the stick"]
         if m == "B":
-            steps.append("Stock-Konfiguration nach /.untrash/stock-config; beim ersten Start übernimmt UntrashOS "
-                         "Benutzer, Gruppen, Freigaben und SMB-Passwörter")
+            steps.append("Stock configuration to /.untrash/stock-config; on the first start UntrashOS takes over "
+                         "users, groups, shares and SMB passwords")
         else:
             shares = new_shares(vol)
-            steps.append("Neue Konfiguration: Benutzer admin mit dem Passwort von unten (SMB, SSH), Name im Netz "
-                         "wie unten, %d Freigabe(n) für admin (lesen/schreiben): %s" % (
-                             len(shares), ", ".join(n for n, _p in shares) or "keine"))
-            steps.append("Die alten Stock-Benutzer und -Rechte werden nicht übernommen")
-        steps.append("Bestätigung an der NAS: COPY-Taste drücken")
-        phrase = "BEHALTEN"
+            steps.append("New configuration: user admin with the password below (SMB, SSH), network name "
+                         "as below, %d share(s) for admin (read/write): %s" % (
+                             len(shares), ", ".join(n for n, _p in shares) or "none"))
+            steps.append("The old stock users and rights are not taken over")
+        steps.append("Confirm at the NAS: press the COPY button")
+        phrase = "KEEP"
     else:
-        problems.append("Unbekannter Weg.")
+        problems.append("Unknown way.")
         phrase = None
     return steps, problems, phrase
 
@@ -879,10 +879,10 @@ def start(req):
     if problems:
         return 409, {"problems": problems}
     if req.get("phrase", "").strip() != phrase:
-        return 403, {"problems": ["Bestätigungstext stimmt nicht (erwartet: %s)." % phrase]}
+        return 403, {"problems": ["Confirmation text does not match (expected: %s)." % phrase]}
     with JOB.lock:
         if JOB.state in ("waiting-copy", "running"):
-            return 409, {"problems": ["Es läuft bereits ein Vorgang."]}
+            return 409, {"problems": ["An operation is already running."]}
         JOB.state, JOB.mode, JOB.log = "waiting-copy", req["mode"], []
         JOB.copy_deadline = time.time() + COPY_WAIT
 
@@ -890,18 +890,18 @@ def start(req):
         mode = MODES[req["mode"]]
         JOB.add("Weg %s: %s%s" % (req["mode"], mode["title"], " (PROBELAUF)" if DRYRUN else ""))
         if mode.get("copy"):
-            JOB.add("Warte auf die COPY-Taste an der NAS (%d s) ..." % COPY_WAIT)
+            JOB.add("Waiting for the COPY button at the NAS (%d s) ..." % COPY_WAIT)
             if not wait_copy_key():
-                JOB.add("Keine COPY-Taste: abgebrochen, nichts verändert.")
+                JOB.add("No COPY button: cancelled, nothing changed.")
                 JOB.state = "failed"
                 return
-            JOB.add("COPY-Taste erkannt.")
+            JOB.add("COPY button detected.")
         JOB.state = "running"
         try:
             mode["fn"](req, info)
             JOB.state = "done"
         except Exception as e:  # report, never retry automatically
-            JOB.add("FEHLER: %s" % e)
+            JOB.add("ERROR: %s" % e)
             JOB.state = "failed"
     threading.Thread(target=worker, daemon=True).start()
     return 202, {"ok": True}
@@ -909,9 +909,9 @@ def start(req):
 
 # ---------------------------------------------------------------------- web
 
-PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UntrashOS einrichten</title>
+<title>Set up UntrashOS</title>
 <link rel="icon" href="ut/assets/favicon.ico"><link rel="stylesheet" href="ut/untrash.css">
 <script src="ut/i18n/i18n.js"></script>
 <style>
@@ -927,65 +927,65 @@ body{margin:0;background:#0d1115;color:#e9eef2;font:15px/1.5 system-ui,sans-seri
 details summary{cursor:pointer;color:var(--ut-fg-2);margin-top:10px}
 </style></head><body class="ut"><div class="ut-page">
 <header class="ut-page__head"><span class="ut-brand"><img src="ut/assets/logo-mark-96.png" alt=""><b>Untrash<span>OS</span></b></span>
-<span class="ut-faint" id="sub">Zyxel NAS542 · Erstkonfiguration</span>
-<a href="manual/" target="_blank" rel="noopener" style="margin-left:auto">Bedienungsanleitung</a>
-<select class="ut-select" id="lang" translate="no" style="width:auto;margin-left:12px" aria-label="Sprache"><option value="de">Deutsch</option><option value="en">English</option><option value="fr">Français</option></select></header>
+<span class="ut-faint" id="sub">Zyxel NAS542 · first setup</span>
+<a href="manual/" target="_blank" rel="noopener" style="margin-left:auto">User guide</a>
+<select class="ut-select" id="lang" translate="no" style="width:auto;margin-left:12px" aria-label="Language"><option value="en">English</option><option value="de">Deutsch</option><option value="fr">Français</option></select></header>
 <main class="ut-page__main">
-<h1>UntrashOS einrichten</h1>
-<p class="ut-muted">Bestehende Daten bleiben unangetastet, solange Sie nicht ausdrücklich Weg A wählen. Jeder Weg wird zusätzlich an der NAS mit der COPY-Taste bestätigt.</p>
+<h1>Set up UntrashOS</h1>
+<p class="ut-muted">Existing data stays untouched unless you explicitly choose way A. Every way is also confirmed at the NAS with the COPY button.</p>
 <div id="dry"></div>
-<div class="ut-section-title">Gefunden</div><div class="ut-card" id="found"><span class="ut-spinner"></span> Suche …</div>
-<div class="ut-section-title">Was soll passieren?</div><div id="ways"></div>
+<div class="ut-section-title">Found</div><div class="ut-card" id="found"><span class="ut-spinner"></span> Searching …</div>
+<div class="ut-section-title">What should happen?</div><div id="ways"></div>
 <div class="ut-card" id="detail" hidden style="margin-top:12px"></div>
-<div class="ut-section-title">Ablauf</div><div class="ut-card"><div class="statebar"><span class="ut-pill" id="pill">bereit</span><span id="state" class="ut-muted">Kein Vorgang.</span></div><pre class="ut-log" id="log" translate="no" hidden></pre><div class=confirm id=after hidden><button class="ut-btn ut-btn--primary" onclick="reboot()">Neu starten</button></div></div>
+<div class="ut-section-title">Progress</div><div class="ut-card"><div class="statebar"><span class="ut-pill" id="pill">ready</span><span id="state" class="ut-muted">No operation.</span></div><pre class="ut-log" id="log" translate="no" hidden></pre><div class=confirm id=after hidden><button class="ut-btn ut-btn--primary" onclick="reboot()">Restart</button></div></div>
 </main></div><script>
 const $=s=>document.querySelector(s);let INFO=null;
 UTI18N.ready.then(()=>{const l=$('#lang');l.value=UTI18N.lang;l.onchange=()=>UTI18N.set(l.value);});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const gb=b=>(b/1e9).toFixed(b>1e11?0:1)+' GB';
-const KIND={untrash:'UntrashOS',stock:'Zyxel-Stock',empty:'leer',raid:'RAID-Mitglied',foreign:'unbekannt'};
+const KIND={untrash:'UntrashOS',stock:'Zyxel-Stock',empty:'empty',raid:'RAID member',foreign:'unknown'};
 const KPILL={untrash:'ok',stock:'info',empty:'',raid:'info',foreign:'warn'};
 async function load(){INFO=await (await fetch('api/scan')).json();render()}
 function render(){const i=INFO;let h='<div class=found-meta>';
- h+=i.stick?`<span class="ut-pill ut-pill--ok">Stick: ${esc(i.stick.model)} · ${gb(i.stick.size)}</span>`+(i.slot?`<span class="ut-pill ut-pill--ok">Systemabbild ${esc(i.slot.version)}</span>`:'<span class="ut-pill ut-pill--danger">Systemabbild fehlt</span>')+(i.backups.some(b=>b.stock&&b.verified)?'<span class="ut-pill ut-pill--ok">Stock-Sicherung vorhanden, geprüft</span>':(i.backups.some(b=>b.stock)?'<span class="ut-pill ut-pill--warn">Stock-Sicherung vorhanden (ungeprüft)</span>':'<span class="ut-pill ut-pill--danger">Keine Stock-Sicherung</span>')):'<span class="ut-pill ut-pill--danger">Kein UntrashOS-Stick gefunden</span>';
- if(i.stock_config)h+='<span class="ut-pill ut-pill--info">Stock-Konfiguration auf dem Stick</span>';
- h+='</div><div class=ut-table-wrap><table class=ut-table><thead><tr><th>Platte</th><th class=num>Größe</th><th>Modell</th><th>Inhalt</th></tr></thead><tbody>';
- for(const d of i.disks)h+=`<tr><td>${esc(d.name)}${d.system?' <span class=ut-faint>(läuft gerade)</span>':''}</td><td class=num>${gb(d.size)}</td><td>${esc(d.model)}</td><td><span class="ut-pill ${KPILL[d.kind]?'ut-pill--'+KPILL[d.kind]:''}">${KIND[d.kind]||esc(d.kind)}</span></td></tr>`;
+ h+=i.stick?`<span class="ut-pill ut-pill--ok">Stick: ${esc(i.stick.model)} · ${gb(i.stick.size)}</span>`+(i.slot?`<span class="ut-pill ut-pill--ok">System image ${esc(i.slot.version)}</span>`:'<span class="ut-pill ut-pill--danger">System image missing</span>')+(i.backups.some(b=>b.stock&&b.verified)?'<span class="ut-pill ut-pill--ok">Stock backup present, checked</span>':(i.backups.some(b=>b.stock)?'<span class="ut-pill ut-pill--warn">Stock backup present (not checked)</span>':'<span class="ut-pill ut-pill--danger">No stock backup</span>')):'<span class="ut-pill ut-pill--danger">No UntrashOS stick found</span>';
+ if(i.stock_config)h+='<span class="ut-pill ut-pill--info">Stock configuration on the stick</span>';
+ h+='</div><div class=ut-table-wrap><table class=ut-table><thead><tr><th>Disk</th><th class=num>Size</th><th>Model</th><th>Contents</th></tr></thead><tbody>';
+ for(const d of i.disks)h+=`<tr><td>${esc(d.name)}${d.system?' <span class=ut-faint>(currently running)</span>':''}</td><td class=num>${gb(d.size)}</td><td>${esc(d.model)}</td><td><span class="ut-pill ${KPILL[d.kind]?'ut-pill--'+KPILL[d.kind]:''}">${KIND[d.kind]||esc(d.kind)}</span></td></tr>`;
  h+='</tbody></table></div>';const vols=i.stock_arrays.filter(a=>a.role==='stock-data');
- if(vols.length)h+=`<p class=ut-muted style="margin:10px 0 0">Stock-Datenverbände: ${vols.map(a=>esc(a.level)+' ('+a.members.length+' Platte(n))').join(', ')}</p>`;
+ if(vols.length)h+=`<p class=ut-muted style="margin:10px 0 0">Stock data arrays: ${vols.map(a=>esc(a.level)+' ('+a.members.length+' disk(s))').join(', ')}</p>`;
  $('#found').innerHTML=h;
- const W={B:['Behalten und übernehmen','Neuinstallation ohne Löschen: alte Einstellungen, Benutzer und Freigaben übernehmen.'],
-  C:['Behalten, neu einrichten','Neuinstallation ohne Löschen: Daten bleiben, neue Benutzer und Einstellungen.'],
-  A:['Platte löschen und neu installieren','Die gewählte Platte wird vollständig gelöscht.'],
-  D:['Zurück zur Stock-Firmware','Den gesicherten Zustand vor der Installation zurückschreiben (nur Stick und Browser).']};
+ const W={B:['Keep and take over','Reinstall without erasing: take over the old settings, users and shares.'],
+  C:['Keep, set up anew','Reinstall without erasing: data stays, new users and settings.'],
+  A:['Erase the disk and reinstall','The selected disk will be erased completely.'],
+  D:['Back to the stock firmware','Write back the state saved before the installation (stick and browser only).']};
  $('#ways').innerHTML=Object.entries(W).map(([k,t])=>`<label class="ut-choice${k==='A'?' ut-choice--danger':''}"><span class=ut-choice__key>${k}</span><input type=radio name=way value=${k} hidden><span><b>${t[0]}</b><small>${t[1]}</small></span></label>`).join('');
  document.querySelectorAll('input[name=way]').forEach(r=>r.onchange=()=>detail(r.value));}
 async function detail(m,extra={}){const box=$('#detail');box.hidden=false;let sel='';
- if(m==='A')sel=`<div class=ut-field><label for=disk>Platte</label><select class=ut-select id=disk>${INFO.disks.map(d=>`<option value="${esc(d.name)}">${esc(d.name)} – ${gb(d.size)} ${esc(d.model)} (${KIND[d.kind]})</option>`).join('')}</select></div>`;
- if(m==='C')sel=`<div class=ut-field><label for=netname>Name im Netz</label><input class=ut-input id=netname value="untrash" maxlength=15 autocomplete=off></div><div class=ut-field><label for=pw1>Neues Passwort für admin (mind. 8 Zeichen)</label><input class=ut-input type=password id=pw1 autocomplete=new-password></div><div class=ut-field><label for=pw2>Passwort wiederholen</label><input class=ut-input type=password id=pw2 autocomplete=new-password></div>`;
- if(m==='D')sel=`<div class=ut-field><label for=backup>Sicherung</label><select class=ut-select id=backup>${INFO.backups.filter(b=>b.stock).reverse().map(b=>`<option>${esc(b.name)}</option>`).join('')}</select></div>`;
+ if(m==='A')sel=`<div class=ut-field><label for=disk>Disk</label><select class=ut-select id=disk>${INFO.disks.map(d=>`<option value="${esc(d.name)}">${esc(d.name)} – ${gb(d.size)} ${esc(d.model)} (${KIND[d.kind]})</option>`).join('')}</select></div>`;
+ if(m==='C')sel=`<div class=ut-field><label for=netname>Network name</label><input class=ut-input id=netname value="untrash" maxlength=15 autocomplete=off></div><div class=ut-field><label for=pw1>New password for admin (at least 8 characters)</label><input class=ut-input type=password id=pw1 autocomplete=new-password></div><div class=ut-field><label for=pw2>Repeat password</label><input class=ut-input type=password id=pw2 autocomplete=new-password></div>`;
+ if(m==='D')sel=`<div class=ut-field><label for=backup>Backup</label><select class=ut-select id=backup>${INFO.backups.filter(b=>b.stock).reverse().map(b=>`<option>${esc(b.name)}</option>`).join('')}</select></div>`;
  box.innerHTML='<div class=ut-card__head><h3>Weg '+m+'</h3></div>'+sel+'<div id=planout class=ut-muted><span class=ut-spinner></span></div>';
  const upd=async()=>{const req={mode:m,disk:$('#disk')?.value,backup:$('#backup')?.value};
   if($('#volume'))req.volume=$('#volume').value;
   const p=await (await fetch('api/plan',{method:'POST',body:JSON.stringify(req)})).json();
   if(p.volumes&&p.volumes.length&&!$('#volume')){const v=document.createElement('div');v.className='ut-field';
-   v.innerHTML='<label for=volume>Volume</label><select class=ut-select id=volume>'+p.volumes.map(x=>`<option value="${esc(x.key)}">${esc(x.name)} – ${gb(x.free)} frei${x.sysvol?' (Systemvolume)':''}${x.untrash?' · UntrashOS vorhanden':''}</option>`).join('')+'</select>';
+   v.innerHTML='<label for=volume>Volume</label><select class=ut-select id=volume>'+p.volumes.map(x=>`<option value="${esc(x.key)}">${esc(x.name)} – ${gb(x.free)} free${x.sysvol?' (system volume)':''}${x.untrash?' · UntrashOS present':''}</option>`).join('')+'</select>';
    box.insertBefore(v,$('#planout'));}
   let h='<ol class=ut-steps>'+p.steps.map(s=>`<li>${esc(s)}</li>`).join('')+'</ol>';
   if(p.problems.length)h+=p.problems.map(x=>`<div class="ut-callout ut-callout--danger" style="margin-top:8px">${esc(x)}</div>`).join('');
-  else if(p.phrase)h+=`<div class="ut-callout ${m==='A'?'ut-callout--danger':'ut-callout--warn'}" style="margin-top:8px"><div>Zum Bestätigen eintippen: <b translate=no>${esc(p.phrase)}</b></div></div><div class=confirm><input class=ut-input type=text id=phrase autocomplete=off translate=no placeholder="${esc(p.phrase)}"><button class="ut-btn ${m==='A'?'ut-btn--danger':'ut-btn--primary'}" id=go>Starten</button></div>`;
-  if(m==='B'&&INFO.import_plan)h+=`<details><summary>Stock-Konfiguration</summary><pre class=ut-log>${esc(INFO.import_plan)}</pre></details>`;
+  else if(p.phrase)h+=`<div class="ut-callout ${m==='A'?'ut-callout--danger':'ut-callout--warn'}" style="margin-top:8px"><div>Type to confirm: <b translate=no>${esc(p.phrase)}</b></div></div><div class=confirm><input class=ut-input type=text id=phrase autocomplete=off translate=no placeholder="${esc(p.phrase)}"><button class="ut-btn ${m==='A'?'ut-btn--danger':'ut-btn--primary'}" id=go>Start</button></div>`;
+  if(m==='B'&&INFO.import_plan)h+=`<details><summary>Stock configuration</summary><pre class=ut-log>${esc(INFO.import_plan)}</pre></details>`;
   $('#planout').innerHTML=h;const go=$('#go');if(go)go.onclick=async()=>{req.phrase=$('#phrase').value;
    if(m==='C'){req.netname=$('#netname').value;req.password=$('#pw1').value;req.password2=$('#pw2').value;}
    req.lang=UTI18N.lang;
    const r=await fetch('api/start',{method:'POST',body:JSON.stringify(req)});const j=await r.json();if(!r.ok)alert((j.problems||[]).map(UTI18N.tr).join('\\n'));};};
  box.onchange=e=>{if(!e.target.matches('input[type=password],#netname,#phrase'))upd();};upd();}
-async function reboot(){if(!confirm('NAS jetzt neu starten?'))return;await fetch('api/reboot',{method:'POST',body:'{}'});
- $('#state').textContent='Neustart läuft – die NAS startet jetzt das installierte System.';}
+async function reboot(){if(!confirm('Restart the NAS now?'))return;await fetch('api/reboot',{method:'POST',body:'{}'});
+ $('#state').textContent='Restarting – the NAS now starts the installed system.';}
 async function poll(){try{const j=await (await fetch('api/job')).json();
- $('#dry').innerHTML=j.dryrun?'<div class="ut-callout ut-callout--warn" style="margin-bottom:12px"><div><b>Probelauf:</b> Befehle werden nur angezeigt, nicht ausgeführt.</div></div>':'';
- const T={idle:'Kein Vorgang.','waiting-copy':`Jetzt die COPY-Taste an der NAS drücken (noch ${j.copy_left} s).`,running:'Läuft …',done:'Fertig.',failed:'Abgebrochen – siehe Protokoll.'};
- const P={idle:['','bereit'],'waiting-copy':['warn ut-pill--live','COPY-Taste'],running:['info ut-pill--live','läuft'],done:['ok','fertig'],failed:['danger','Fehler']}[j.state]||['',j.state];
+ $('#dry').innerHTML=j.dryrun?'<div class="ut-callout ut-callout--warn" style="margin-bottom:12px"><div><b>Dry run:</b> Commands are only shown, not run.</div></div>':'';
+ const T={idle:'No operation.','waiting-copy':`Now press the COPY button at the NAS (still ${j.copy_left} s).`,running:'Running …',done:'Done.',failed:'Cancelled – see the log.'};
+ const P={idle:['','ready'],'waiting-copy':['warn ut-pill--live','COPY button'],running:['info ut-pill--live','running'],done:['ok','done'],failed:['danger','Error']}[j.state]||['',j.state];
  $('#pill').className='ut-pill'+(P[0]?' ut-pill--'+P[0]:'');$('#pill').textContent=P[1];
  $('#state').textContent=(j.mode?'Weg '+j.mode+': ':'')+T[j.state];$('#log').hidden=!j.log.length;
  // log lines "HH:MM:SS text": messages are translated whole, commands ("$ ...", output) never
@@ -1064,13 +1064,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/reboot":
             with JOB.lock:
                 if JOB.state in ("waiting-copy", "running"):
-                    return self.reply(409, {"problems": ["Es läuft noch ein Vorgang."]})
+                    return self.reply(409, {"problems": ["An operation is still running."]})
             if DRYRUN or TEST:
-                return self.reply(409, {"problems": ["Probelauf: kein Neustart."]})
+                return self.reply(409, {"problems": ["Dry run: no restart."]})
             threading.Timer(1.0, lambda: subprocess.run(["systemctl", "reboot"])).start()
             return self.reply(202, {"ok": True})
         if req.get("mode") not in MODES:
-            return self.reply(400, {"problems": ["Unbekannter Weg."]})
+            return self.reply(400, {"problems": ["Unknown way."]})
         if self.path == "/api/plan":
             info = scan()
             steps, problems, phrase = plan(req, info)

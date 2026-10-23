@@ -451,10 +451,10 @@ def main():
                   and "geheim-12345" not in json.dumps(a.req("/api/iscsi")[1]))
             a.req("/api/iscsi/targets", {"targets": [{"name": "t1", "iqn": iqn, "luns": ["l1"], "chap": True, "chap_user": "u"}]})
             check("iscsi: empty password keeps the secret", json.load(open(r + "/etc/untrash/iscsi-secrets.json"))[iqn]["password"] == "geheim-12345")
-            check("iscsi: LUN in a target cannot be deleted", a.req("/api/iscsi/lun-delete", {"name": "l1", "confirm": "LÖSCHEN"})[0] == 400)
+            check("iscsi: LUN in a target cannot be deleted", a.req("/api/iscsi/lun-delete", {"name": "l1", "confirm": "DELETE"})[0] == 400)
             a.req("/api/iscsi/targets", {"targets": []})
-            check("iscsi: LUN delete needs LÖSCHEN, then gone", a.req("/api/iscsi/lun-delete", {"name": "l1"})[0] == 400 and
-                  a.req("/api/iscsi/lun-delete", {"name": "l1", "confirm": "LÖSCHEN"})[0] == 200 and not os.path.exists(r + "/i-data/aaaa0001/.iscsi_Lun/l1"))
+            check("iscsi: LUN delete needs DELETE, then gone", a.req("/api/iscsi/lun-delete", {"name": "l1"})[0] == 400 and
+                  a.req("/api/iscsi/lun-delete", {"name": "l1", "confirm": "DELETE"})[0] == 200 and not os.path.exists(r + "/i-data/aaaa0001/.iscsi_Lun/l1"))
             # power: power-loss mode, WoL, schedule
             check("power: bad mode refused", a.req("/api/settings", {"power": {"pwron": "maybe"}})[0] == 400)
             check("power: bad time refused", a.req("/api/settings", {"power": {"schedule": [{"action": "on", "kind": "daily", "hour": 25}]}})[0] == 400)
@@ -474,7 +474,7 @@ def main():
             check("raid status + idle job", st == 200 and rj["arrays"][0]["md"] == "md2" and rj["free"] == ["disk3", "disk4"]
                   and rj["job"]["state"] == "idle")
             check("unknown raid op refused", a.req("/api/raid/job", {"op": "format-all"})[0] == 400)
-            check("create needs FORMATIEREN", a.req("/api/raid/job", {"op": "create", "level": "basic", "disks": ["disk3"],
+            check("create needs FORMAT", a.req("/api/raid/job", {"op": "create", "level": "basic", "disks": ["disk3"],
                                                                        "name": "Neu", "confirm": "ja"})[0] == 400)
 
             def raid_wait():
@@ -485,15 +485,15 @@ def main():
                     time.sleep(0.1)
                 return j
             st, _ = a.req("/api/raid/job", {"op": "create", "level": "basic", "disks": ["disk3"], "name": "Neu",
-                                             "confirm": "FORMATIEREN"})
+                                             "confirm": "FORMAT"})
             j = raid_wait()
             jobs = open(r + "/storage-jobs.log").read()
             check("create job ran (args without confirm)", st == 200 and j["state"] == "done" and
-                  any("RESULT OK" in x for x in j["log"]) and '"disks": ["disk3"]' in jobs and "FORMATIEREN" not in jobs)
+                  any("RESULT OK" in x for x in j["log"]) and '"disks": ["disk3"]' in jobs and "FORMAT" not in jobs)
             check("expand without confirmation", a.req("/api/raid/job", {"op": "expand", "md": "md2"})[0] == 200
                   and raid_wait()["state"] == "done")
-            check("delete needs LÖSCHEN", a.req("/api/raid/job", {"op": "delete", "md": "md9", "confirm": "LOESCHEN"})[0] == 400)
-            a.req("/api/raid/job", {"op": "delete", "md": "md9", "confirm": "LÖSCHEN"})
+            check("delete needs DELETE", a.req("/api/raid/job", {"op": "delete", "md": "md9", "confirm": "LOESCHEN"})[0] == 400)
+            a.req("/api/raid/job", {"op": "delete", "md": "md9", "confirm": "DELETE"})
             check("failed job reported", raid_wait()["state"] == "failed")
             check("overview hides md0/md1", all(x["name"] not in ("md0", "md1") for x in a.req("/api/overview")[1]["arrays"]))
             # passwords

@@ -62,8 +62,8 @@ def main():
             tv.start(c["id"])
             early = False
         except T.Fail as e:
-            early = e.code == 503 and "vorbereitet" in str(e)
-        check("before the durations are read: 503 'wird vorbereitet'", early or c["id"] not in tv.prep)
+            early = e.code == 503 and "being prepared" in str(e)
+        check("before the durations are read: 503 'being prepared'", early or c["id"] not in tv.prep)
         ready(c)
         files = tv.files(c)
         check("folder expands to its videos, sorted, with durations",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Write design/i18n/{en,fr}.json from tools/i18n/catalog_*.py and report
-German UI texts (tools/i18n/extract.py) that have no translation yet.
+"""Write design/i18n/{de,fr}.json from tools/i18n/catalog_*.py and report
+English UI texts (tools/i18n/extract.py) that have no translation yet.
 
   build.py           write the catalogs, list missing texts, exit 1 if any
   build.py --check   only check (used by make test)
@@ -16,7 +16,7 @@ sys.path.insert(0, HERE)
 import extract  # noqa: E402
 
 OUT = extract.CAT
-LANGS = ("en", "fr")
+LANGS = ("de", "fr")
 
 
 def load():

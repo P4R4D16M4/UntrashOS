@@ -76,11 +76,11 @@ WEBDAV_PORT, WEBDAV_TLS_PORT = 5002, 5003            # stock httpd_dav.conf
 BOND_MODES = ("balance-rr", "active-backup", "balance-xor", "broadcast", "802.3ad", "balance-tlb", "balance-alb")
 WEEKDAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
 
-LANGUAGES = ("de", "en", "fr")
+LANGUAGES = ("en", "de", "fr")
 DEFAULTS = {
     "hostname": "untrash",
     "hostname_auto": True,     # default name: untrash-netname keeps the mDNS name (untrash-2, -3, ...)
-    "language": "de",          # Desk default; a browser may choose its own (i18n.js)
+    "language": "en",          # Desk default; a browser may choose its own (i18n.js)
     "netbios": {"name": "UNTRASH", "description": "UntrashOS", "workgroup": "WORKGROUP", "nomaster": False},
     "time": {"timezone": "Europe/Berlin", "ntp": True, "ntp_server": "pool.ntp.org"},
     "network": {"eth0": {"mode": "dhcp", "address": "", "gateway": "", "mtu": 1500},
