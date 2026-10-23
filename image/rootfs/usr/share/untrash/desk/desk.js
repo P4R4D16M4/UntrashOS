@@ -524,7 +524,7 @@ VIEWS.storage = async b => {
       ${a.progress ? `<div class="ut-progress" style="--v:${parseFloat(a.progress.percent)}%"><i></i></div><span class="ut-faint">${esc(a.progress.action)} ${esc(a.progress.percent)}${a.progress.finish ? ' · remaining ' + esc(a.progress.finish) : ''}</span>` : ''}
       <div class="ut-faint">Disks: ${a.members.map(m => esc(m.bay) + (m.state === 'spare' ? ' (spare)' : m.state === 'faulty' ? ' (faulty)' : '')).join(', ')}</div>
       ${a.volumes.map(v => { const used = v.size ? Math.round(100 * (v.size - v.free) / v.size) : 0; return `<div class="vol"><div><b>${esc(v.name)}</b> <span class="ut-faint mono">${esc(v.mnt.replace(/^.*\/i-data/, '/i-data'))}</span>${v.sysvol ? ' <span class="ut-pill ut-pill--plain">System</span>' : ''}</div>
-        ${v.mounted ? `<div class="ut-progress ${used > 90 ? 'ut-progress--danger' : ''}" style="--v:${used}%"><i></i></div><span class="ut-faint">${gb(v.size - v.free)} of ${gb(v.size)}</span>` : '<span class="ut-pill ut-pill--danger">not mounted</span>'}
+        ${v.mounted ? `<div class="ut-progress ${used > 90 ? 'ut-progress--danger' : ''}" style="--v:${used}%"><i></i></div><span class="ut-faint">${gb(v.size - v.free)} of ${gb(v.size)} used</span>` : '<span class="ut-pill ut-pill--danger">not mounted</span>'}
         <button class="ut-btn ut-btn--sm" data-ren="${i}:${esc(v.id)}">Rename</button></div>`; }).join('')}
       ${a.type === 'lvm' ? `<div class="ut-faint">Free in the disk group: ${gb(a.vg_free)}</div>` : ''}
       <div class="row" style="margin-top:6px">${busy ? '' : a.actions.map(x => `<button class="ut-btn ut-btn--sm${x === 'delete' || x === 'lv-delete' ? ' ut-btn--danger' : ''}" data-act="${i}:${x}">${esc(ACTLABEL[x] || x)}</button>`).join(' ')}</div></div>`; }).join('')
@@ -1064,7 +1064,7 @@ VIEWS.status = async b => {
         ${ring(100 * used / m.total, 100, 'RAM ' + size(used), '%', 80, 92)}${ring(L.board.temp_c, 80, 'Case' + (L.board.stale ? ' (old)' : ''), '°C', 55, 68)}</div>
       <div class="ut-section-title">Disks</div><div class="row" style="flex-wrap:wrap;gap:6px">${disks || '<span class="muted">none</span>'}</div>
       <div class="ut-section-title">Network</div>${net}
-      <p class="muted">Load ${L.load.join(' · ')} · Fan level ${L.board.level ?? '–'} · up for ${days ? days + ' d ' : ''}${hours % 24} h · swap ${size(m.swap_total - m.swap_free)} of ${size(m.swap_total)}</p>`;
+      <p class="muted">Load ${L.load.join(' · ')} · Fan level ${L.board.level ?? '–'} · up for ${days ? days + ' d ' : ''}${hours % 24} h · swap ${size(m.swap_total - m.swap_free)} / ${size(m.swap_total)}</p>`;
     if (main) main.innerHTML = html; else b.innerHTML = `<div class="ut-window__main ut-status">${html}</div>`;
   };
   await draw();

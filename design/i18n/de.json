@@ -19,6 +19,7 @@
 "%s is too small for %s.": "%s ist zu klein für %s.",
 "%s needs %d to %d disks.": "%s braucht %d bis %d Platten.",
 "%s needs at least %d disks.": "%s braucht mindestens %d Platten.",
+"%s of %s used": "%s von %s belegt",
 "%s read back: identical": "%s zurückgelesen: identisch",
 "%s was on: connect the account again under Cloud and create the job": "%s war an: unter Cloud das Konto neu verbinden und den Auftrag anlegen",
 "%s was on: left out of UntrashOS on purpose": "%s war an: in UntrashOS bewusst weggelassen",

@@ -15,6 +15,7 @@ T = {
     "%s is too small for %s.": ("%s ist zu klein für %s.", "%s est trop petit pour %s."),
     "%s needs %d to %d disks.": ("%s braucht %d bis %d Platten.", "%s nécessite de %d à %d disques."),
     "%s needs at least %d disks.": ("%s braucht mindestens %d Platten.", "%s nécessite au moins %d disques."),
+    "%s of %s used": ("%s von %s belegt", "%s sur %s utilisés"),
     "%s was on: connect the account again under Cloud and create the job": ("%s war an: unter Cloud das Konto neu verbinden und den Auftrag anlegen", "%s était actif : reconnectez le compte sous Cloud et créez la tâche"),
     "%s was on: left out of UntrashOS on purpose": ("%s war an: in UntrashOS bewusst weggelassen", "%s était actif : omis volontairement dans UntrashOS"),
     "At most %d disks.": ("Höchstens %d Platten.", "Au plus %d disques."),
