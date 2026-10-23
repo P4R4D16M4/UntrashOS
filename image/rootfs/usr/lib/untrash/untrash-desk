@@ -12,7 +12,7 @@ browser and can change their own password.  First start without users (way
 A): /api/setup sets the admin password and the name.
 Frontend: /usr/share/untrash/desk (index.html, desk.js), design /ut/.
 
-Test mode (ZT_DESK_TEST=1, os/image/tests/test-desk-host.py): system
+Test mode (ZT_DESK_TEST=1, image/tests/test-desk-host.py): system
 commands are only logged, all paths under ZT_DESK_ROOT.
 """
 import base64
@@ -1520,7 +1520,7 @@ def boot_env():
 
 
 def update_upload(handler, length):
-    """Body = a slot file (*.utslot, os/install/mk-stick-system.sh); stored,
+    """Body = a slot file (*.utslot, firmware install/mk-stick-system.sh); stored,
     signature + payload hashes checked by zt-loader's rules, written to the
     inactive slot, boot state prefers it once.  The loader falls back to the
     old slot if the new one never confirms itself (3 tries)."""

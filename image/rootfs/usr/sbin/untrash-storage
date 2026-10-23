@@ -29,7 +29,7 @@ Never touches: USB disks, disks with UntrashOS partitions (ut-*), the array
 holding the running system (/.untrash slot file boot), anything mounted that
 is not a volume of the array being changed.  One job at a time (lock file).
 
-Test environment (os/image/tests/test-storage-host.sh): ZT_STORAGE_DISKS
+Test environment (image/tests/test-storage-host.sh): ZT_STORAGE_DISKS
 "disk1=/dev/loop5,..." fixes the bays, ZT_STORAGE_MDNAMES / _MDFW / _MDSWAP
 the md names, ZT_STORAGE_IDATA, _STATE, _DB, _MAC, _RUN, ZT_STORAGE_NOSWAPON.
 """
@@ -47,7 +47,9 @@ import time
 import uuid as uuidlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "untrash", "pylib"))
-import untrash_bays  # noqa: E402
+if os.environ.get("ZT_BOARD_ROOTFS"):    # PC tests: the board's untrash_bays outside this tree
+    sys.path.append(os.path.join(os.environ["ZT_BOARD_ROOTFS"], "usr", "lib", "untrash", "pylib"))
+import untrash_bays  # noqa: E402  (board module, docs/board-interface.md)
 E = os.environ.get
 IDATA = E("ZT_STORAGE_IDATA", "/i-data")
 STATE_FILE = E("ZT_STORAGE_STATE", "/etc/untrash/zyxel/takeover.json")

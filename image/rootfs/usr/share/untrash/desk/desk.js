@@ -1,5 +1,5 @@
 /* Untrash Desk frontend (backend: /usr/lib/untrash/untrash-desk).
-   Window manager after os/design/desk.html; every value from the API is
+   Window manager after design/desk.html; every value from the API is
    escaped with esc() before it goes into HTML. */
 'use strict';
 const $ = (s, r = document) => r.querySelector(s);

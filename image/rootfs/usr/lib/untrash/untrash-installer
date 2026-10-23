@@ -42,7 +42,7 @@ IMPORT = os.environ.get("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
 KEY_PROG1 = 148          # NAS542 COPY button (gpio-keys-polled, DT label "copy")
 COPY_WAIT = 60
 BOOTSTATE = b"ZTBS1 pref=a a=3 b=3 good=- booting=-\n"
-LAYOUT = [  # sgdisk, os/loader/mkgpt.sh
+LAYOUT = [  # sgdisk, firmware loader/slot/mkgpt.sh
     ["-a", "2048", "-n", "1:0:+1G", "-t", "1:8300", "-c", "1:ut-sys-a",
      "-n", "2:0:+1G", "-t", "2:8300", "-c", "2:ut-sys-b",
      "-n", "3:0:+4G", "-t", "3:8300", "-c", "3:ut-state",
@@ -239,7 +239,7 @@ def import_plan(cfg):
 
 
 def slot_source(stick):
-    """System slot on the stick, UNTRASH/system/ (os/install/mk-stick-system.sh):
+    """System slot on the stick, UNTRASH/system/ (firmware install/mk-stick-system.sh):
     slot.utslot (head + trailer) or the older slot.head.gz + slot.trailer;
     slot.sha256 lines "<sha256> <name>", "<bytes> slot.head.length"."""
     if not stick:
@@ -460,7 +460,7 @@ def sha256_file(path):
 
 
 def do_stock_restore(req, info):
-    """Way D with stick + browser only (os/loader/zt-loader "way D"): check the
+    """Way D with stick + browser only (firmware loader/slot/zt-loader "way D"): check the
     install run's backup, set UNTRASH/ROLLBACK, reboot.  The loader leaves a
     RAM mark and resets, Barebox then starts the stock firmware, whose
     PartnerKey writes env + kernel<X> back from this backup and powers off."""
@@ -994,7 +994,7 @@ async function poll(){try{const j=await (await fetch('api/job')).json();
 load();poll();
 </script></body></html>"""
 
-# design system (os/design, copied to /usr/share/untrash/design by mkslot-erofs.sh)
+# design system (design, copied to /usr/share/untrash/design by mkslot-erofs.sh)
 DESIGN = os.environ.get("ZT_DESIGN_DIR") or next(
     (d for d in ("/usr/share/untrash/design",
                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../../design"))

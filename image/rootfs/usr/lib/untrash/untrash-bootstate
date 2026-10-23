@@ -1,5 +1,5 @@
 #!/bin/sh
-# UntrashOS boot state (same format as os/loader/zt-loader, GPT partition
+# UntrashOS boot state (same format as firmware loader/slot/zt-loader, GPT partition
 # ut-bootstate, first 512 bytes): "ZTBS1 pref= a= b= good= booting=".
 # Slot file boot: the file /.untrash/bootstate on the container.
 #   untrash-bootstate [show]     print the state

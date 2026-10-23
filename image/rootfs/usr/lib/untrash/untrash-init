@@ -19,7 +19,7 @@
 # Any failure in 1-4 falls back to a tmpfs under /state ("volatile"): the
 # system still boots and stays reachable, it just forgets its changes.
 # Messages go to /dev/kmsg (prefix UNTRASH-INIT:), so the blackbox sees them.
-# Slot FILE boot (os/loader/zt-slotinit.c ran first and left
+# Slot FILE boot (firmware loader/slot/zt-slotinit.c ran first and left
 # /run/untrash/boot.env, container at /run/untrash/host): state and swap are
 # files in /.untrash/ of the container (state.img = ext4 image on a loop
 # device, swap.img = swap file); without them (installer stick) the state is
@@ -121,7 +121,7 @@ if [ $ov_ok = 0 ] && [ $state_ok = 1 ]; then
 fi
 [ $state_ok = 1 ] && log "state PERSISTENT $STATE"
 
-# Stock MAC addresses (os/install/partnerkey: device.env of the install run;
+# Stock MAC addresses (firmware install/partnerkey: device.env of the install run;
 # the installer copies it to /.untrash/device.env (ways B/C) or block 1 of
 # ut-bootstate (way A); the installer stick reads it from the stick) ->
 # .link files, applied by udev when pfe registers eth0/eth1.  Without them
@@ -146,9 +146,12 @@ for n in 0 1; do
 	log "eth$n MAC from the stock env"
 done
 
-# PFE PE firmware from the NAS's own stock kernel (NAND kernel1), cached on
-# the state; must happen before udev loads pfe.ko (untrash-pfe-firmware)
-/usr/lib/untrash/untrash-pfe-firmware /state/firmware/pfe || log "no PFE firmware: no network"
+# board: network firmware before udev loads the drivers (NAS542: the PFE PE
+# firmware from the NAS's own stock kernel, cached on the state;
+# docs/board-interface.md)
+if [ -x /usr/lib/untrash/untrash-pfe-firmware ]; then
+	/usr/lib/untrash/untrash-pfe-firmware /state/firmware/pfe || log "no PFE firmware: no network"
+fi
 
 if [ -n "$DISK" ] && SWAP=$(part_dev ut-swap "$DISK"); then
 	if empty "$SWAP"; then

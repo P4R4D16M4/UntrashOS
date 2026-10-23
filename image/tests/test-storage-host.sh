@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PC test of untrash-storage (RAID/volume management in the stock format), as root:
 #   sudo test-storage-host.sh TOOLROOT
-# TOOLROOT: extracted Debian mdadm/lvm2/dmsetup debs (os/loader/tests/test-zt-blk-host.sh).
+# TOOLROOT: extracted Debian mdadm/lvm2/dmsetup debs (firmware loader/slot/tests/test-zt-blk-host.sh).
 # Four sparse loop disks are the bays.  Checks the stock layout (GPT p1/p2
 # sizes, md0/md1 RAID1 over 4 slots, metadata 1.2, chunk 64, ext4 flags and
 # stride, /i-data/<uuid8>, name_label, sysvol marker + links, default
