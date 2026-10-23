@@ -16,6 +16,10 @@
                        password settable at the Desk; 7 s = factory defaults
   untrash-config boot  (untrash-settings.service) defaults if there are no
                        settings yet (way A), then render
+  untrash-config netname
+                       (untrash-netname.service) with the default name, keep
+                       the mDNS name Avahi settled on: "untrash" taken by
+                       another device -> "untrash-2", "-3", ... from then on
 
 Settings (docs/architecture/stock-takeover.md section 8):
   hostname, netbios {name, description, workgroup, nomaster}
@@ -74,9 +78,10 @@ WEEKDAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
 
 LANGUAGES = ("de", "en", "fr")
 DEFAULTS = {
-    "hostname": "zyxel-untrash",
+    "hostname": "untrash",
+    "hostname_auto": True,     # default name: untrash-netname keeps the mDNS name (untrash-2, -3, ...)
     "language": "de",          # Desk default; a browser may choose its own (i18n.js)
-    "netbios": {"name": "ZYXEL-UNTRASH", "description": "UntrashOS", "workgroup": "WORKGROUP", "nomaster": False},
+    "netbios": {"name": "UNTRASH", "description": "UntrashOS", "workgroup": "WORKGROUP", "nomaster": False},
     "time": {"timezone": "Europe/Berlin", "ntp": True, "ntp_server": "pool.ntp.org"},
     "network": {"eth0": {"mode": "dhcp", "address": "", "gateway": "", "mtu": 1500},
                 "eth1": {"mode": "dhcp", "address": "", "gateway": "", "mtu": 1500},
@@ -216,6 +221,7 @@ def stock_to_settings(cfg):
     hn = g("system.hostname") or re.sub(r"[^a-z0-9-]", "-", (g("system.servername.servername") or "").lower()).strip("-")
     if hn and HOSTNAME_RE.match(hn):
         s["hostname"] = hn
+        s["hostname_auto"] = hn == DEFAULTS["hostname"]     # a name of its own is never changed
     s["netbios"] = {"name": g("system.servername.servername") or s["hostname"].upper(),
                     "description": g("system.servername.description") or "",
                     "workgroup": g("system.servername.workgroupname") or "WORKGROUP",
@@ -515,7 +521,7 @@ def share_paths(root=""):
 
 def render(s, root=""):
     out = []
-    hn = s["hostname"] if HOSTNAME_RE.match(s["hostname"]) else "zyxel-untrash"
+    hn = s["hostname"] if HOSTNAME_RE.match(s["hostname"]) else DEFAULTS["hostname"]
     w(root, "/etc/hostname", hn + "\n")
     w(root, "/etc/hosts", "127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n" % hn)
     out.append("hostname " + hn)
@@ -989,6 +995,52 @@ def cmd_apply(args):
         subprocess.run(["systemctl", "reload-or-restart", "smbd.service"], check=False)
 
 
+def avahi(method):
+    """One value of the Avahi server over D-Bus (busctl prints 'i 2', 's "name"')."""
+    r = subprocess.run([os.environ.get("ZT_BUSCTL", "busctl"), "call", "org.freedesktop.Avahi", "/",
+                        "org.freedesktop.Avahi.Server", method], capture_output=True, text=True)
+    if r.returncode:
+        return None
+    v = r.stdout.strip().split(" ", 1)[-1]
+    return v.strip('"') if v.startswith('"') else int(v) if v.lstrip("-").isdigit() else None
+
+
+def cmd_netname(args):
+    """Avahi renames on a conflict (untrash -> untrash-2) but only for this
+    boot; keeping its name makes every device stay at its address, whatever
+    order the devices start in.  Only the default name: a name the admin set
+    or the stock system had is never touched."""
+    s = load()
+    if not s.get("hostname_auto"):
+        return
+    wait = float(os.environ.get("ZT_NETNAME_WAIT", "90"))
+    t0, stable = time.time(), 0
+    while time.time() - t0 < wait:
+        stable = stable + 1 if avahi("GetState") == 2 else 0     # 2 = AVAHI_SERVER_RUNNING (probing done)
+        if stable >= 3:
+            break
+        time.sleep(float(os.environ.get("ZT_NETNAME_STEP", "2")))
+    else:
+        return
+    name = avahi("GetHostName")
+    if not isinstance(name, str) or not HOSTNAME_RE.match(name) or name.lower() == s["hostname"].lower():
+        return
+    _lock = config_lock()  # noqa: F841
+    s = load()
+    old = s["hostname"]
+    s["hostname"] = name
+    if s["netbios"]["name"].upper() == old.upper()[:15]:
+        s["netbios"]["name"] = name.upper()[:15]
+    save(s)
+    root = os.environ.get("ZT_RENDER_ROOT", "")      # PC tests: render into a directory, touch nothing else
+    for line in render(s, root):
+        log("render: " + line)
+    if not root:
+        subprocess.run(["hostname", name], check=False)
+        subprocess.run(["systemctl", "try-restart", "smbd.service", "nmbd.service"], check=False)
+    log("netname: %s was taken in the network, this NAS is now %s" % (old, name))
+
+
 def cmd_reset_network(args):
     """RESET button ~2 s (stock): network back to DHCP; untrash-desk then lets
     the admin password be set without login for 15 minutes."""
@@ -1112,6 +1164,8 @@ def main():
         cmd_factory_reset(a[1:])
     elif a[0] == "boot":
         cmd_boot(a[1:])
+    elif a[0] == "netname":
+        cmd_netname(a[1:])
     else:
         die(__doc__)
 

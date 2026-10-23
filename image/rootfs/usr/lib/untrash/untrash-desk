@@ -596,6 +596,8 @@ def settings_update(req):
     if "hostname" in req:
         if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?", req["hostname"]):
             raise Fail("Ungültiger Rechnername.")
+        if req["hostname"] != s["hostname"]:
+            s["hostname_auto"] = False      # the admin's name, untrash-netname leaves it alone
         s["hostname"] = req["hostname"]
     nb = req.get("netbios")
     if nb:
@@ -2363,7 +2365,7 @@ def setup(req):
     if initialized():
         raise Fail("Bereits eingerichtet.", 409)
     check_password(req.get("password", ""))
-    name = (req.get("name") or "zyxel-untrash").strip()
+    name = (req.get("name") or "untrash").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,14}", name):
         raise Fail("Name: bis 15 Zeichen, Buchstaben, Ziffern, Bindestrich.")
     c = db()

@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashOS: keep the network name Avahi chose (untrash, untrash-2, ...)
+# untrash-config netname: only while the NAS has the default name
+ConditionKernelCommandLine=!untrash.installer=1
+After=avahi-daemon.service untrash-settings.service
+Wants=avahi-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/untrash-config netname
+
+[Install]
+WantedBy=multi-user.target

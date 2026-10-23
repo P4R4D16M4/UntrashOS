@@ -1,6 +1,7 @@
 [Unit]
-Description=UntrashOS installer: network name zyxel-untrash (DHCP, mDNS)
-# installer-plan.md: the installer is reachable as zyxel-untrash(.local).
+Description=UntrashOS installer: network name untrash (DHCP, mDNS)
+# installer-plan.md: the installer is reachable as untrash(.local); with another
+# "untrash" in the network Avahi answers as untrash-2.local.
 # Kernel hostname only (the stick system keeps no state); set before the
 # network and Avahi start, so DHCP and mDNS announce this name.
 ConditionKernelCommandLine=untrash.installer=1
@@ -11,7 +12,7 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/hostname zyxel-untrash
+ExecStart=/usr/bin/hostname untrash
 
 [Install]
 WantedBy=sysinit.target

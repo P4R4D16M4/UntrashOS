@@ -197,11 +197,11 @@ const CONTENT = {
         <svg class="spark" viewBox="0 0 300 60" preserveAspectRatio="none"><defs><linearGradient id="sg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#19d6a6" stop-opacity=".35"/><stop offset="1" stop-color="#19d6a6" stop-opacity="0"/></linearGradient><linearGradient id="sl" x1="0" x2="1"><stop offset="0" stop-color="#6ff06b"/><stop offset="1" stop-color="#00bfd0"/></linearGradient></defs>
           <path id="spark-a" fill="url(#sg)"/><path id="spark-l" fill="none" stroke="url(#sl)" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></div>
     </div>`,
-  terminal: () => `<div class="ut-window__main" style="padding:0;background:#05080a"><pre class="ut-log" style="border:0;border-radius:0;max-height:none;height:100%;color:#cfe">admin@zyxel-untrash:~$ untrash status
+  terminal: () => `<div class="ut-window__main" style="padding:0;background:#05080a"><pre class="ut-log" style="border:0;border-radius:0;max-height:none;height:100%;color:#cfe">admin@untrash:~$ untrash status
 <span style="color:var(--ut-green)">●</span> System    Slot A · 1.0 · gut
 <span style="color:var(--ut-green)">●</span> Speicher  Volume 1 gesund · Altbestand nur lesen
 <span style="color:var(--ut-warn)">●</span> Backup    letzte Sicherung vor 3 Tagen
-admin@zyxel-untrash:~$ <span style="background:var(--ut-teal)"> </span></pre></div>`,
+admin@untrash:~$ <span style="background:var(--ut-teal)"> </span></pre></div>`,
 };
 setInterval(() => { /* fake sparkline */
   const l = $('#spark-l'); if (!l) return;

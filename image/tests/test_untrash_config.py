@@ -596,7 +596,7 @@ with tempfile.TemporaryDirectory() as W:
     check("reset 7 s: old configuration archived (0600), DB and keys gone, settings default", r.returncode == 0 and tars and
           os.stat(tars[0]).st_mode & 0o777 == 0o600 and "settings.json" in names and "zyxel/stock-config/ugs_conf.db" in names
           and not os.path.exists(fr + "/zyxel/stock-config/ugs_conf.db") and not os.path.exists(fr + "/tls")
-          and json.load(open(fr + "/settings.json"))["hostname"] == "zyxel-untrash")
+          and json.load(open(fr + "/settings.json"))["hostname"] == "untrash")
 
     # untrash-upnp against a simulated router
     st_file = os.path.join(W, "upnp-state.json")
@@ -614,6 +614,28 @@ with tempfile.TemporaryDirectory() as W:
     subprocess.run([UP, "apply"], env=uenv, stdout=subprocess.PIPE)
     st = json.loads(subprocess.run([UP, "status"], env=uenv, stdout=subprocess.PIPE, text=True).stdout)
     check("upnp: changed port remapped, removed service unmapped", {m["description"]: m["wan_port"] for m in st["mappings"] if m["ours"]} == {"UntrashOS HTTP": 8080})
+
+    # network name: default "untrash"; Avahi's conflict name is kept (untrash-2), a name of its own never changes
+    check("import: stock hostname is not automatic", s["hostname_auto"] is False)
+    nset = os.path.join(W, "net.json")
+    fb = os.path.join(W, "fake-busctl")
+    open(fb, "w").write("#!/bin/sh\ncase $5 in GetState) echo 'i 2' ;; GetHostName) echo 's \"'$ZT_FAKE_AVAHI'\"' ;; esac\n")
+    os.chmod(fb, 0o755)
+    nenv = dict(os.environ, ZT_SETTINGS=nset, ZT_BUSCTL=fb, ZT_RENDER_ROOT=os.path.join(W, "netroot"),
+                ZT_RUN_DIR=os.path.join(W, "netrun"), ZT_NETNAME_STEP="0", ZT_FAKE_AVAHI="untrash")
+    subprocess.run([sys.executable, CFG_TOOL, "netname"], env=nenv, check=True)
+    n = json.load(open(nset)) if os.path.exists(nset) else {}
+    check("netname: default untrash, no conflict -> nothing written", n == {})
+    json.dump({}, open(nset, "w"))
+    subprocess.run([sys.executable, CFG_TOOL, "netname"], env=dict(nenv, ZT_FAKE_AVAHI="untrash-2"), check=True)
+    n = json.load(open(nset))
+    check("netname: Avahi chose untrash-2 -> kept (hostname, NetBIOS, /etc/hostname)",
+          n["hostname"] == "untrash-2" and n["netbios"]["name"] == "UNTRASH-2" and n["hostname_auto"]
+          and open(os.path.join(W, "netroot/etc/hostname")).read() == "untrash-2\n")
+    n["hostname"], n["hostname_auto"] = "keller", False
+    json.dump(n, open(nset, "w"))
+    subprocess.run([sys.executable, CFG_TOOL, "netname"], env=dict(nenv, ZT_FAKE_AVAHI="keller-2"), check=True)
+    check("netname: the admin's name stays", json.load(open(nset))["hostname"] == "keller")
 
 print("FAILURES %d" % fails)
 sys.exit(1 if fails else 0)

@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """untrash-installer - first-time setup of UntrashOS in the browser.
 
-docs/architecture/installer-plan.md.  Serves http://zyxel-untrash/ (port 80,
+docs/architecture/installer-plan.md.  Serves http://untrash/ (port 80,
 or ZT_INSTALLER_PORT).  Four ways:
   A  new install, wipe the selected disk          (COPY key confirmation)
   B  keep the data, take over stock users/shares  (COPY key confirmation)
@@ -962,7 +962,7 @@ function render(){const i=INFO;let h='<div class=found-meta>';
  document.querySelectorAll('input[name=way]').forEach(r=>r.onchange=()=>detail(r.value));}
 async function detail(m,extra={}){const box=$('#detail');box.hidden=false;let sel='';
  if(m==='A')sel=`<div class=ut-field><label for=disk>Platte</label><select class=ut-select id=disk>${INFO.disks.map(d=>`<option value="${esc(d.name)}">${esc(d.name)} – ${gb(d.size)} ${esc(d.model)} (${KIND[d.kind]})</option>`).join('')}</select></div>`;
- if(m==='C')sel=`<div class=ut-field><label for=netname>Name im Netz</label><input class=ut-input id=netname value="zyxel-untrash" maxlength=15 autocomplete=off></div><div class=ut-field><label for=pw1>Neues Passwort für admin (mind. 8 Zeichen)</label><input class=ut-input type=password id=pw1 autocomplete=new-password></div><div class=ut-field><label for=pw2>Passwort wiederholen</label><input class=ut-input type=password id=pw2 autocomplete=new-password></div>`;
+ if(m==='C')sel=`<div class=ut-field><label for=netname>Name im Netz</label><input class=ut-input id=netname value="untrash" maxlength=15 autocomplete=off></div><div class=ut-field><label for=pw1>Neues Passwort für admin (mind. 8 Zeichen)</label><input class=ut-input type=password id=pw1 autocomplete=new-password></div><div class=ut-field><label for=pw2>Passwort wiederholen</label><input class=ut-input type=password id=pw2 autocomplete=new-password></div>`;
  if(m==='D')sel=`<div class=ut-field><label for=backup>Sicherung</label><select class=ut-select id=backup>${INFO.backups.filter(b=>b.stock).reverse().map(b=>`<option>${esc(b.name)}</option>`).join('')}</select></div>`;
  box.innerHTML='<div class=ut-card__head><h3>Weg '+m+'</h3></div>'+sel+'<div id=planout class=ut-muted><span class=ut-spinner></span></div>';
  const upd=async()=>{const req={mode:m,disk:$('#disk')?.value,backup:$('#backup')?.value};
