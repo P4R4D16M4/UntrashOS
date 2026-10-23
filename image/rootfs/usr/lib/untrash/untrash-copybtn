@@ -6,7 +6,7 @@ usbzync.table).
   untrash-copybtn             daemon: KEY_PROG1 released before 3 s = COPY,
                               held 3 s = SYNC (the COPY LED blinks while it runs,
                               red on error)
-  untrash-copybtn copy|sync   the same once (Untrash Desk "Jetzt ausführen")
+  untrash-copybtn copy|sync   the same once (Untrash Desk "Run now")
   untrash-copybtn status      JSON of the last run
 
 USB source: the partitions of the USB disk mounted last under /e-data; if one
@@ -111,11 +111,11 @@ def run(kind):
     res = {"kind": kind, "time": int(started), "ok": False, "log": []}
     srcs = usb_sources(kind)
     if not share or not os.path.isdir(share):
-        res["log"].append("Keine NAS-Freigabe für %s eingestellt (Desk: Einstellungen → COPY-Taste)." % kind.upper())
+        res["log"].append("No NAS share set for %s (Desk: Settings → COPY button)." % kind.upper())
     elif not srcs:
-        res["log"].append("Kein USB-Datenträger eingehängt.")
+        res["log"].append("No USB drive mounted.")
     elif c.get("bak_path") and not os.path.isdir(c["bak_path"]):
-        res["log"].append("Sicherungsordner %s fehlt." % c["bak_path"])
+        res["log"].append("Backup folder %s is missing." % c["bak_path"])
     else:
         os.umask(0)
         led("red", "off")
@@ -150,7 +150,7 @@ def run(kind):
                         open(os.path.join(work, re.sub(r"\W", "_", m + share)), "w").close()
                     rc |= r.returncode
         res["ok"] = rc == 0
-        res["log"].append("%s %s: %s" % (kind.upper(), ", ".join(m for _d, m in srcs), "fertig" if rc == 0 else "Fehler %d" % rc))
+        res["log"].append("%s %s: %s" % (kind.upper(), ", ".join(m for _d, m in srcs), "done" if rc == 0 else "error %d" % rc))
     res["seconds"] = int(time.time() - started)
     for line in res["log"]:
         log(line)
@@ -159,7 +159,7 @@ def run(kind):
     os.makedirs(os.path.dirname(STATUS), exist_ok=True)
     json.dump(res, open(STATUS, "w"))
     if not res["ok"]:
-        subprocess.run([NOTIFY, "alert", "COPY-Taste: %s fehlgeschlagen" % kind.upper(),
+        subprocess.run([NOTIFY, "alert", "COPY button: %s failed" % kind.upper(),
                         "\n".join(res["log"])], check=False)
     return 0 if res["ok"] else 1
 

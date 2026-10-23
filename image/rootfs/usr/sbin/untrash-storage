@@ -107,7 +107,7 @@ def run(cmd, check=True, input=None, quiet=False):
         for line in out.splitlines()[-12:]:
             log("  " + line)
     if check and r.returncode:
-        raise Fail("%s fehlgeschlagen (%d)" % (cmd[0], r.returncode))
+        raise Fail("%s failed (%d)" % (cmd[0], r.returncode))
     return r
 
 
@@ -125,7 +125,7 @@ def again(cmd, tries=10):
         if run(cmd, check=False, quiet=i > 0).returncode == 0:
             return True
         time.sleep(1)
-    raise Fail("%s fehlgeschlagen" % " ".join(cmd))
+    raise Fail("%s failed" % " ".join(cmd))
 
 
 # ------------------------------------------------------------------ bays
@@ -278,7 +278,7 @@ def wait_sync(md, what):
             log(line)
             last = line
         time.sleep(2 if os.environ.get("ZT_STORAGE_FAST") else 5)
-    log("%s: fertig (%s)" % (what, raid_stat(md)))
+    log("%s: done (%s)" % (what, raid_stat(md)))
 
 
 # ---------------------------------------------------------------- volumes
@@ -341,27 +341,27 @@ def disk_role(dev, arrays, mounts):
     parts = partitions(dev)
     for p in parts:
         if partlabel(p).startswith("ut-"):
-            return "system", "UntrashOS-Partitionen"
+            return "system", "UntrashOS partitions"
     for p in [dev] + parts:
         for md, a in arrays.items():
             if p in a["members"]:
                 if md in (MDX_FW, MDX_SWAP) and p != part(dev, 3):
                     continue
                 st = a["members"][p]
-                return "member", "%s (%s)" % (md, "Reserve" if "spare" in st else ("defekt" if "faulty" in st else "aktiv"))
+                return "member", "%s (%s)" % (md, "spare" if "spare" in st else ("faulty" if "faulty" in st else "active"))
         if os.path.realpath(p) in mounts:
-            return "busy", "eingehängt: " + ", ".join(mounts[os.path.realpath(p)])
+            return "busy", "mounted: " + ", ".join(mounts[os.path.realpath(p)])
         for h in holders(p):
             if not (h in (MDX_FW, MDX_SWAP)):
-                return "busy", "benutzt von " + h
+                return "busy", "used by " + h
     if parts:
         p3 = part(dev, 3)
         info = IMP.examine(p3) if os.path.exists(p3) else None
         if info and info.get("MD_UUID"):
-            return "foreign", "Daten eines anderen Arrays (%s, %s)" % (info.get("MD_LEVEL", "?"), info.get("MD_UUID", "")[:8])
+            return "foreign", "data of another array (%s, %s)" % (info.get("MD_LEVEL", "?"), info.get("MD_UUID", "")[:8])
         if any(IMP.blkid(p).get("TYPE") for p in parts):
-            return "foreign", "enthält Dateisysteme"
-    return "free", "leer" if not parts else "partitioniert, ohne Daten"
+            return "foreign", "holds file systems"
+    return "free", "empty" if not parts else "partitioned, no data"
 
 
 def host_md():
@@ -465,9 +465,9 @@ def need_md(req, arrays=None):
     md = req.get("md", "")
     arrays = arrays if arrays is not None else active_arrays()
     if md not in arrays or md in (MDX_FW, MDX_SWAP):
-        raise Fail("Unbekanntes Daten-Array: %s" % md)
+        raise Fail("Unknown data array: %s" % md)
     if IMP.holds_host(arrays[md]["dev"]) and req.get("_op") in ("delete",):
-        raise Fail("%s trägt das laufende System (/.untrash) und kann nicht gelöscht werden." % md)
+        raise Fail("%s holds the running system (/.untrash) and cannot be deleted." % md)
     return arrays[md]
 
 
@@ -475,15 +475,15 @@ def need_free_disks(req):
     b = bays()
     names = req.get("disks") or []
     if not names or len(set(names)) != len(names):
-        raise Fail("Platten angeben (Schächte, ohne Doppelte).")
+        raise Fail("Name the disks (bays, no duplicates).")
     arrays, mounts = active_arrays(), mounted_devs()
     out = []
     for n in names:
         if n not in b or not os.path.exists(b[n]):
-            raise Fail("Kein Schacht %s." % n)
+            raise Fail("No bay %s." % n)
         role, detail = disk_role(b[n], arrays, mounts)
         if role not in ("free", "foreign"):
-            raise Fail("%s ist nicht frei: %s" % (n, detail))
+            raise Fail("%s is not free: %s" % (n, detail))
         out.append(b[n])
     return out
 
@@ -495,18 +495,18 @@ def check_vol_size(devs, level):
     size = {"basic": min(gb), "raid1": min(gb), "raid0": sum(gb), "jbod": sum(gb), "raid5": min(gb) * (n - 1),
             "raid6": min(gb) * (n - 2), "raid10": min(gb) * (n // 2)}[level]
     if size > MAX_VOL_GB:
-        raise Fail("Volume wäre %d GB, mehr als %d GB (ext4-Grenze der Stock-Firmware)." % (size, MAX_VOL_GB))
+        raise Fail("The volume would be %d GB, more than %d GB (ext4 limit of the stock firmware)." % (size, MAX_VOL_GB))
 
 
 def check_count(level, n):
     if level not in MIN_DISKS:
-        raise Fail("Unbekannter RAID-Typ %s." % level)
+        raise Fail("Unknown RAID type %s." % level)
     if level == "basic" and n != 1:
-        raise Fail("Basic = genau eine Platte.")
+        raise Fail("Basic = exactly one disk.")
     if n < MIN_DISKS[level]:
-        raise Fail("%s braucht mindestens %d Platten." % (level, MIN_DISKS[level]))
+        raise Fail("%s needs at least %d disks." % (level, MIN_DISKS[level]))
     if level == "raid10" and n % 2:
-        raise Fail("RAID 10 braucht eine gerade Plattenzahl.")
+        raise Fail("RAID 10 needs an even number of disks.")
 
 
 def fw_sw_member(dev):
@@ -551,7 +551,7 @@ def parted_disk(dev):
     settle(dev)
     # CheckInternalDiskFormat
     if len(partitions(dev)) != 3 or sectors(part(dev, 1)) != LEGAL_FW_SIZ or sectors(part(dev, 2)) != LEGAL_SWAP_SIZ:
-        raise Fail("Partitionierung von %s weicht vom Stock-Format ab (p1 %d, p2 %d Sektoren)."
+        raise Fail("The partitioning of %s differs from the stock format (p1 %d, p2 %d sectors)."
                    % (dev, sectors(part(dev, 1)), sectors(part(dev, 2))))
 
 
@@ -561,7 +561,7 @@ def find_sys_array(role):
     if not cands:
         return None
     if len(cands) > 1:
-        log("WARN mehrere %s-Arrays, nehme das mit den meisten Mitgliedern" % role)
+        log("WARN several %s arrays, taking the one with the most members" % role)
     return max(cands, key=lambda a: len(a["members"]))
 
 
@@ -607,7 +607,7 @@ def free_md():
     for n in MD_NAMES:
         if n not in act and not os.path.exists("/sys/block/%s/md/level" % n):
             return n
-    raise Fail("Keine freie md-Nummer (höchstens %d Daten-Arrays)." % len(MD_NAMES))
+    raise Fail("No free md number (at most %d data arrays)." % len(MD_NAMES))
 
 
 def stride(md):
@@ -668,7 +668,7 @@ def link_sysvol(target=None):
         marked = [m for _n, m in vols if glob.glob(m + "/.system/sysvol_*")]
         target = marked[0] if marked else (vols[0][1] if vols else None)
     if not target:
-        log("kein internes Volume mehr: kein Systemvolume")
+        log("no internal volume left: no system volume")
         return
     for n, sub in (("sysvol", ""), (".system", "/.system"), (".media", "/.media")):
         os.symlink(target + sub, os.path.join(IDATA, n))
@@ -680,7 +680,7 @@ def link_sysvol(target=None):
         os.chmod(p, 0o666)
     for d in ("admin", "admin/download", "admin/download/torrent", "music", "photo", "video"):
         mkdir777(os.path.join(target, d))
-    log("Systemvolume: " + target)
+    log("system volume: " + target)
 
 
 def new_volume(dev, md, mnt, name):
@@ -717,7 +717,7 @@ def drop_shares(mnt):
         for n in names:
             for t in ("smb_share", "share_user_privilege", "share_group_privilege"):
                 c.execute("DELETE FROM %s WHERE s_name=?" % t, (n,))
-            log("Freigabe %s entfernt (lag auf dem Volume)" % n)
+            log("share %s removed (it was on the volume)" % n)
         c.commit()
     finally:
         c.close()
@@ -750,7 +750,7 @@ def grow_fs(a):
     else:
         r = run(["resize2fs", "-fF", a["dev"]], check=False)
         if r.returncode and "already" not in r.stdout:
-            raise Fail("resize2fs fehlgeschlagen")
+            raise Fail("resize2fs failed")
 
 
 def tune_stride(a):
@@ -775,13 +775,13 @@ def lv_size_arg(size):
         return None
     m = re.fullmatch(r"(\d+)G", size)
     if not m or not 0 < int(m.group(1)) <= MAX_VOL_GB:
-        raise Fail("Größe: max oder <n>G (bis %dG)." % MAX_VOL_GB)
+        raise Fail("Size: max or <n>G (up to %dG)." % MAX_VOL_GB)
     return size
 
 
 def name_ok(name):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,31}", name or ""):
-        raise Fail("Name: Buchstaben, Ziffern, Leerzeichen . _ - (bis 32 Zeichen).")
+        raise Fail("Name: letters, digits, spaces . _ - (up to 32 characters).")
     return name
 
 
@@ -790,7 +790,7 @@ def wait_ok(md):
         if md in active_arrays():
             return
         time.sleep(0.5)
-    raise Fail("%s ist nicht aktiv geworden." % md)
+    raise Fail("%s did not become active." % md)
 
 
 # -------------------------------------------------------------------- jobs
@@ -799,7 +799,7 @@ def op_create(req):
     level, vtype = req.get("level", ""), req.get("type", "md")
     name = name_ok(req.get("name", ""))
     if vtype not in ("md", "lvm"):
-        raise Fail("Typ md oder lvm.")
+        raise Fail("Type md or lvm.")
     devs = need_free_disks(req)
     check_count(level, len(devs))
     if vtype == "md":
@@ -807,7 +807,7 @@ def op_create(req):
     vname = name_ok(req.get("volume") or name) if vtype == "lvm" else name
     size = lv_size_arg(req.get("size")) if vtype == "lvm" else None
     md = free_md()
-    log("Neues %s-Array %s aus %s (%s)" % (level, md, ", ".join(devs), "Volume" if vtype == "md" else "Disk Group"))
+    log("new %s array %s from %s (%s)" % (level, md, ", ".join(devs), "Volume" if vtype == "md" else "Disk Group"))
     for d in devs:
         parted_disk(d)
     create_sys_mds(devs)
@@ -848,7 +848,7 @@ def lv_new(a, vg, name, size):
         if r.returncode and "insufficient free space" in r.stdout.lower():
             size = None
         elif r.returncode:
-            raise Fail("lvcreate fehlgeschlagen")
+            raise Fail("lvcreate failed")
     if not size:
         r = run(["lvcreate", "-y", "--addtag", "ext4", "-L%dG" % MAX_VOL_GB, "-n", lv, vg], check=False)
         if r.returncode:
@@ -860,19 +860,19 @@ def op_repair(req):
     a = need_md(req)
     md = a["md"]
     if a["level"] in ("jbod", "basic", "raid0"):
-        raise Fail("%s (%s) lässt sich nicht reparieren." % (md, a["level"]))
+        raise Fail("%s (%s) cannot be repaired." % (md, a["level"]))
     if raid_stat(md) != "Degraded":
-        raise Fail("%s ist nicht beeinträchtigt (%s)." % (md, raid_stat(md)))
+        raise Fail("%s is not degraded (%s)." % (md, raid_stat(md)))
     devs = need_free_disks(req)
     active = sum(1 for s in a["members"].values() if "in_sync" in s)
     new_n = active + len(devs)
     if new_n > BAY_NUM:
-        raise Fail("Zu viele Platten.")
+        raise Fail("Too many disks.")
     base = sectors(a["dev"]) // max(1, {"raid5": active, "raid6": active, "raid1": 1}.get(a["level"], 1)) \
         if a["level"] in ("raid1", "raid5", "raid6") else 0
     for d in devs:
         if a["level"] != "raid10" and sectors(d) - 8388608 < base:
-            raise Fail("%s ist zu klein für %s." % (d, md))
+            raise Fail("%s is too small for %s." % (d, md))
     run(["mdadm", "--manage", a["dev"], "--remove", "failed"], check=False)
     run(["mdadm", "--manage", a["dev"], "--remove", "detached"], check=False)
     for d in devs:
@@ -881,7 +881,7 @@ def op_repair(req):
     for d in devs:
         run(["mdadm", "--zero-superblock", part(d, 3)], check=False, quiet=True)
     run(["mdadm", "--manage", a["dev"], "--add"] + [part(d, 3) for d in devs])
-    wait_sync(md, "Wiederherstellung " + md)
+    wait_sync(md, "rebuild " + md)
     if a["raid_disks"] < new_n:
         run(["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n], check=False)
         wait_sync(md, md)
@@ -893,13 +893,13 @@ def op_add_disks(req):
     a = need_md(req)
     md, level = a["md"], a["level"]
     if raid_stat(md) != "Normal":
-        raise Fail("%s ist nicht im Normalzustand." % md)
+        raise Fail("%s is not in its normal state." % md)
     if level not in ("jbod", "raid1", "raid5", "raid6"):
-        raise Fail("%s (%s) lässt sich nicht um Platten erweitern." % (md, level))
+        raise Fail("%s (%s) cannot be extended with disks." % (md, level))
     devs = need_free_disks(req)
     new_n = a["raid_disks"] + len(devs)
     if new_n > BAY_NUM:
-        raise Fail("Höchstens %d Platten." % BAY_NUM)
+        raise Fail("At most %d disks." % BAY_NUM)
     if a["level"] != "raid1":
         check_vol_size(devs + [parent(p) for p in a["members"]], level)
     for d in devs:
@@ -917,7 +917,7 @@ def op_add_disks(req):
         if level in ("raid5", "raid6"):
             cmd.append("--backup-file=%s/raid_backup-%s" % (BACKUP_DIR, md))
         run(cmd)
-    wait_sync(md, "Umbau " + md)
+    wait_sync(md, "reshape " + md)
     tune_stride(active_arrays()[md])
     grow_fs(active_arrays()[md])
     log("RESULT OK %s" % md)
@@ -927,13 +927,13 @@ def op_change_level(req):
     a = need_md(req)
     md, old, new = a["md"], a["level"], req.get("level", "")
     if NEXT_LEVEL.get(old) != new:
-        raise Fail("Wechsel %s -> %s gibt es nicht (nur basic->raid1->raid5->raid6)." % (old, new))
+        raise Fail("There is no change %s -> %s (only basic->raid1->raid5->raid6)." % (old, new))
     if raid_stat(md) != "Normal":
-        raise Fail("%s ist nicht im Normalzustand." % md)
+        raise Fail("%s is not in its normal state." % md)
     devs = need_free_disks(req)
     new_n = a["raid_disks"] + len(devs)
     if new_n > BAY_NUM or new_n < MIN_DISKS[new]:
-        raise Fail("%s braucht %d bis %d Platten." % (new, MIN_DISKS[new], BAY_NUM))
+        raise Fail("%s needs %d to %d disks." % (new, MIN_DISKS[new], BAY_NUM))
     for d in devs:
         parted_disk(d)
     create_sys_mds(devs)
@@ -949,13 +949,13 @@ def op_change_level(req):
                 + ([bk] if new == "raid6" else []), check=False)
         if r.returncode:
             # newer mdadm: level first (same disk count), then the disk count
-            log("Level und Plattenzahl getrennt ändern")
+            log("change the level and the number of disks separately")
             wait_sync(md, md)
             run(["mdadm", "--grow", a["dev"], "--level=" + new] + ([bk] if new == "raid6" else []))
-            wait_sync(md, "Levelwechsel " + md)
+            wait_sync(md, "level change " + md)
             if int(rd("/sys/block/%s/md/raid_disks" % md, "0")) < new_n:
                 run(["mdadm", "--grow", a["dev"], "--raid-devices=%d" % new_n] + [bk])
-    wait_sync(md, "Umbau %s -> %s" % (md, new))
+    wait_sync(md, "reshape %s -> %s" % (md, new))
     if new in ("raid5", "raid6"):
         stripe_cache(md)
     tune_stride(active_arrays()[md])
@@ -966,7 +966,7 @@ def op_change_level(req):
 def op_add_spare(req):
     a = need_md(req)
     if raid_stat(a["md"]) != "Normal" or a["level"] not in ("raid1", "raid5", "raid6", "raid10"):
-        raise Fail("Reserveplatten nur für ein intaktes RAID 1/5/6/10.")
+        raise Fail("Spare disks only for an intact RAID 1/5/6/10.")
     devs = need_free_disks(req)
     for d in devs:
         parted_disk(d)
@@ -985,10 +985,10 @@ def op_remove_spare(req):
     for n in req.get("disks") or []:
         p = part(b.get(n, "/nonexistent"), 3)
         if "spare" not in a["members"].get(p, ""):
-            raise Fail("%s ist keine Reserveplatte von %s." % (n, a["md"]))
+            raise Fail("%s is not a spare disk of %s." % (n, a["md"]))
         ps.append(p)
     if not ps:
-        raise Fail("Platten angeben.")
+        raise Fail("Name the disks.")
     run(["mdadm", "--manage", a["dev"], "--fail"] + ps)
     run(["mdadm", "--manage", a["dev"], "--remove"] + ps)
     run(["mdadm", "--zero-superblock"] + ps)
@@ -998,7 +998,7 @@ def op_remove_spare(req):
 def op_expand(req):
     a = need_md(req)
     if raid_stat(a["md"]) != "Normal":
-        raise Fail("%s ist nicht im Normalzustand." % a["md"])
+        raise Fail("%s is not in its normal state." % a["md"])
     grow_fs(a)
     log("RESULT OK %s" % a["md"])
 
@@ -1019,14 +1019,14 @@ def op_delete(req):
     again(["mdadm", "--stop", a["dev"]])
     run(["mdadm", "--zero-superblock"] + mem, check=False)
     link_sysvol()
-    log("RESULT OK %s gelöscht" % a["md"])
+    log("RESULT OK %s deleted" % a["md"])
 
 
 def lvm_target(req):
     a = need_md(req)
     vg = vg_of(a)
     if not vg:
-        raise Fail("%s ist keine Disk Group (LVM)." % a["md"])
+        raise Fail("%s is not a disk group (LVM)." % a["md"])
     return a, vg
 
 
@@ -1040,17 +1040,17 @@ def op_lv_extend(req):
     a, vg = lvm_target(req)
     lv = req.get("lv", "")
     if not re.fullmatch(r"lv_[0-9a-f]{8}", lv):
-        raise Fail("Unbekanntes Volume.")
+        raise Fail("Unknown volume.")
     dev = "/dev/%s/%s" % (vg, lv)
     if not is_mounted(os.path.join(IDATA, lv[3:])):
-        raise Fail("Volume ist nicht eingehängt (beschädigt?).")
+        raise Fail("The volume is not mounted (damaged?).")
     size = lv_size_arg(req.get("size"))
     if size:
         r = run(["lvextend", "-L", size, dev], check=False)
         if r.returncode and "insufficient free space" in r.stdout.lower():
             run(["lvextend", "--extents", "+100%FREE", dev])
         elif r.returncode:
-            raise Fail("lvextend fehlgeschlagen")
+            raise Fail("lvextend failed")
     else:
         run(["lvextend", "--extents", "+100%FREE", dev])
     run(["resize2fs", "-fF", dev])
@@ -1061,10 +1061,10 @@ def op_lv_delete(req):
     a, vg = lvm_target(req)
     lv = req.get("lv", "")
     if not re.fullmatch(r"lv_[0-9a-f]{8}", lv):
-        raise Fail("Unbekanntes Volume.")
+        raise Fail("Unknown volume.")
     mnt = os.path.join(IDATA, lv[3:])
     if IMP.holds_host("/dev/%s/%s" % (vg, lv)):
-        raise Fail("Das Volume trägt das laufende System.")
+        raise Fail("The volume holds the running system.")
     umount_vol(mnt)
     drop_shares(mnt)
     again(["lvremove", "-f", "/dev/%s/%s" % (vg, lv)])
@@ -1080,7 +1080,7 @@ def op_rename(req):
             write_label(mnt, name)
             log("RESULT OK")
             return
-    raise Fail("Volume nicht gefunden.")
+    raise Fail("Volume not found.")
 
 
 OPS = {"create": op_create, "repair": op_repair, "add-disks": op_add_disks, "change-level": op_change_level,
@@ -1103,7 +1103,7 @@ def main():
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("FEHLER: ein anderer Speicherauftrag läuft", flush=True)
+            print("ERROR: another storage job is running", flush=True)
             return 2
         run(["modprobe", "-a", "md_mod", "raid1", "raid456", "raid0", "raid10", "linear"], check=False, quiet=True)
         os.makedirs(BACKUP_DIR, exist_ok=True)

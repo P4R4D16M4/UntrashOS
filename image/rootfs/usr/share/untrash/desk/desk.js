@@ -68,7 +68,7 @@ async function boot() {
 }
 function resetScreen(st) {
   $('#app').innerHTML = `<main class="ut-login"><form class="ut-login__card" id="rf">
-    <img class="ut-login__logo" src="/ut/assets/logo-mark-192.png" alt=""><div class="ut-login__host">${esc(st.hostname)} · RESET-Taste</div>
+    <img class="ut-login__logo" src="/ut/assets/logo-mark-192.png" alt=""><div class="ut-login__host">${esc(st.hostname)} · RESET button</div>
     <p>New password for <b>admin</b> set (still ${Math.ceil(st.reset_window / 60)} minutes possible).</p>
     ${field('r1', 'New password (at least 8 characters)', '', 'type=password autocomplete=new-password')}${field('r2', 'Repeat', '', 'type=password autocomplete=new-password')}
     <div id="rerr" class="ut-callout ut-callout--danger" hidden></div><button class="ut-btn ut-btn--primary ut-btn--lg" style="width:100%">Set password</button></form></main>`;
@@ -152,10 +152,10 @@ function desk(st) {
       <span class="ut-topbar__item ut-activity" id="activity" aria-live="polite"></span>
       <span class="ut-topbar__item" id="raid-pill"></span>
       <button class="ut-topbar__item" id="user-btn" translate="no">${esc(ME.user)}</button><span class="ut-topbar__item" id="clock"></span></header>
-    <nav class="ut-desktop-icons">${apps.filter(k => k !== 'account').slice(0, 6).map(k => `<button class="ut-desk-icon" data-app="${k}"><img src="${ICON(APPS[k].icon)}" old="">${APPS[k].name}</button>`).join('')}</nav>
+    <nav class="ut-desktop-icons">${apps.filter(k => k !== 'account').slice(0, 6).map(k => `<button class="ut-desk-icon" data-app="${k}"><img src="${ICON(APPS[k].icon)}" alt="">${APPS[k].name}</button>`).join('')}</nav>
     <div id="windows"></div><div class="ut-toasts" id="toasts" aria-live="polite"></div>
-    <nav class="ut-dock" aria-label="Dock" style="--dock-n:${dock.length + (ME.admin ? 1 : 0)}">${dock.map(k => `<button class="ut-dock__item" data-app="${k}" aria-label="${APPS[k].name}"><img src="${ICON(APPS[k].icon)}" old=""><span class="ut-tip">${APPS[k].name}</span></button>`).join('')}
-      ${ME.admin ? '<span class="ut-dock__sep"></span><button class="ut-dock__item" data-power aria-label="Switch off"><img src="' + ICON('power') + '" old=""><span class="ut-tip">Switch off</span></button>' : ''}</nav></div>`;
+    <nav class="ut-dock" aria-label="Dock" style="--dock-n:${dock.length + (ME.admin ? 1 : 0)}">${dock.map(k => `<button class="ut-dock__item" data-app="${k}" aria-label="${APPS[k].name}"><img src="${ICON(APPS[k].icon)}" alt=""><span class="ut-tip">${APPS[k].name}</span></button>`).join('')}
+      ${ME.admin ? '<span class="ut-dock__sep"></span><button class="ut-dock__item" data-power aria-label="Switch off"><img src="' + ICON('power') + '" alt=""><span class="ut-tip">Switch off</span></button>' : ''}</nav></div>`;
   $('#desk').addEventListener('click', e => {
     const b = e.target.closest('[data-app]'); if (b && !b.closest('.ut-window')) openApp(b.dataset.app);
     if (e.target.closest('[data-power]')) powerDialog();
@@ -204,7 +204,7 @@ function openApp(k) {
   const W = Math.min((sz && sz.w) || a.w || 720, innerWidth - 16), H = Math.min((sz && sz.h) || a.h || 480, innerHeight - 130);
   w.className = 'ut-window'; w.dataset.app = k;
   w.style.cssText = `width:${W}px;height:${H}px;left:${Math.max(8, (innerWidth - W) / 2 - 40 + (N % 5) * 30)}px;top:${50 + (N++ % 5) * 26}px`;
-  w.innerHTML = `<div class="ut-window__bar"><img src="${ICON(a.icon)}" old=""><span class="ut-window__title">${a.name}</span>
+  w.innerHTML = `<div class="ut-window__bar"><img src="${ICON(a.icon)}" alt=""><span class="ut-window__title">${a.name}</span>
     <div class="ut-window__ctl"><button data-act="max" aria-label="Maximise">▢</button><button data-act="close" aria-label="Close">✕</button></div></div>
     <div class="ut-window__body"><div class="ut-window__main"><span class="ut-spinner"></span></div></div>
     ${['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map(d => `<i class="ut-rz ut-rz--${d}" data-rz="${d}"></i>`).join('')}`;
@@ -375,7 +375,7 @@ function viewer(names, cur, rel) {
     const n = names[i], k = mediaKind(n), src = '/api/files/download?' + new URLSearchParams({ share: FS.share, path: rel(n), inline: '1' });
     const dl = '/api/files/download?' + new URLSearchParams({ share: FS.share, path: rel(n) });
     s.innerHTML = `<div class="ut-dialog" style="max-width:min(96vw,1100px);width:auto"><div class="ut-dialog__head"><h2 translate="no">${esc(n)}</h2></div>
-      <div class="ut-dialog__body" style="text-align:center">${k === 'img' ? `<img src="${src}" old="" style="max-width:90vw;max-height:72vh">`
+      <div class="ut-dialog__body" style="text-align:center">${k === 'img' ? `<img src="${src}" alt="" style="max-width:90vw;max-height:72vh">`
         : k === 'audio' ? `<audio src="${src}" controls autoplay style="width:min(80vw,520px)"></audio>`
         : k === 'video' ? `<video src="${src}" controls autoplay style="max-width:90vw;max-height:72vh"></video>`
         : `<iframe src="${src}" sandbox="" style="width:80vw;height:72vh;border:0"></iframe>`}</div>
@@ -390,7 +390,7 @@ function viewer(names, cur, rel) {
 }
 
 /* shares ---------------------------------------------------------------- */
-let SHARE_PREFILL = null, SHARE_PICK = null;   // set by Files → "Als Freigabe einrichten"
+let SHARE_PREFILL = null, SHARE_PICK = null;   // set by Files → "Set up as share"
 const MEDIA = [[1, 'Video'], [2, 'Photos'], [4, 'Music']];
 VIEWS.shares = async (b, sel) => {
   const [sh, us] = await Promise.all([api('shares'), api('users')]);
@@ -462,7 +462,7 @@ VIEWS.shares = async (b, sel) => {
 
 /* storage ---------------------------------------------------------------- */
 const LEVELS = { basic: 'Basic (1 disk)', jbod: 'JBOD', raid0: 'RAID 0', raid1: 'RAID 1', raid5: 'RAID 5', raid6: 'RAID 6', raid10: 'RAID 10' };
-const RSTATE = { Normal: ['ut-pill--ok', 'healthy'], Degraded: ['ut-pill--danger', 'degraded'], Resyncing: ['ut-pill--warn', 'synchronisiert'], Crashed: ['ut-pill--danger', 'ausgefallen'] };
+const RSTATE = { Normal: ['ut-pill--ok', 'healthy'], Degraded: ['ut-pill--danger', 'degraded'], Resyncing: ['ut-pill--warn', 'resyncing'], Crashed: ['ut-pill--danger', 'failed'] };
 const ROLE = { free: 'free', foreign: 'free (old data)', member: 'in the RAID', system: 'UntrashOS', busy: 'used' };
 let RAIDPOLL = null;
 const diskPick = (s, list) => list.length ? list.map(n => { const d = s.disks.find(x => x.bay === n) || {};
@@ -470,7 +470,7 @@ const diskPick = (s, list) => list.length ? list.map(n => { const d = s.disks.fi
   : '<p class="ut-faint">No free disk.</p>';
 const picked = s => $$('[data-disk]', s).filter(x => x.checked).map(x => x.dataset.disk);
 const confirmField = word => `<div class="ut-callout ut-callout--danger" style="margin:10px 0"><div>All data on the selected disks or the volume will be lost.</div></div>
-  ${field('rconf', 'To confirm ' + word + ' eintippen', '', 'autocomplete=off')}`;
+  ${field('rconf', 'Type ' + word + ' to confirm', '', 'autocomplete=off')}`;
 async function raidRun(op, req, s) {
   await api('raid/job', Object.assign({ op, confirm: s && $('#rconf', s) ? $('#rconf', s).value.trim() : '' }, req));
   toast('Job started', op); render('storage');
@@ -515,7 +515,7 @@ VIEWS.storage = async b => {
   const busy = job.state === 'running' || st.busy;
   b.innerHTML = `<div class="ut-window__main">
     ${job.state && job.state !== 'idle' ? `<div class="ut-card" style="margin-bottom:12px"><div class="row"><b>Job ${esc(job.op)}</b>
-      <span class="ut-pill ${job.state === 'running' ? 'ut-pill--warn' : job.state === 'done' ? 'ut-pill--ok' : 'ut-pill--danger'}">${job.state === 'running' ? 'running' : job.state === 'done' ? 'done' : 'fehlgeschlagen'}</span></div>
+      <span class="ut-pill ${job.state === 'running' ? 'ut-pill--warn' : job.state === 'done' ? 'ut-pill--ok' : 'ut-pill--danger'}">${job.state === 'running' ? 'running' : job.state === 'done' ? 'done' : 'failed'}</span></div>
       <pre class="mono joblog" style="max-height:160px;overflow:auto;white-space:pre-wrap">${esc(job.log.slice(-60).join('\n'))}</pre></div>` : ''}
     <div class="row"><div class="ut-section-title" style="flex:1">Volumes and RAID</div>${(st.free || []).length && !busy ? '<button class="ut-btn ut-btn--primary" id="rnew">+ New volume</button>' : ''}</div>
     ${st.arrays.length ? st.arrays.map((a, i) => { const [cls, txt] = RSTATE[a.state] || ['ut-pill--plain', a.state]; return `<div class="ut-card" style="margin-bottom:10px">
@@ -555,7 +555,7 @@ async function iscsiPanel(b) {
     ${c.targets.map((t, i) => `<div class="row" style="margin-top:6px"><b>${esc(t.name)}</b> <span class="ut-faint mono">${esc(t.iqn)}</span>
       <span class="ut-pill ${st[t.iqn] && st[t.iqn].running ? 'ut-pill--ok' : 'ut-pill--plain'}">${st[t.iqn] && st[t.iqn].running ? 'active' : 'off'}</span>
       <span class="ut-faint">LUNs: ${esc(t.luns.join(', ') || '–')} · ${t.chap ? 'CHAP' + (t.mutual ? ' gegenseitig' : '') : 'without CHAP'} · ${t.initiators.length ? esc(t.initiators.join(', ')) : 'all initiators'}</span>
-      <button class="ut-btn ut-btn--sm" style="margin-left:auto" data-ted="${i}">Bearbeiten</button><button class="ut-btn ut-btn--sm ut-btn--danger" data-tdel="${i}">Delete</button></div>`).join('')}`;
+      <button class="ut-btn ut-btn--sm" style="margin-left:auto" data-ted="${i}">Edit</button><button class="ut-btn ut-btn--sm ut-btn--danger" data-tdel="${i}">Delete</button></div>`).join('')}`;
   const plainT = t => ({ name: t.name, iqn: t.iqn, luns: t.luns, initiators: t.initiators, active: t.active, chap: t.chap, chap_user: t.chap_user, mutual: t.mutual });
   const tgtDlg = t => { t = t || { name: UTI18N.tr('Target') + (c.targets.length + 1), iqn: '', luns: [], initiators: [], active: true, chap: false, chap_user: '', mutual: false };
     dialog({ title: 'iSCSI target', ok: 'Save', body: `${field('tn', 'Name', t.name)}${field('tq', 'IQN (empty = automatic)', t.iqn)}
@@ -713,7 +713,7 @@ VIEWS.settings = async (b, sel = 'services') => {
     const m = s.notify.mail;
     main = `<h2>E-mail notification</h2><div class="form">${sw('ml', m.active, 'Send e-mails')}
       <div class="row">${field('mls', 'Mail server (SMTP)', m.server)}${field('mlp', 'Port (0 = automatic)', m.port, 'type=number min=0 max=65535')}</div>
-      ${sw('mla', m.auth, 'Mail server login')}<div class="row">${field('mlu', 'User name', m.username, 'autocomplete=off')}${field('mlw', m.password_set ? 'Password (gespeichert; empty = behalten)' : 'Password', '', 'type=password autocomplete=new-password')}</div>
+      ${sw('mla', m.auth, 'Mail server login')}<div class="row">${field('mlu', 'User name', m.username, 'autocomplete=off')}${field('mlw', m.password_set ? 'Password (saved; empty = keep)' : 'Password', '', 'type=password autocomplete=new-password')}</div>
       ${field('mlf', 'Sender', m.from)}${field('mlt', 'Warnings to', m.alerts_to)}${sw('mlal', m.alerts, 'Send warnings (RAID, SMART, volume full)')}
       ${field('mlr', 'Log report to', m.log_to)}${sw('mlra', m.report_all, 'Report with all messages (otherwise warnings only)')}
       <div class="row"><div class="ut-field"><label for="mlsc">Report</label><select class="ut-select" id="mlsc">${[['hourly', 'hourly'], ['daily', 'daily'], ['weekly', 'weekly']].map(([k, v]) => `<option value="${k}"${m.schedule === k ? ' selected' : ''}>${v}</option>`).join('')}</select></div>
@@ -762,13 +762,13 @@ VIEWS.settings = async (b, sel = 'services') => {
         <div class="ut-field"><label>Direction</label><select class="ut-select" id="syd">${[['twoWay', 'both directions'], ['sync2USB', 'NAS → USB (mirror)'], ['sync2Vol', 'USB → NAS (mirror)']].map(([k, v]) => `<option value="${k}"${y.direction === k ? ' selected' : ''}>${v}</option>`).join('')}</select></div></div>
       <div class="ut-field"><label>Keep replaced/deleted files in</label>${sel_('syb', byPath(y.bak_path), '– do not keep –')}</div>
       <div class="row"><button class="ut-btn ut-btn--primary" id="cbsave">Save</button><button class="ut-btn" data-cbrun="copy">Copy now</button><button class="ut-btn" data-cbrun="sync">Synchronise now</button></div>
-      ${last.kind ? `<p class="ut-faint">Last: ${esc(last.kind.toUpperCase())} ${last.ok ? 'done' : 'fehlgeschlagen'} · ${esc(new Date(last.time * 1000).toLocaleString(UTI18N.locale))}<br>${esc((last.log || []).join(' '))}</p>` : ''}</div>`;
+      ${last.kind ? `<p class="ut-faint">Last: ${esc(last.kind.toUpperCase())} ${last.ok ? 'done' : 'failed'} · ${esc(new Date(last.time * 1000).toLocaleString(UTI18N.locale))}<br>${esc((last.log || []).join(' '))}</p>` : ''}</div>`;
   } else if (sel === 'dyndns') {
     const d = s.services.dyndns;
     const prov = [['dyndns', 'DynDNS (dyn.com)'], ['noip', 'No-IP'], ['3322', '3322.org'], ['zoneedit', 'ZoneEdit'], ['duckdns', 'Duck DNS'], ['freedns', 'FreeDNS (afraid.org)'], ['dynv6', 'dynv6']];
     main = `<h2>DynDNS</h2><div class="form">${sw('dd', d.active, 'Keep the address current at the DynDNS provider')}
       <div class="ut-field"><label for="ddp">Provider</label><select class="ut-select" id="ddp">${prov.map(([k, v]) => `<option value="${k}"${d.provider === k ? ' selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
-      ${field('ddh', 'Host name', d.hostname)}${field('ddu', 'User name', d.username, 'autocomplete=off')}${field('ddw', d.password_set ? 'Password / token (gespeichert; empty = behalten)' : 'Password / token', '', 'type=password autocomplete=new-password')}
+      ${field('ddh', 'Host name', d.hostname)}${field('ddu', 'User name', d.username, 'autocomplete=off')}${field('ddw', d.password_set ? 'Password / token (saved; empty = keep)' : 'Password / token', '', 'type=password autocomplete=new-password')}
       <button class="ut-btn ut-btn--primary" id="ddsave">Save</button></div>`;
   } else if (sel === 'recycle') {
     main = `<h2>Recycle bin</h2><div class="form"><p class="ut-faint">Deleted files in shares with a recycle bin go to the “recycle” folder.</p>
@@ -835,7 +835,7 @@ VIEWS.settings = async (b, sel = 'services') => {
 const DIRS = { both: 'two-way sync', up: 'upload only', down: 'download only' };
 const RTYPE = { dropbox: 'Dropbox', drive: 'Google Drive', ftp: 'FTP-Server' };
 function cloudConnect(provider) {
-  const s = dialog({ title: RTYPE[provider] + ' verbinden', ok: 'Done', body: `${field('cn', 'Account name', provider === 'drive' ? 'GoogleDrive' : 'Dropbox')}
+  const s = dialog({ title: 'Connect ' + RTYPE[provider], ok: 'Done', body: `${field('cn', 'Account name', provider === 'drive' ? 'GoogleDrive' : 'Dropbox')}
     <ol class="ut-steps"><li><button class="ut-btn" id="cgo">Open the sign-in page</button> (new tab) and sign in and agree there.</li>
     <li>Then the browser shows an error page at <span class="mono">localhost:53682</span> (or 127.0.0.1:53682) – that is correct.</li>
     <li>Copy the complete address from that page's address bar and paste it here:</li></ol>${field('cu', 'Redirect address', '', 'placeholder="http://127.0.0.1:53682/?state=…&code=…"')}`,
@@ -863,7 +863,7 @@ VIEWS.cloud = async b => {
     ${c.jobs.length ? `<div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Account</th><th>Direction</th><th>NAS</th><th>Last</th><th></th></tr></thead><tbody>${c.jobs.map(j => { const st = c.status[j.id];
       return `<tr><td>${esc(j.name)}${j.active ? '' : ' <span class="ut-pill ut-pill--plain">off</span>'}</td><td>${esc(j.remote)}:${esc(j.path || '/')}</td><td>${DIRS[j.direction]}</td><td class="mono">${esc(j.share + (j.folder ? '/' + j.folder : ''))}</td>
       <td>${st ? `<span class="ut-pill ${st.ok ? 'ut-pill--ok' : 'ut-pill--danger'}" title="${esc(st.log.slice(-5).join('\n'))}">${st.ok ? 'ok' : 'Error'}</span> ${esc(new Date(st.time * 1000).toLocaleString(UTI18N.locale))}` : '–'}</td>
-      <td><button class="ut-btn ut-btn--sm" data-jrun="${j.id}">Jetzt</button> <button class="ut-btn ut-btn--sm" data-jed="${j.id}">Bearbeiten</button> <button class="ut-btn ut-btn--sm ut-btn--danger" data-jdel="${j.id}">Delete</button></td></tr>`; }).join('')}</tbody></table></div>` : '<div class="ut-card empty">No job.</div>'}
+      <td><button class="ut-btn ut-btn--sm" data-jrun="${j.id}">Now</button> <button class="ut-btn ut-btn--sm" data-jed="${j.id}">Edit</button> <button class="ut-btn ut-btn--sm ut-btn--danger" data-jdel="${j.id}">Delete</button></td></tr>`; }).join('')}</tbody></table></div>` : '<div class="ut-card empty">No job.</div>'}
     </div>`;
   $$('[data-conn]', b).forEach(x => x.onclick = () => cloudConnect(x.dataset.conn));
   $('#cftp', b).onclick = () => dialog({ title: 'Add FTP server', ok: 'Save', body: `${field('fn', 'Name', 'FTP')}<div class="row">${field('fh', 'Server')}${field('fp', 'Port', 21, 'type=number')}</div>
@@ -878,7 +878,7 @@ VIEWS.cloud = async b => {
 };
 
 /* downloads ---------------------------------------------------------------- */
-const DLST = { active: 'loading', waiting: 'waiting', paused: 'paused', complete: 'done', error: 'Error', removed: 'entfernt' };
+const DLST = { active: 'loading', waiting: 'waiting', paused: 'paused', complete: 'done', error: 'Error', removed: 'removed' };
 let DLPOLL = null;
 VIEWS.downloads = async (b, sel = 'list') => {
   const d = await api('downloads'), c = d.settings;
@@ -901,7 +901,7 @@ VIEWS.downloads = async (b, sel = 'list') => {
         const pct = x.size ? Math.floor(100 * x.done / x.size) : 0;
         return `<tr><td>${esc(x.name)}${x.error ? '<br><span class="ut-faint">' + esc(x.error) + '</span>' : ''}</td><td>${esc(DLST[x.status] || x.status)}</td>
         <td class="num">${pct} %<br><span class="ut-faint">${size(x.done)} / ${size(x.size)}</span></td><td class="num">${size(x.down)}/s<br>${size(x.up)}/s</td>
-        <td>${x.status === 'active' || x.status === 'waiting' ? `<button class="ut-btn ut-btn--sm" data-dl="pause:${x.gid}">Pause</button>` : ''}${x.status === 'paused' ? `<button class="ut-btn ut-btn--sm" data-dl="resume:${x.gid}">Weiter</button>` : ''}
+        <td>${x.status === 'active' || x.status === 'waiting' ? `<button class="ut-btn ut-btn--sm" data-dl="pause:${x.gid}">Pause</button>` : ''}${x.status === 'paused' ? `<button class="ut-btn ut-btn--sm" data-dl="resume:${x.gid}">Resume</button>` : ''}
         <button class="ut-btn ut-btn--sm ut-btn--danger" data-dl="remove:${x.gid}">Remove</button></td></tr>`; }).join('')}</tbody></table></div>
         <button class="ut-btn ut-btn--sm" data-dl="purge:">Finished ones from the list</button>` : '<div class="empty">No downloads.</div>'}`;
   }
@@ -932,7 +932,7 @@ function backupJob(c, j) {
     <div class="ut-field"><label>Sources</label><div id="bsrc">${(j.source_names || []).map(srcRow).join('')}</div><button class="ut-btn ut-btn--sm" id="bsadd">+ Source</button></div>
     <div id="blocal"><div class="ut-field"><label for="bk">Target</label><select class="ut-select" id="bk"><option value="local"${t.kind !== 'usb' ? ' selected' : ''}>Share on this NAS</option>${c.usb.map(u => `<option value="usb:${esc(u.path)}"${t.kind === 'usb' && t.path === u.path ? ' selected' : ''}>USB: ${esc(u.label)}</option>`).join('')}</select></div>
       <div class="row" id="bshare"><select class="ut-select" id="bts">${shOpt(t.share)}</select><input class="ut-input" id="btf" value="${esc(t.folder || '')}" placeholder="Folder"></div></div>
-    <div id="brs"><div class="row">${field('bh', 'Rsync server', t.host || '')}${field('bm', 'Module', t.module || '')}</div><div class="row">${field('bu', 'User name', t.user || '')}${field('bp', 'Password (empty = behalten)', '', 'type=password autocomplete=new-password')}</div></div>
+    <div id="brs"><div class="row">${field('bh', 'Rsync server', t.host || '')}${field('bm', 'Module', t.module || '')}</div><div class="row">${field('bu', 'User name', t.user || '')}${field('bp', 'Password (empty = keep)', '', 'type=password autocomplete=new-password')}</div></div>
     <div class="row"><div class="ut-field"><label for="bsk">Schedule</label><select class="ut-select" id="bsk">${Object.entries(BSCHED).map(([k, v]) => `<option value="${k}"${k === sc.kind ? ' selected' : ''}>${v}</option>`).join('')}</select></div>
       ${field('bsh', 'Time HH:MM', String(sc.hour).padStart(2, '0') + ':' + String(sc.minute).padStart(2, '0'))}
       <div class="ut-field"><label for="bsd">Weekday</label><select class="ut-select" id="bsd">${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d, i) => `<option value="${i}"${sc.day === i ? ' selected' : ''}>${d}</option>`).join('')}</select></div>
@@ -958,7 +958,7 @@ VIEWS.backup = async b => {
       const tgt = j.target.kind === 'rsync' ? 'rsync://' + j.target.host + '/' + j.target.module : j.target.kind === 'usb' ? 'USB ' + j.target.path : j.target.share + (j.target.folder ? '/' + j.target.folder : '');
       return `<tr><td>${esc(j.name)}${j.active ? '' : ' <span class="ut-pill ut-pill--plain">off</span>'}</td><td>${BTYPE[j.type]}</td><td class="mono">${esc(tgt)}</td><td>${BSCHED[j.schedule.kind]}</td>
       <td>${st ? `<span class="ut-pill ${st.ok ? 'ut-pill--ok' : 'ut-pill--danger'}" title="${esc(st.log.slice(-6).join('\n'))}">${st.ok ? 'ok' : 'Error'}</span> ${esc(new Date(st.time * 1000).toLocaleString(UTI18N.locale))}` : '–'}</td>
-      <td><button class="ut-btn ut-btn--sm" data-brun="${j.id}">Jetzt</button> ${j.type !== 'rsync' ? `<button class="ut-btn ut-btn--sm" data-bres="${j.id}">Restore</button>` : ''} <button class="ut-btn ut-btn--sm" data-bed="${j.id}">Bearbeiten</button> <button class="ut-btn ut-btn--sm ut-btn--danger" data-bdel="${j.id}">Delete</button></td></tr>`; }).join('')}</tbody></table></div>` : '<div class="ut-card empty">No backup set up.</div>'}
+      <td><button class="ut-btn ut-btn--sm" data-brun="${j.id}">Now</button> ${j.type !== 'rsync' ? `<button class="ut-btn ut-btn--sm" data-bres="${j.id}">Restore</button>` : ''} <button class="ut-btn ut-btn--sm" data-bed="${j.id}">Edit</button> <button class="ut-btn ut-btn--sm ut-btn--danger" data-bdel="${j.id}">Delete</button></td></tr>`; }).join('')}</tbody></table></div>` : '<div class="ut-card empty">No backup set up.</div>'}
     <p class="ut-faint">Archive: one dated folder per backup, unchanged files take no extra space. Synchronisation: the target mirrors the source. Rsync: to an rsync server (another NAS or computer).</p></div>`;
   const plain = x => Object.assign({}, x, { sources: x.source_names, target: x.target.kind === 'local' ? { kind: 'local', share: x.target.share, folder: x.target.folder } : x.target });
   $('#bnew', b).onclick = () => backupJob(c);
@@ -969,7 +969,7 @@ VIEWS.backup = async b => {
     const v = (await api('backup/versions?id=' + x.dataset.bres)).versions;
     if (!v.length) return toast('No backup yet');
     dialog({ title: 'Restore', ok: 'Restore', body: `<div class="ut-field"><label for="rv">Version</label><select class="ut-select" id="rv">${v.map(n => `<option value="${esc(n)}">${n === '-' ? 'current mirror' : esc(n.replace(/^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)$/, '$3.$2.$1 $4:$5:$6'))}</option>`).join('')}</select></div>
-      <div class="row"><select class="ut-select" id="rs">${c.shares.map(n => `<option>${esc(n)}</option>`).join('')}</select><input class="ut-input" id="rf" value="Wiederhergestellt" placeholder="Folder"></div><p class="ut-faint">Existing files with the same name are overwritten.</p>`,
+      <div class="row"><select class="ut-select" id="rs">${c.shares.map(n => `<option>${esc(n)}</option>`).join('')}</select><input class="ut-input" id="rf" value="Restored" placeholder="Folder"></div><p class="ut-faint">Existing files with the same name are overwritten.</p>`,
       onOk: async s => { await api('backup/restore', { id: x.dataset.bres, version: $('#rv', s).value, share: $('#rs', s).value, folder: $('#rf', s).value.trim() }); toast('Restored'); } });
   } catch (e) { fail(e); } });
 };
@@ -1107,7 +1107,7 @@ VIEWS.manual = async b => {
 };
 VIEWS.mesh = async b => {
   b.innerHTML = `<div class="ut-window__main ut-mesh">
-    <img src="${ICON('mesh')}" old="" class="ut-mesh__logo">
+    <img src="${ICON('mesh')}" alt="" class="ut-mesh__logo">
     <h2>UntrashMesh <span class="ut-pill ut-pill--warn">in progress</span></h2>
     <p>Several UntrashOS devices form one shared, encrypted network – at home, at friends' or on the road.</p>
     <ul>
@@ -1450,7 +1450,7 @@ VIEWS.media = async (b, sel = 'status') => {
     main = `<h2>What the media server shows</h2><p class="muted">Media types per share. The server does not publish empty or missing folders.</p>
       <table class="ut-table"><thead><tr><th>Share</th>${MEDIA.map(([, l]) => `<th>${l}</th>`).join('')}<th></th></tr></thead><tbody>
       ${m.shares.map(x => `<tr data-s="${esc(x.name)}"><td translate="no">${esc(x.name)}</td>${MEDIA.map(([k]) => `<td><input type="checkbox" data-m="${k}"${x.media & k ? ' checked' : ''}></td>`).join('')}
-        <td>${x.published ? '<span class="ut-pill ut-pill--ok">published</span>' : x.media ? `<span class="ut-pill">${x.present ? 'empty' : 'fehlt'}</span>` : ''}</td></tr>`).join('')}</tbody></table>
+        <td>${x.published ? '<span class="ut-pill ut-pill--ok">published</span>' : x.media ? `<span class="ut-pill">${x.present ? 'empty' : 'missing'}</span>` : ''}</td></tr>`).join('')}</tbody></table>
       <div class="row" style="margin-top:12px"><button class="ut-btn ut-btn--primary" id="msv">Save</button></div>`;
   } else if (sel === 'tv') {
     main = tvAdmin(m.tv);
@@ -1487,7 +1487,7 @@ function tvAdmin(t) {
       ${c.preparing ? `<div class="ut-progress"><i style="--v:${Math.round(100 * c.preparing.done / Math.max(1, c.preparing.total))}%"></i></div>
         <div class="muted">Reading durations: ${c.preparing.done} of ${c.preparing.total} files (once; afterwards the channel starts at once)</div>` : ''}
       <div class="muted">On now: <span translate="no">${esc(c.now || '–')}</span>${c.now_left_s ? ' · remaining ' + fmtT(c.now_left_s) : ''} · ${c.files} Files · ${fmtT(c.total_s)}</div>
-      <div class="ut-rowbtns"><button class="ut-btn ut-btn--sm" data-tw="${c.id}">Ansehen</button><button class="ut-btn ut-btn--sm ut-btn--ghost" data-tu="${c.id}">Address</button><button class="ut-btn ut-btn--sm ut-btn--ghost" data-te="${c.id}">Bearbeiten</button>${c.running ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-ts="${c.id}">Anhalten</button>` : ''}<button class="ut-btn ut-btn--sm ut-btn--ghost" data-td="${c.id}">Delete</button></div></div>`).join('')
+      <div class="ut-rowbtns"><button class="ut-btn ut-btn--sm" data-tw="${c.id}">Watch</button><button class="ut-btn ut-btn--sm ut-btn--ghost" data-tu="${c.id}">Address</button><button class="ut-btn ut-btn--sm ut-btn--ghost" data-te="${c.id}">Edit</button>${c.running ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-ts="${c.id}">Stop</button>` : ''}<button class="ut-btn ut-btn--sm ut-btn--ghost" data-td="${c.id}">Delete</button></div></div>`).join('')
       : '<p class="muted">No channels yet. “New channel” creates one: pick a name and videos or music from the shares, done.</p>'}`;
 }
 function tvAdminBind(b, t) {
@@ -1572,7 +1572,7 @@ async function tvTune(b, ch) {
     if (code) { try { const r = await fetch(url); code = r.status; msg = (await r.json()).error || msg; } catch (e) { } }
     bad(msg);
     // still preparing (durations being read): try again until it is ready
-    if (code === 503 && /vorbereitet/.test(msg)) setTimeout(() => { if (wins.tv && TVW.id === c.id && TVW.hls === h) tvTune(b, ch); }, 5000);
+    if (code === 503 && /being prepared/.test(msg)) setTimeout(() => { if (wins.tv && TVW.id === c.id && TVW.hls === h) tvTune(b, ch); }, 5000);
   });
   h.loadSource(url); h.attachMedia(v);
 }

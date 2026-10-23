@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -33,8 +33,8 @@
     </button>
     <span class="ut-topbar__item" id="active-title" style="cursor:default">Desktop</span>
     <div class="ut-topbar__spacer"></div>
-    <button class="ut-topbar__item" title="Speicherzustand"><span class="ut-pill ut-pill--ok" style="height:18px">RAID ok</span></button>
-    <button class="ut-topbar__item" title="Netzwerk">
+    <button class="ut-topbar__item" title="Storage state"><span class="ut-pill ut-pill--ok" style="height:18px">RAID ok</span></button>
+    <button class="ut-topbar__item" title="Network">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="9" width="12" height="5" rx="1.5"/><path d="M5 9V6h6v3M8 6V2"/></svg>1 Gbit/s
     </button>
     <button class="ut-topbar__item" id="bell" title="Benachrichtigungen">
@@ -56,12 +56,12 @@
 <script>
 const ICON = n => /^(mesh|settings|logs|packages)$/.test(n) ? `assets/icons/${n}.svg` : `assets/icons/${n}-128.png`;
 const APPS = {
-  files:    { name: 'Dateien' },
-  shares:   { name: 'Freigaben' },
-  storage:  { name: 'Speicher-Manager', w: 860, h: 560 },
+  files:    { name: 'Files' },
+  shares:   { name: 'Shares' },
+  storage:  { name: 'Storage-Manager', w: 860, h: 560 },
   raid:     { name: 'RAID' },
-  network:  { name: 'Netzwerk' },
-  users:    { name: 'Benutzer' },
+  network:  { name: 'Network' },
+  users:    { name: 'Users' },
   updates:  { name: 'Updates' },
   backup:   { name: 'Backup' },
   mesh:     { name: 'UntrashMesh' },
@@ -69,9 +69,9 @@ const APPS = {
   packages: { name: 'Pakete' },
   terminal: { name: 'Terminal', w: 640, h: 380 },
   monitor:  { name: 'Systemmonitor', w: 640, h: 460 },
-  logs:     { name: 'Protokolle' },
-  settings: { name: 'Einstellungen' },
-  power:    { name: 'Ausschalten' },
+  logs:     { name: 'Logs' },
+  settings: { name: 'Settings' },
+  power:    { name: 'Switch off' },
 };
 const DOCK = ['files', 'shares', 'storage', 'backup', 'users', 'network', 'apps', 'monitor', 'terminal', '|', 'settings', 'power'];
 const DESK = ['files', 'shares', 'storage', 'backup', 'mesh'];
@@ -123,7 +123,7 @@ function open(k) {
   w.className = 'ut-window'; w.dataset.app = k;
   w.style.cssText = `width:${W}px;height:${H}px;left:${Math.max(12, (innerWidth - W) / 2 - 60 + (N % 5) * 34)}px;top:${54 + (N++ % 5) * 30}px`;
   w.innerHTML = `<div class="ut-window__bar"><img src="${ICON(k)}" alt=""><span class="ut-window__title">${a.name}</span>
-    <div class="ut-window__ctl"><button data-act="min" aria-label="Minimieren">${IC.min}</button><button data-act="max" aria-label="Maximieren">${IC.max}</button><button data-act="close" aria-label="Schließen">${IC.close}</button></div></div>
+    <div class="ut-window__ctl"><button data-act="min" aria-label="Minimieren">${IC.min}</button><button data-act="max" aria-label="Maximise">${IC.max}</button><button data-act="close" aria-label="Close">${IC.close}</button></div></div>
     <div class="ut-window__body">${(CONTENT[k] || CONTENT._)(k)}</div>`;
   $('#windows').append(w); wins[k] = w;
   w.addEventListener('mousedown', () => focus(w));
@@ -166,41 +166,41 @@ const nav = (items, cur = 0) => `<aside class="ut-sidebar">${items.map((it, i) =
   ? `<div class="ut-sidebar__group">${it[0].slice(1)}</div>`
   : `<button class="ut-nav"${i === cur ? ' aria-current="page"' : ''}>${IC[it[1]]}<span>${it[0]}</span>${it[2] ? `<span class="ut-pill ut-pill--plain ${it[2][1] || ''}">${it[2][0]}</span>` : ''}</button>`).join('')}</aside>`;
 const CONTENT = {
-  _: k => `<div class="ut-window__main"><div class="placeholder"><div><img src="${ICON(k)}" alt=""><h3>${APPS[k].name}</h3><p class="ut-muted">Modul folgt in P4 – Cockpit-Paket im Untrash-Desk-Stil.</p></div></div></div>`,
-  storage: () => nav([['#Speicher'], ['Übersicht', 'grid'], ['Volumes', 'vol', ['2']], ['Datenträger', 'disk', ['3']], ['RAID', 'raid'],
-      ['#Altbestand'], ['Stock-Übernahme', 'import', ['1', 'ut-pill--warn']], ['SMART', 'heart']], 2) + `
+  _: k => `<div class="ut-window__main"><div class="placeholder"><div><img src="${ICON(k)}" alt=""><h3>${APPS[k].name}</h3><p class="ut-muted">Module folgt in P4 – Cockpit-Paket im Untrash-Desk-Stil.</p></div></div></div>`,
+  storage: () => nav([['#Storage'], ['Overview', 'grid'], ['Volumes', 'vol', ['2']], ['Drive', 'disk', ['3']], ['RAID', 'raid'],
+      ['#Legacy'], ['Stock takeover', 'import', ['1', 'ut-pill--warn']], ['SMART', 'heart']], 2) + `
     <div class="ut-window__main">
       <div class="ut-card__head" style="margin-bottom:16px"><h2 style="margin:0">Volumes</h2><span class="ut-spacer"></span>
-        <button class="ut-btn ut-btn--sm">${IC.refresh}Neu einlesen</button><button class="ut-btn ut-btn--primary ut-btn--sm">Volume anlegen</button></div>
-      <div class="ut-callout ut-callout--warn" style="margin-bottom:16px">${IC.info}<div><b>Zyxel-Volume erkannt.</b> Es ist nur lesend eingebunden; Freigaben und Rechte sind unverändert.
-        <div style="margin-top:8px"><button class="ut-btn ut-btn--sm" onclick="takeoverDialog()">Übernahme prüfen …</button></div></div></div>
-      <div class="bays"><div class="bay"><i></i><b>Schacht 1</b>2,0 TB · sda</div><div class="bay"><i></i><b>Schacht 2</b>2,0 TB · sdb</div>
-        <div class="bay"><i style="background:var(--ut-warn);box-shadow:0 0 8px var(--ut-warn)"></i><b>Schacht 3</b>4,0 TB · sdc</div><div class="bay bay--empty"><i></i><b>Schacht 4</b>leer</div></div>
+        <button class="ut-btn ut-btn--sm">${IC.refresh}Rescan</button><button class="ut-btn ut-btn--primary ut-btn--sm">Create volume</button></div>
+      <div class="ut-callout ut-callout--warn" style="margin-bottom:16px">${IC.info}<div><b>Zyxel volume found.</b> It is mounted read-only; shares and rights are unchanged.
+        <div style="margin-top:8px"><button class="ut-btn ut-btn--sm" onclick="takeoverDialog()">Check the takeover …</button></div></div></div>
+      <div class="bays"><div class="bay"><i></i><b>Bay 1</b>2,0 TB · sda</div><div class="bay"><i></i><b>Bay 2</b>2,0 TB · sdb</div>
+        <div class="bay"><i style="background:var(--ut-warn);box-shadow:0 0 8px var(--ut-warn)"></i><b>Bay 3</b>4,0 TB · sdc</div><div class="bay bay--empty"><i></i><b>Bay 4</b>empty</div></div>
       <div class="ut-card">
-        <div class="vol"><div><b>Volume 1</b> <span class="ut-faint">· btrfs auf RAID 1 · sda, sdb</span></div><span class="ut-pill ut-pill--ok">Gesund</span>
-          <div class="ut-progress" style="--v:41%"><i></i></div><span class="ut-faint" style="font-size:var(--ut-fs-xs)">742 GB von 1,8 TB belegt</span></div>
-        <div class="vol"><div><b>Altbestand</b> <span class="ut-faint">· ext4 auf LVM (Zyxel) · sdc</span></div><span class="ut-pill ut-pill--warn">Nur lesen</span>
-          <div class="ut-progress ut-progress--warn" style="--v:78%"><i></i></div><span class="ut-faint" style="font-size:var(--ut-fs-xs)">2,8 TB von 3,6 TB belegt</span></div>
+        <div class="vol"><div><b>Volume 1</b> <span class="ut-faint">· btrfs on RAID 1 · sda, sdb</span></div><span class="ut-pill ut-pill--ok">Healthy</span>
+          <div class="ut-progress" style="--v:41%"><i></i></div><span class="ut-faint" style="font-size:var(--ut-fs-xs)">742 GB of 1,8 TB used</span></div>
+        <div class="vol"><div><b>Legacy</b> <span class="ut-faint">· ext4 on LVM (Zyxel) · sdc</span></div><span class="ut-pill ut-pill--warn">Read only</span>
+          <div class="ut-progress ut-progress--warn" style="--v:78%"><i></i></div><span class="ut-faint" style="font-size:var(--ut-fs-xs)">2,8 TB of 3,6 TB used</span></div>
       </div>
-      <div class="ut-section-title">Laufende Vorgänge</div>
-      <div class="ut-card"><div class="vol"><div>RAID 1 · Volume 1 · Konsistenzprüfung</div><span class="ut-pill ut-pill--info ut-pill--live">62 %</span>
+      <div class="ut-section-title">Running tasks</div>
+      <div class="ut-card"><div class="vol"><div>RAID 1 · Volume 1 · consistency check</div><span class="ut-pill ut-pill--info ut-pill--live">62 %</span>
         <div class="ut-progress" style="--v:62%"><i></i></div></div></div>
     </div>`,
   monitor: () => `<div class="ut-window__main">
-      <div class="ut-tabs"><button class="ut-tab" aria-selected="true">Leistung</button><button class="ut-tab" aria-selected="false">Prozesse</button><button class="ut-tab" aria-selected="false">Dienste</button></div>
+      <div class="ut-tabs"><button class="ut-tab" aria-selected="true">Leistung</button><button class="ut-tab" aria-selected="false">Prozesse</button><button class="ut-tab" aria-selected="false">Services</button></div>
       <div class="grid-3">
         <div class="ut-stat"><div class="ut-stat__label">CPU · 2× A9</div><div class="ut-stat__value">23<small>%</small></div></div>
-        <div class="ut-stat"><div class="ut-stat__label">Speicher</div><div class="ut-stat__value">412<small>/ 1024 MB</small></div></div>
-        <div class="ut-stat"><div class="ut-stat__label">Temperatur</div><div class="ut-stat__value">41<small>°C · Lüfter 1</small></div></div>
+        <div class="ut-stat"><div class="ut-stat__label">Storage</div><div class="ut-stat__value">412<small>/ 1024 MB</small></div></div>
+        <div class="ut-stat"><div class="ut-stat__label">Temperature</div><div class="ut-stat__value">41<small>°C · fan 1</small></div></div>
       </div>
-      <div class="ut-card"><div class="ut-card__head"><h3>CPU-Last</h3><span class="ut-spacer"></span><span class="ut-faint">letzte 60 s</span></div>
+      <div class="ut-card"><div class="ut-card__head"><h3>CPU-Load</h3><span class="ut-spacer"></span><span class="ut-faint">last 60 s</span></div>
         <svg class="spark" viewBox="0 0 300 60" preserveAspectRatio="none"><defs><linearGradient id="sg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#19d6a6" stop-opacity=".35"/><stop offset="1" stop-color="#19d6a6" stop-opacity="0"/></linearGradient><linearGradient id="sl" x1="0" x2="1"><stop offset="0" stop-color="#6ff06b"/><stop offset="1" stop-color="#00bfd0"/></linearGradient></defs>
           <path id="spark-a" fill="url(#sg)"/><path id="spark-l" fill="none" stroke="url(#sl)" stroke-width="2" vector-effect="non-scaling-stroke"/></svg></div>
     </div>`,
   terminal: () => `<div class="ut-window__main" style="padding:0;background:#05080a"><pre class="ut-log" style="border:0;border-radius:0;max-height:none;height:100%;color:#cfe">admin@untrash:~$ untrash status
-<span style="color:var(--ut-green)">●</span> System    Slot A · 1.0 · gut
-<span style="color:var(--ut-green)">●</span> Speicher  Volume 1 gesund · Altbestand nur lesen
-<span style="color:var(--ut-warn)">●</span> Backup    letzte Sicherung vor 3 Tagen
+<span style="color:var(--ut-green)">●</span> System    Slot A · 1.0 · good
+<span style="color:var(--ut-green)">●</span> Storage  Volume 1 healthy · Legacy read-only
+<span style="color:var(--ut-warn)">●</span> Backup    last backup 3 days ago
 admin@untrash:~$ <span style="background:var(--ut-teal)"> </span></pre></div>`,
 };
 setInterval(() => { /* fake sparkline */
@@ -232,48 +232,48 @@ $('#logo-btn').onclick = e => {
 $('#user-btn').onclick = e => {
   if (e.currentTarget.getAttribute('aria-expanded') === 'true') return closeMenus();
   const r = e.currentTarget.getBoundingClientRect();
-  menu(`<div class="ut-menu__label">Angemeldet als admin</div>
-    <button class="ut-menu__item">${IC.user}Mein Konto</button><button class="ut-menu__item">${IC.lock}Sperren<kbd>Ctrl L</kbd></button>
-    <div class="ut-menu__sep"></div><button class="ut-menu__item" onclick="location.href='login.html'">${IC.restart}Abmelden</button>
-    <button class="ut-menu__item ut-menu__item--danger" data-app="power">${IC.power}Ausschalten …</button>`, r.right - 230, r.bottom + 6, '', e.currentTarget);
+  menu(`<div class="ut-menu__label">Signed in as admin</div>
+    <button class="ut-menu__item">${IC.user}My account</button><button class="ut-menu__item">${IC.lock}Block<kbd>Ctrl L</kbd></button>
+    <div class="ut-menu__sep"></div><button class="ut-menu__item" onclick="location.href='login.html'">${IC.restart}Sign out</button>
+    <button class="ut-menu__item ut-menu__item--danger" data-app="power">${IC.power}Switch off …</button>`, r.right - 230, r.bottom + 6, '', e.currentTarget);
 };
 $('#desk').addEventListener('contextmenu', e => {
   if (e.target.closest('.ut-window, .ut-dock, .ut-topbar, .ut-menu')) return;
   e.preventDefault();
-  menu(`<button class="ut-menu__item" data-app="files">${IC.folder}Dateien öffnen</button><button class="ut-menu__item" data-app="storage">${IC.vol}Speicher-Manager</button>
-    <div class="ut-menu__sep"></div><button class="ut-menu__item" data-app="settings">${IC.grid}Hintergrund & Darstellung</button><button class="ut-menu__item" onclick="location.href='styleguide.html'">${IC.info}Design-System</button>`, e.clientX, e.clientY);
+  menu(`<button class="ut-menu__item" data-app="files">${IC.folder}Open Files</button><button class="ut-menu__item" data-app="storage">${IC.vol}Storage manager</button>
+    <div class="ut-menu__sep"></div><button class="ut-menu__item" data-app="settings">${IC.grid}Wallpaper & appearance</button><button class="ut-menu__item" onclick="location.href='styleguide.html'">${IC.info}Design system</button>`, e.clientX, e.clientY);
 });
 
 /* ---------------------------------------------------------------- toasts + dialogs */
 function toast({ icon, title, text, kind = '', actions = '' }) {
   const t = document.createElement('div'); t.className = 'ut-toast ' + (kind ? 'ut-toast--' + kind : '');
   t.innerHTML = `<img src="${ICON(icon)}" alt=""><div class="ut-toast__body"><div class="ut-toast__title">${title}</div><div class="ut-toast__text">${text}</div>
-    ${actions ? `<div class="ut-toast__actions">${actions}</div>` : ''}<div class="ut-toast__time">gerade eben</div></div>
-    <button class="ut-btn ut-btn--ghost ut-btn--icon ut-btn--sm ut-toast__close" aria-label="Schließen">${IC.close}</button>`;
+    ${actions ? `<div class="ut-toast__actions">${actions}</div>` : ''}<div class="ut-toast__time">just now</div></div>
+    <button class="ut-btn ut-btn--ghost ut-btn--icon ut-btn--sm ut-toast__close" aria-label="Close">${IC.close}</button>`;
   t.querySelector('.ut-toast__close').onclick = () => { t.remove(); $('#bell-n').textContent = Math.max(0, $('#toasts').children.length); };
   $('#toasts').append(t);
 }
 function dialog({ kind = '', icon = IC.info, title, body, ok, okCls = 'ut-btn--primary', onOk }) {
   const s = document.createElement('div'); s.className = 'ut-scrim';
   s.innerHTML = `<div class="ut-dialog ${kind ? 'ut-dialog--' + kind : ''}" role="dialog" aria-modal="true"><div class="ut-dialog__head"><div class="ut-dialog__icon">${icon}</div><h2>${title}</h2></div>
-    <div class="ut-dialog__body">${body}</div><div class="ut-dialog__foot"><button class="ut-btn" data-x>Abbrechen</button><button class="ut-btn ${okCls}" data-ok>${ok}</button></div></div>`;
+    <div class="ut-dialog__body">${body}</div><div class="ut-dialog__foot"><button class="ut-btn" data-x>Cancel</button><button class="ut-btn ${okCls}" data-ok>${ok}</button></div></div>`;
   s.onclick = e => { if (e.target === s || e.target.closest('[data-x]')) s.remove(); };
   s.querySelector('[data-ok]').onclick = () => { s.remove(); onOk && onOk(); };
   document.body.append(s); s.querySelector('[data-ok]').focus();
 }
 function powerDialog() {
   closeMenus();
-  dialog({ kind: 'danger', icon: IC.power, title: 'NAS ausschalten?', ok: 'Ausschalten', okCls: 'ut-btn--danger',
-    body: '<p>Laufende Kopien und die Konsistenzprüfung von <b style="color:var(--ut-fg)">Volume 1</b> werden angehalten und beim nächsten Start fortgesetzt.</p><label class="ut-switch"><input type="checkbox"><i></i>Stattdessen neu starten</label>',
-    onOk: () => toast({ icon: 'power', title: 'Vorschau', text: 'Hier würde die NAS jetzt herunterfahren.' }) });
+  dialog({ kind: 'danger', icon: IC.power, title: 'Switch the NAS off?', ok: 'Switch off', okCls: 'ut-btn--danger',
+    body: '<p>Running copies and the consistency check of <b style="color:var(--ut-fg)">Volume 1</b> are paused and continue at the next start.</p><label class="ut-switch"><input type="checkbox"><i></i>Restart instead</label>',
+    onOk: () => toast({ icon: 'power', title: 'Preview', text: 'The NAS would shut down now.' }) });
 }
 function takeoverDialog() {
-  dialog({ kind: 'warn', title: 'Zyxel-Volume übernehmen?', ok: 'Übernahme starten',
-    body: '<p>UntrashOS liest Benutzer, Gruppen und Freigaben der Stock-Firmware und stellt sie unverändert bereit. md-, LVM- und ext4-Metadaten bleiben, wie sie sind.</p><p class="ut-faint" style="margin:0">Vorher wird die Stock-Konfiguration auf den Stick gesichert.</p>' });
+  dialog({ kind: 'warn', title: 'Take over the Zyxel volume?', ok: 'Start the takeover',
+    body: '<p>UntrashOS reads the users, groups and shares of the stock firmware and serves them unchanged. md, LVM and ext4 metadata stay as they are.</p><p class="ut-faint" style="margin:0">The stock configuration is saved to the stick first.</p>' });
 }
-setTimeout(() => toast({ icon: 'raid', title: 'Konsistenzprüfung läuft', text: 'RAID 1 · Volume 1 – 62 %, noch etwa 2 h' }), 600);
-setTimeout(() => toast({ icon: 'backup', kind: 'warn', title: 'Backup überfällig', text: 'Die letzte Sicherung ist 3 Tage alt.',
-  actions: '<button class="ut-btn ut-btn--primary ut-btn--sm" data-app="backup">Jetzt sichern</button><button class="ut-btn ut-btn--sm">Später</button>' }), 1300);
+setTimeout(() => toast({ icon: 'raid', title: 'Consistency check running', text: 'RAID 1 · Volume 1 – 62 %, about 2 h left' }), 600);
+setTimeout(() => toast({ icon: 'backup', kind: 'warn', title: 'Backup overdue', text: 'The last backup is 3 days old.',
+  actions: '<button class="ut-btn ut-btn--primary ut-btn--sm" data-app="backup">Back up now</button><button class="ut-btn ut-btn--sm">Later</button>' }), 1300);
 
 /* ---------------------------------------------------------------- clock */
 const tick = () => $('#clock').textContent = new Date().toLocaleString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });

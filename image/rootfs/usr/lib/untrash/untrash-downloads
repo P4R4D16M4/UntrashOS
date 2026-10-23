@@ -74,7 +74,7 @@ def main():
             c = {}
         print("download complete: %s" % a[2], flush=True)
         if c.get("notify"):
-            subprocess.run(["/usr/lib/untrash/untrash-notify", "alert", "Download fertig", a[2]], check=False)
+            subprocess.run(["/usr/lib/untrash/untrash-notify", "alert", "Download finished", a[2]], check=False)
         return 0
     print(__doc__)
     return 2

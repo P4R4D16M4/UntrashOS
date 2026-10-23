@@ -130,15 +130,15 @@ def auth_finish(name, url):
     u = urllib.parse.urlsplit(url.strip())
     q = urllib.parse.parse_qs(u.query)
     if u.hostname not in ("127.0.0.1", "localhost") or (u.port or 80) != AUTH_PORT or "state" not in q:
-        die("Das ist nicht die Rücksprung-Adresse (http://127.0.0.1:%d/?state=…&code=…)." % AUTH_PORT)
+        die("That is not the return address (http://127.0.0.1:%d/?state=…&code=…)." % AUTH_PORT)
     if "code" not in q:
-        die("Anmeldung abgelehnt: %s" % (q.get("error", ["kein code"])[0]))
+        die("Sign-in refused: %s" % (q.get("error", ["no code"])[0]))
     st = json.load(open(os.path.join(RUN, "cloud-auth.json")))
     local = "http://127.0.0.1:%d/?%s" % (AUTH_PORT, u.query)
     try:
         urllib.request.urlopen(local, timeout=30).read()
     except OSError as e:
-        die("rclone hat die Anmeldung nicht angenommen: %s" % e)
+        die("rclone did not accept the sign-in: %s" % e)
     token = None
     for _ in range(300):
         m = re.search(r"--->\s*(\{.*?\})\s*<---", open(st["log"]).read(), re.S)
@@ -147,7 +147,7 @@ def auth_finish(name, url):
             break
         time.sleep(0.1)
     if not token:
-        die("kein Token von rclone: %s" % open(st["log"]).read()[-300:])
+        die("no token from rclone: %s" % open(st["log"]).read()[-300:])
     secure_conf()
     extra = ["scope=drive"] if st["provider"] == "drive" else []
     rclone("config", "create", name, PROVIDERS[st["provider"]], "token=" + token, *extra, "--non-interactive")

@@ -83,11 +83,11 @@ def run_job(j):
     missing = [s for s in srcs if not os.path.isdir(s)]
     tgt = j["target"]
     if missing:
-        rc, log = 1, ["Quelle fehlt: %s" % ", ".join(missing)]
+        rc, log = 1, ["Source missing: %s" % ", ".join(missing)]
     elif tgt["kind"] == "local" and not os.path.isdir(os.path.dirname(ROOT + tgt["path"].rstrip("/"))):
-        rc, log = 1, ["Ziel fehlt: %s" % tgt["path"]]
+        rc, log = 1, ["Target missing: %s" % tgt["path"]]
     elif tgt["kind"] == "usb" and not os.path.isdir(ROOT + tgt["path"]):
-        rc, log = 1, ["Ziel fehlt: %s (USB-Datenträger eingesteckt?)" % tgt["path"]]
+        rc, log = 1, ["Target missing: %s (USB drive plugged in?)" % tgt["path"]]
     elif tgt["kind"] == "rsync":
         env = dict(os.environ)
         try:
@@ -122,7 +122,7 @@ def run_job(j):
                 vers = sorted(v for v in os.listdir(base) if VER_RE.match(v))
                 for old in vers[:-keep]:
                     shutil.rmtree(os.path.join(base, old), ignore_errors=True)
-                    log.append("alte Version %s gelöscht" % old)
+                    log.append("old version %s deleted" % old)
         else:
             for s in srcs:
                 r = subprocess.run(rsync_cmd(j, ["--delete"]) + [s, base + "/"], stdout=subprocess.PIPE,
@@ -134,7 +134,7 @@ def run_job(j):
     json.dump(res, open(os.path.join(STATE, j["id"] + ".json"), "w"), indent=1)
     print("%s %s: %s" % (j["id"], j["type"], "ok" if rc == 0 else "FAILED %d" % rc), flush=True)
     if rc:
-        subprocess.run([NOTIFY, "alert", "Sicherung %s fehlgeschlagen" % j["name"], "\n".join(log[-15:])], check=False)
+        subprocess.run([NOTIFY, "alert", "Backup %s failed" % j["name"], "\n".join(log[-15:])], check=False)
     return res
 
 

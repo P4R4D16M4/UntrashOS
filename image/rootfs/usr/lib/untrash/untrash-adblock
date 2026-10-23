@@ -41,7 +41,7 @@ PID = os.path.join(RUN, "dnsmasq.pid")
 LOG_MAX = int(os.environ.get("ZT_ADBLOCK_LOG_MAX", str(8 << 20)))   # x2 files, ~2 days of a household
 MAX_DOMAINS = 250000            # RAM guard (1 GB NAS): 2 entries per name, ~40 MB in dnsmasq at most
 DEFAULT_LISTS = [
-    {"name": "StevenBlack (Werbung + Malware)", "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", "on": True},
+    {"name": "StevenBlack (ads + malware)", "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", "on": True},
     {"name": "Hagezi Light", "url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/light.txt", "on": False},
     {"name": "Hagezi Pro (strenger)", "url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/pro.txt", "on": False},
 ]
@@ -154,7 +154,7 @@ def update(s=None, fetcher=fetch):
         try:
             text = fetcher(l["url"])
             if not parse_list(text):
-                raise ValueError("keine Domains erkannt")
+                raise ValueError("no domains found")
             os.makedirs(DATA, exist_ok=True)
             with open(cache_path(l["url"]) + ".tmp", "w") as f:
                 f.write(text)

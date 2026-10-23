@@ -14,7 +14,7 @@ if sys.argv[1:2] == ["status"]:
     print(json.dumps({
         "disks": [{"bay": "disk%d" % i, "dev": "/dev/sd" + "abcd"[i - 1], "size": 4 * 10 ** 12, "model": "TEST",
                    "role": r, "detail": d} for i, (r, d) in enumerate(
-            [("member", "md2 (aktiv)"), ("member", "md2 (aktiv)"), ("free", "leer"),
+            [("member", "md2 (active)"), ("member", "md2 (active)"), ("free", "empty"),
              ("foreign", "Daten eines anderen Arrays (raid1, 1234abcd)")], 1)],
         "arrays": [{"md": "md2", "dev": "/dev/md2", "uuid": "aaaa0001:00:00:00", "uuid8": "aaaa0001", "level": "raid1",
                     "state": "Normal", "progress": None, "raid_disks": 2, "size": 4 * 10 ** 12, "type": "md", "vg": "",

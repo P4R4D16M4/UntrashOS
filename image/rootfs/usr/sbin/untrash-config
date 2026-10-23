@@ -230,7 +230,7 @@ def stock_to_settings(cfg):
     if tz:
         s["time"]["timezone"] = tz
     elif g("system.date_time.timezoneCountry"):
-        unsupported.append("Zeitzone %r nicht zugeordnet (Europe/Berlin)" % g("system.date_time.timezoneCountry"))
+        unsupported.append("Time zone %r not mapped (Europe/Berlin)" % g("system.date_time.timezoneCountry"))
     s["time"]["ntp"] = yes(g("system.date_time.timeServerActive", "true"))
     if g("system.date_time.timeServerAddr"):
         s["time"]["ntp_server"] = g("system.date_time.timeServerAddr")
@@ -284,8 +284,8 @@ def stock_to_settings(cfg):
         except OSError:
             on = None
         if on and yes(on.group(1)):
-            unsupported.append("%s war an: %s" % (app, "unter Cloud das Konto neu verbinden und den Auftrag anlegen"
-                                                  if ok else "in UntrashOS bewusst weggelassen"))
+            unsupported.append("%s was on: %s" % (app, "connect the account again under Cloud and create the job"
+                                                  if ok else "left out of UntrashOS on purpose"))
     sv["itunes"] = yes(g("system.service.itune.active", "false"))
     if sv["itunes"]:
         unsupported.append("iTunes-Server (DAAP, in UntrashOS bewusst weggelassen)")
@@ -301,14 +301,14 @@ def stock_to_settings(cfg):
     # inside the daemon, defaults like stock (admin/download, watch folder admin/download/torrent)
     sv["download"] = dict(DEFAULTS["services"]["download"], active=not os.path.exists(os.path.join(cfg, "dservice.disable")))
     if yes(g("system.service.telnet.active", "false")):
-        unsupported.append("Telnet (bewusst nicht angeboten)")
+        unsupported.append("Telnet (not offered on purpose)")
     d = "system.service.dydns."
     sv["dyndns"] = {"active": yes(g(d + "active", "false")), "provider": g(d + "provider") or "dyndns",
                     "username": g(d + "username") or "", "password": g(d + "password") or "",
                     "hostname": g(d + "hostname") or ""}
     if sv["dyndns"]["provider"] not in DYNDNS:
         if sv["dyndns"]["active"]:
-            unsupported.append("DynDNS-Anbieter %s gibt es nicht mehr (DynDNS aus)" % sv["dyndns"]["provider"])
+            unsupported.append("DynDNS provider %s no longer exists (DynDNS off)" % sv["dyndns"]["provider"])
         sv["dyndns"].update(active=False, provider="dyndns")
     m = "maintenance.log.mail."
     sched = g(m + "schedule") or "hourly"
@@ -357,7 +357,7 @@ def stock_to_settings(cfg):
                     exports.append({"path": m.group(1), "clients": m.group(2), "options": m.group(3)})
     sv["nfs"] = {"active": nfs_on, "exports": exports}
     if nfs_on and not exports:
-        unsupported.append("NFS war an, aber keine Exportliste in der Stock-Konfiguration gefunden")
+        unsupported.append("NFS was on, but no export list was found in the stock configuration")
     try:
         mins = num(open(os.path.join(cfg, "hd-idle.conf")).read(), 0)
     except OSError:
@@ -397,7 +397,7 @@ def stock_to_settings(cfg):
                     if svc in ("HTTP", "HTTPS", "FTP", "SSH", "WEBDAV_HTTP", "WEBDAV_HTTPS", "WEBPUBLISHING_HTTP", "MEDIASERVER"):
                         s["upnp"]["services"][svc] = num(wan, -1)
                     else:
-                        unsupported.append("UPnP-Weiterleitung %s (WAN %s) nicht übernommen" % (svc, wan))
+                        unsupported.append("UPnP forwarding %s (WAN %s) not taken over" % (svc, wan))
         except sqlite3.Error:
             pass
         c.close()
@@ -437,7 +437,7 @@ def stock_power_schedule(cfg, unsupported):
         try:
             t = datetime.datetime.fromtimestamp(int(start))
         except (TypeError, ValueError):
-            unsupported.append("Zeitplan-Eintrag ohne lesbare Startzeit")
+            unsupported.append("Schedule entry without a readable start time")
             continue
         base = {"action": action, "hour": t.hour, "minute": t.minute}
         if str(tt) == "0":
@@ -449,7 +449,7 @@ def stock_power_schedule(cfg, unsupported):
         elif str(tt) == "2":
             out.append(dict(base, kind="monthly", mday=num(dom, t.day)))
         else:
-            unsupported.append("Zeitplan „monatlich nach Woche“ (%s) nicht übernommen" % action)
+            unsupported.append("Schedule “monthly by week” (%s) not taken over" % action)
     return out
 
 

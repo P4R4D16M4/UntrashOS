@@ -319,7 +319,7 @@ def main():
             check("cloud state: accounts, jobs, shares", st == 200 and cj["remotes"][0]["name"] == "Box" and "mixed" in cj["shares"])
             check("cloud auth-start returns the login page", a.req("/api/cloud/auth-start", {"provider": "dropbox"})[1]["url"].startswith("https://"))
             st, er = a.req("/api/cloud/auth-finish", {"name": "B2", "url": "http://x/"})
-            check("cloud auth-finish error passed on", st == 400 and "Rücksprung" in er["error"])
+            check("cloud auth-finish error passed on", st == 400 and "return address" in er["error"])
             check("cloud job with unknown account refused", a.req("/api/cloud/jobs", {"jobs": [{"name": "x", "remote": "Nope", "share": "mixed", "direction": "both"}]})[0] == 400)
             check("cloud job path traversal refused", a.req("/api/cloud/jobs", {"jobs": [{"name": "x", "remote": "Box", "share": "mixed", "folder": "../..", "direction": "both"}]})[0] == 400)
             st, jj = a.req("/api/cloud/jobs", {"jobs": [{"name": "Sync", "remote": "Box", "share": "mixed", "folder": "Dropbox", "direction": "both", "interval_min": 1, "active": True}]})
@@ -576,7 +576,7 @@ def main():
                 urllib.request.urlopen(anon.base + lk["url"])
                 gone = False
             except urllib.error.HTTPError as e:
-                gone = e.code == 404 and b"abgelaufen" in e.read()
+                gone = e.code == 404 and b"expired" in e.read()
             check("deleted link answers 404", dl == 200 and gone)
             # export: USB targets (never the UntrashOS stick), copy job runs to the end, rights
             os.makedirs(r + "/media/usb-x", exist_ok=True)

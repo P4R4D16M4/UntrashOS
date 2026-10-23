@@ -9,6 +9,7 @@ import glob
 import importlib.util
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +42,9 @@ def main():
         for i, lang in enumerate(LANGS):
             with open(os.path.join(OUT, lang + ".json"), "w", encoding="utf-8") as f:
                 json.dump({"lang": lang, "text": {k: v[i] for k, v in sorted(t.items())}}, f, ensure_ascii=False, indent=0)
-    missing = [x for x in extract.collect() if x not in t]
+    # a piece of a composed text ('Connect ' + name) is covered by a pattern key ("Connect %s")
+    parts = {p.strip() for k in t if "%" in k for p in re.split(r"%(?:\.\d)?[sdf]", k)}
+    missing = [x for x in extract.collect() if x not in t and x not in parts]
     for x in missing:
         print("MISSING " + x)
     print("i18n: %d texts, %d translated, %d missing" % (len(t) + len([x for x in missing]), len(t), len(missing)))

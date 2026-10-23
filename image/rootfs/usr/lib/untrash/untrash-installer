@@ -89,7 +89,7 @@ def root_disk():
 def find_stick():
     if TEST and os.environ.get("ZT_INSTALLER_STICKDIR"):
         d = os.environ["ZT_INSTALLER_STICKDIR"]
-        return {"disk": "test", "dev": d, "mnt": d, "size": 0, "model": "Testverzeichnis", "fake": True}
+        return {"disk": "test", "dev": d, "mnt": d, "size": 0, "model": "test directory", "fake": True}
     for d in lsblk():
         if d.get("tran") != "usb":
             continue
@@ -328,7 +328,7 @@ def wait_copy_key():
 
 
 def backup_disk_meta(stick, disk, tag):
-    """Partition table, md superblock areas and LVM metadata -> stick (Ebene E)."""
+    """Partition table, md superblock areas and LVM metadata -> stick (level E)."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = os.path.join(stick["mnt"], "UNTRASH", "disk-backup-%s-%s-%s" % (tag, disk["name"], stamp))
     run(["mkdir", "-p", out])
@@ -512,9 +512,9 @@ def stock_volumes():
             detail = r.stdout.decode("utf-8", "replace").strip()
         # Keep the web response readable and never turn arbitrary command
         # output into markup (the client escapes every problem string).
-        detail = " ".join(detail.split())[-600:] or "none Detailmeldung erhalten"
+        detail = " ".join(detail.split())[-600:] or "no details received"
         print("importer volumes --mount failed (rc %d): %s" % (r.returncode, detail), flush=True)
-        return [], "Read-only-Prüfung of RAID/LVM/Dateisystem fehlgeschlagen: " + detail
+        return [], "Read-only check of RAID/LVM/file system failed: %s" % detail
     out = []
     for a in arrays:
         for v in a.get("volumes") or []:
@@ -535,7 +535,7 @@ def stock_volumes():
                 if not v.get("mounted"):
                     unknown.append("%s (%s)" % (v.get("dev", "?"), v.get("type", "unknown")))
         if unknown:
-            return [], "Kein einhängbares ext4-Stock-Volume: " + ", ".join(unknown[:4])
+            return [], "No mountable ext4 stock volume: %s" % ", ".join(unknown[:4])
     return sorted(out, key=lambda v: (not v["sysvol"], v["name"])), None
 
 
@@ -653,7 +653,7 @@ def write_new_config(req, vol, dst, root):
     nt = md4(pw.encode("utf-16-le")).hex().upper()
     shadow = sh(["openssl", "passwd", "-6", "-stdin"], input=pw.encode()).strip()
     if not shadow.startswith("$6$"):
-        raise RuntimeError("openssl passwd lieferte keinen SHA-512-Hash")
+        raise RuntimeError("openssl passwd gave no SHA-512 hash")
     os.makedirs(dst, mode=0o700)
     c = sqlite3.connect(os.path.join(dst, "ugs_conf.db"))
     c.executescript(STOCK_SCHEMA)
@@ -672,7 +672,7 @@ def write_new_config(req, vol, dst, root):
         f.write("[system]\n    hostname = %s\n    [[servername]]\n        servername = %s\n"
                 "        description = UntrashOS\n        workgroupname = WORKGROUP\n        nomaster = false\n" % (
                     req["netname"].strip().lower(), req["netname"].strip()))
-    JOB.add("Neue Konfiguration: Users admin, %d Share(n), Name %s" % (
+    JOB.add("New configuration: user admin, %d share(s), name %s" % (
         len(shares), req["netname"].strip()))
 
 
@@ -744,19 +744,19 @@ def do_keep_install(req, info, takeover):
         run(["mdadm", "--stop", md])
     clear_install_marker(stick)
     # two whole sentences, so the EN/FR catalogs can translate each (i18n.js patterns)
-    JOB.add(("Done: Restart startet UntrashOS %s off /.untrash auf „%s“ und richtet beim ersten Start die alten "
-             "Users und Shares ein" if takeover else
-             "Done: Restart startet UntrashOS %s off /.untrash auf „%s“ und richtet beim ersten Start admin und "
-             "die Shares ein") % (slot["version"], vol["name"]))
+    JOB.add(("Done: restarting starts UntrashOS %s from /.untrash on “%s” and sets up the old users and "
+             "shares on the first start" if takeover else
+             "Done: restarting starts UntrashOS %s from /.untrash on “%s” and sets up admin and the shares on "
+             "the first start") % (slot["version"], vol["name"]))
 
 
 MODES = {
-    "A": {"title": "Neuinstallation – Disk löschen", "fn": do_wipe_install, "copy": True},
-    "B": {"title": "Neuinstallation – Daten behalten, alte Users und Shares übernehmen",
+    "A": {"title": "new installation – erase the disk", "fn": do_wipe_install, "copy": True},
+    "B": {"title": "new installation – keep the data, take over the old users and shares",
           "fn": lambda req, info: do_keep_install(req, info, True), "copy": True},
-    "C": {"title": "Neuinstallation – Daten behalten, neue Users und Settings",
+    "C": {"title": "new installation – keep the data, new users and settings",
           "fn": lambda req, info: do_keep_install(req, info, False), "copy": True},
-    "D": {"title": "Stock-Firmware off der Backup auf dem Stick wiederherstellen", "fn": do_stock_restore,
+    "D": {"title": "restore the stock firmware from the backup on the stick", "fn": do_stock_restore,
           "copy": True},
 }
 
@@ -791,8 +791,8 @@ def plan(req, info):
             names = {os.path.basename(m) for m in a.get("members") or []}
             others = {p["name"] for p in disk["parts"]}
             if a.get("role") == "stock-data" and names & others and names - others:
-                steps.insert(2, "Achtung: Der Stock-Verband %s (%s) verliert damit eine Disk und ist danach "
-                                "incomplete" % (a.get("level"), a["uuid"][:8]))
+                steps.insert(2, "Caution: the stock array %s (%s) loses a disk and is incomplete "
+                                "afterwards" % (a.get("level"), a["uuid"][:8]))
         phrase = "DELETE %s" % disk["name"]
     elif m == "D":
         b = next((x for x in info["backups"] if x["name"] == req.get("backup")), None)
@@ -806,10 +806,10 @@ def plan(req, info):
         steps = [("Check the checksums of backup %s (%d files, read back when it was made)" if b["verified"]
                   else "Check the checksums of backup %s (%d files)") % (b["name"], b["files"]),
                  "Write the marker UNTRASH/ROLLBACK to the stick and restart",
-                 "Die NAS startet einmal die Stock-Firmware; diese schreibt Env und kernel%s off der Backup "
-                 "zurück und schaltet off (Stick stecken lassen)" % b["device"].get("LOADER_SLOT", "?"),
-                 "Danach einschalten: Stock-Firmware wie vor der Installation; Daten auf den Disks bleiben, "
-                 "UntrashOS-Files in /.untrash bzw. die UntrashOS-Disk bleiben liegen",
+                 "The NAS starts the stock firmware once; it writes env and kernel%s back from the backup "
+                 "and powers off (leave the stick in)" % b["device"].get("LOADER_SLOT", "?"),
+                 "Then power on: stock firmware as before the installation; data on the disks stays, the "
+                 "UntrashOS files in /.untrash or the UntrashOS disk are left in place",
                  "Confirm at the NAS: press the COPY button"]
         phrase = "STOCK"
     elif m in ("B", "C"):
@@ -852,7 +852,7 @@ def plan(req, info):
                  "Store system image %s twice as /.untrash/slot-a/b.utslot and read it back (%.1f GB)" % (
                      slot.get("version", "?"), 2 * slot.get("size", 0) / 1e9),
                  "Create the state (/.untrash/state.img, 4 GiB) and swap (/.untrash/swap.img, 1 GiB)"
-                 + (" – vorhandener Zustand stays" if vol["untrash"] else ""),
+                 + (" – the existing state is kept" if vol["untrash"] else ""),
                  "Write the boot counter /.untrash/bootstate, remove the marker UNTRASH/INSTALL from the stick"]
         if m == "B":
             steps.append("Stock configuration to /.untrash/stock-config; on the first start UntrashOS takes over "
@@ -888,7 +888,7 @@ def start(req):
 
     def worker():
         mode = MODES[req["mode"]]
-        JOB.add("Weg %s: %s%s" % (req["mode"], mode["title"], " (PROBELAUF)" if DRYRUN else ""))
+        JOB.add("Way %s: %s%s" % (req["mode"], mode["title"], " (DRY RUN)" if DRYRUN else ""))
         if mode.get("copy"):
             JOB.add("Waiting for the COPY button at the NAS (%d s) ..." % COPY_WAIT)
             if not wait_copy_key():

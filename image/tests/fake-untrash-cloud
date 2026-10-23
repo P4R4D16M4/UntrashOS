@@ -17,7 +17,7 @@ elif a[:1] == ["auth-start"]:
     print(json.dumps({"url": "https://www.dropbox.com/oauth2/authorize?x", "provider": a[1]}))
 elif a[:1] == ["auth-finish"]:
     if "code=" not in a[2]:
-        print("untrash-cloud: Das ist nicht die Rücksprung-Adresse", file=sys.stderr)
+        print("untrash-cloud: That is not the return address", file=sys.stderr)
         sys.exit(1)
     print(json.dumps({"name": a[1], "type": "dropbox"}))
 elif a[:1] in (["add-ftp"], ["delete"], ["run"]):

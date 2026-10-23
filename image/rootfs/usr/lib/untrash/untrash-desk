@@ -851,7 +851,7 @@ def printers():
         name = p.get("name", "")
         st = read(["lpstat", "-p", name]).strip()
         out.append({"serial": serial, "name": name, "model": p.get("model", ""),
-                    "status": "ready" if "idle" in st or "Leerlauf" in st else ("druckt" if "printing" in st else
+                    "status": "ready" if "idle" in st or "Leerlauf" in st else ("printing" if "printing" in st else
                                                                                   p.get("status", "?")),
                     "jobs": sum(1 for j in jobs if j.startswith(name + "-"))})
     return {"printers": out}
@@ -1268,13 +1268,13 @@ def upnp_save(req):
     want = {}
     for k, v in (req.get("services") or {}).items():
         if k not in UPNP_SERVICES:
-            raise Fail("Unbekannter Service %s." % k)
+            raise Fail("Unknown service %s." % k)
         v = int(v or 0)
         if v:
             if not 1 <= v <= 65535:
                 raise Fail("WAN port 1 to 65535.")
             if v in want.values():
-                raise Fail("WAN-Port %d doppelt." % v)
+                raise Fail("WAN port %d used twice." % v)
             want[k] = v
     s = settings_load()
     s.setdefault("upnp", {})["services"] = want
@@ -1368,7 +1368,7 @@ def notify_test(req):
     r = subprocess.run(["/usr/lib/untrash/untrash-notify", "test"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                        text=True, timeout=120)
     if r.returncode:
-        raise Fail((r.stdout.strip().splitlines() or ["Versand fehlgeschlagen"])[-1])
+        raise Fail((r.stdout.strip().splitlines() or ["Sending failed"])[-1])
     return {"log": r.stdout.splitlines()}
 
 
@@ -1497,7 +1497,7 @@ def raid_job(req):
                 del RAIDJOB["log"][:-2000]
             rc = p.wait()
         except OSError as e:
-            RAIDJOB["log"].append("FEHLER %s" % e)
+            RAIDJOB["log"].append("ERROR %s" % e)
         try:
             with LOCK:
                 resmb()            # shares on a deleted volume left the database
@@ -1563,7 +1563,7 @@ def update_upload(handler, length):
                 if hashlib.sha256(f.read(int(m[p + "_len"]))).hexdigest() != m.get(p + "_sha256"):
                     raise Fail("Image damaged (%s)." % p)
     UPDATE.update(state="ready", version=m.get("version", "?"), file=tmp, size=length,
-                  log=["Abbild %s geprüft (Signatur, Kernel, DTB, initrd)" % m.get("version", "?")])
+                  log=["Image %s checked (signature, kernel, DTB, initrd)" % m.get("version", "?")])
     return {"version": UPDATE["version"]}
 
 
@@ -1584,7 +1584,7 @@ def update_install(req):
         # head at the start of the partition, trailer in its last 8 KiB
         sysrun(["/usr/lib/untrash/untrash-slot-write", f, part])
     sysrun(["/usr/lib/untrash/untrash-bootstate", "prefer", other])
-    UPDATE["log"].append("in Slot %s geschrieben; Restart startet %s" % (other.upper(), UPDATE["version"]))
+    UPDATE["log"].append("written to slot %s; restarting starts %s" % (other.upper(), UPDATE["version"]))
     UPDATE["state"] = "installed"
     return {"slot": other}
 
@@ -2331,7 +2331,7 @@ def files_probe(user, q):
     playable = not vids or vids[0]["codec"] in WEB_VIDEO
     return {"duration": float(fmt.get("duration") or 0), "container": names, "video": vids, "audio": auds,
             "subtitles": subs, "mode": "direct" if direct else "remux" if playable else "none",
-            "note": "" if playable else "Videoformat %s spielt kein Browser; Umkodieren kommt mit dem Export." % (
+            "note": "" if playable else "No browser plays the video format %s; use Export to convert it." % (
                 vids[0]["codec"] if vids else "?")}
 
 
@@ -2746,7 +2746,7 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and p in ADMIN_POST:
             with LOCK:
                 return self.reply(200, ADMIN_POST[p](self.json_body()))
-        raise Fail("Unbekannt.", 404)
+        raise Fail("Unknown.", 404)
 
     def webpublish(self, p):
         """Stock Web Publishing on port 80: http://NAS/MyWeb/<share>/... for
@@ -2766,7 +2766,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 c.close()
         if not pub:
-            return self.reply(404, "Web Publishing ist off.", "text/plain; charset=utf-8", sb)
+            return self.reply(404, "Web publishing is off.", "text/plain; charset=utf-8", sb)
         if not parts or not parts[0]:
             body = "".join('<li><a href="/MyWeb/%s/">%s</a></li>' % (urllib.parse.quote(n), html.escape(n))
                            for n, _p in sorted(pub.values()))
@@ -2774,11 +2774,11 @@ class Handler(BaseHTTPRequestHandler):
                               "text/html; charset=utf-8", sb)
         share = pub.get(parts[0].lower())
         if not share:
-            return self.reply(404, "Nicht gefunden.", "text/plain; charset=utf-8", sb)
+            return self.reply(404, "Not found.", "text/plain; charset=utf-8", sb)
         base = os.path.realpath(R + share[1])
         full = os.path.realpath(os.path.join(base, *[x for x in parts[1:] if x]))
         if full != base and not full.startswith(base + "/"):
-            return self.reply(403, "Verboten.", "text/plain; charset=utf-8", sb)
+            return self.reply(403, "Forbidden.", "text/plain; charset=utf-8", sb)
         if os.path.isdir(full):
             if not p.endswith("/"):
                 self.send_response(301)
@@ -2797,7 +2797,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, "<!doctype html><meta charset=utf-8><title>%s</title><h1>%s</h1><ul>%s</ul>" % (
                     html.escape(share[0]), html.escape(urllib.parse.unquote(p)), body), "text/html; charset=utf-8", sb)
         if not os.path.isfile(full):
-            return self.reply(404, "Nicht gefunden.", "text/plain; charset=utf-8", sb)
+            return self.reply(404, "Not found.", "text/plain; charset=utf-8", sb)
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         size = os.path.getsize(full)
         self.send_response(200)
@@ -2850,7 +2850,7 @@ class Handler(BaseHTTPRequestHandler):
         (stored, streamed).  A password link asks for it first (POST form)."""
         v = links_load().get(tok.split("/")[0])
         if not v:
-            return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>Dieser Link ist abgelaufen oder gelöscht.</p>"),
+            return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>This link has expired or was deleted.</p>"),
                               "text/html; charset=utf-8")
         if v.get("pw"):
             pw = ""
@@ -2858,20 +2858,20 @@ class Handler(BaseHTTPRequestHandler):
                 n = min(int(self.headers.get("Content-Length") or 0), 4096)
                 pw = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace")).get("pw", [""])[0]
             if not hmac.compare_digest(hashlib.sha256((v["salt"] + pw).encode()).hexdigest(), v["pw"]):
-                form = ('<p>Dieser Link ist mit einem Password geschützt.</p>%s<div class="ut-field"><label for="pw">Password</label>'
+                form = ('<p>This link is protected with a password.</p>%s<div class="ut-field"><label for="pw">Password</label>'
                         '<input class="ut-input" id="pw" name="pw" type="password" autofocus></div>'
                         '<button class="ut-btn ut-btn--primary ut-btn--lg" style="width:100%%">Download</button>') % (
-                            '<div class="ut-callout ut-callout--danger">Falsches Password.</div>' if method == "POST" else "")
+                            '<div class="ut-callout ut-callout--danger">Wrong password.</div>' if method == "POST" else "")
                 return self.reply(200 if method == "GET" else 403, LINK_PAGE % ("Link", html.escape(os.path.basename(v["path"]) or v["share"]), form),
                                   "text/html; charset=utf-8")
         try:
             _b, full = resolve(v["owner"], v["share"], v["path"])     # the owner's rights still apply
         except Fail:
-            return self.reply(410, LINK_PAGE % ("Link", "UntrashOS", "<p>No access mehr auf diese File.</p>"), "text/html; charset=utf-8")
+            return self.reply(410, LINK_PAGE % ("Link", "UntrashOS", "<p>No access to this file any more.</p>"), "text/html; charset=utf-8")
         if os.path.isfile(full):
             return self.send_file(full)
         if not os.path.isdir(full):
-            return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>Die File gibt es nicht mehr.</p>"), "text/html; charset=utf-8")
+            return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>The file no longer exists.</p>"), "text/html; charset=utf-8")
         import zipfile
         name = os.path.basename(full.rstrip("/")) or "download"
         self.send_response(200)
@@ -2993,7 +2993,7 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("untrash-desk: %s %s failed:\n%s" % (method, self.path.split("?")[0], traceback.format_exc()))
             sys.stderr.flush()
             try:
-                self.reply(500, {"error": "Interner Error (%s: %s), Details im Systemprotokoll" % (type(e).__name__, e)})
+                self.reply(500, {"error": "Internal error (%s: %s), details in the system log" % (type(e).__name__, e)})
             except OSError:
                 pass
 

@@ -161,30 +161,30 @@ def activities(root=""):
     acts = []
     procs = _procs(root)
     if procs.get("minidlnad", 0) > 1:      # the scanner is a forked child
-        acts.append({"kind": "index", "text": "Medienserver indexiert"})
+        acts.append({"kind": "index", "text": "Media server indexing"})
     n = _tcp_peers(root, 8200)
     if n:
-        acts.append({"kind": "stream", "text": "%d Medien-Stream%s" % (n, "s" if n > 1 else "")})
+        acts.append({"kind": "stream", "text": "Media streams: %d" % n})
     n = _tcp_peers(root, 445)
     if n:
-        acts.append({"kind": "smb", "text": "%d Gerät%s an den Freigaben" % (n, "e" if n > 1 else "")})
+        acts.append({"kind": "smb", "text": "Devices on the shares: %d" % n})
     for m in re.finditer(r"^(md\d+) : .*?\n.*?\n\s*\[.*?\]\s*(resync|recovery|check|reshape)\s*=\s*([\d.]+)%",
                          _first(root + "/proc/mdstat"), re.M | re.S):
         acts.append({"kind": "raid", "text": "RAID %s: %s %s %%" % (m.group(1), m.group(2), m.group(3)),
                      "progress": float(m.group(3))})
     # oneshot jobs: "activating" while they run
-    for unit, text in (("untrash-backup.service", "Sicherung läuft"), ("untrash-cloud.service", "Cloud-Abgleich läuft")):
+    for unit, text in (("untrash-backup.service", "Backup running"), ("untrash-cloud.service", "Cloud sync running")):
         if not root and subprocess.run(["systemctl", "show", "-p", "ActiveState", "--value", unit], stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, text=True).stdout.strip() == "activating":
             acts.append({"kind": "job", "text": text})
     if procs.get("aria2c"):
-        acts.append({"kind": "download", "text": "Downloads aktiv"})
+        acts.append({"kind": "download", "text": "Downloads active"})
     if procs.get("untrash-export"):
-        acts.append({"kind": "encode", "text": "Export läuft"})
+        acts.append({"kind": "encode", "text": "Export running"})
     elif procs.get("ffmpeg"):
-        acts.append({"kind": "encode", "text": "Wiedergabe wird umgewandelt"})
+        acts.append({"kind": "encode", "text": "Converting for playback"})
     if procs.get("untrash-slot-wr") or os.path.exists(root + "/run/untrash/slot-writing"):
-        acts.append({"kind": "update", "text": "System-Update wird geschrieben"})
+        acts.append({"kind": "update", "text": "Writing the system update"})
     return {"activities": acts, "time": int(time.time())}
 
 

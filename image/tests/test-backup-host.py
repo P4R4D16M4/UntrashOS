@@ -73,7 +73,7 @@ def main():
         check("sync = mirror with deletion", os.path.isfile(tgt + "/Spiegel/Fotos/2026/a.jpg") and not os.path.exists(tgt + "/Spiegel/Fotos/b.txt"))
         rc, out = cl("run", "aaaa0003")
         st = json.loads(cl("status")[1])
-        check("missing source: failed, alert hook", rc == 1 and not st["aaaa0003"]["ok"] and "Sicherung Weg" in open(W + "/notified").read())
+        check("missing source: failed, alert hook", rc == 1 and not st["aaaa0003"]["ok"] and "Backup Weg failed" in open(W + "/notified").read())
         check("status ok for the others", st["aaaa0001"]["ok"] and st["aaaa0002"]["ok"])
         # schedule
         T = lambda *x: datetime.datetime(*x).timestamp()  # noqa: E731

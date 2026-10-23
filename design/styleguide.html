@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -32,50 +32,50 @@ section { margin-bottom: 34px; }
     <span class="ut-brand"><img src="assets/logo-mark-96.png" alt=""><b>Untrash<span>OS</span></b></span>
     <span class="ut-faint">Design-System</span>
     <span style="flex:1"></span>
-    <a class="ut-btn ut-btn--sm" href="login.html">Anmeldung</a>
-    <a class="ut-btn ut-btn--primary ut-btn--sm" href="desk.html">Untrash Desk öffnen</a>
+    <a class="ut-btn ut-btn--sm" href="login.html">Sign-in</a>
+    <a class="ut-btn ut-btn--primary ut-btn--sm" href="desk.html">Open Untrash Desk</a>
   </header>
   <main class="ut-page__main">
 
     <section>
       <h1>Untrash<span class="ut-grad-text">OS</span> Design-System</h1>
-      <p class="ut-muted">Abgeleitet aus Logo, Icon-Set und Wallpaper. Eine Datei <code>untrash.css</code> für Installer, Untrash Desk, Anmeldung und das Cockpit-Branding. Nur dunkel, ohne Web-Fonts und ohne externe Abrufe.</p>
+      <p class="ut-muted">Derived from the logo, the icon set and the wallpaper. One file, <code>untrash.css</code>, for the installer, Untrash Desk, the sign-in and the Cockpit branding. No web fonts and no external requests.</p>
       <img src="assets/logo-1000.png" alt="UntrashOS" style="width:min(520px,100%);display:block;margin:18px 0">
     </section>
 
     <section>
-      <div class="ut-section-title">Farben · Flächen</div>
+      <div class="ut-section-title">Colours · surfaces</div>
       <div class="swatches" id="sw-surf"></div>
-      <div class="ut-section-title">Farben · Marke und Zustände</div>
+      <div class="ut-section-title">Colours · brand and states</div>
       <div class="swatches" id="sw-brand"></div>
-      <div class="sw" style="margin-top:8px"><i style="background:var(--ut-grad);height:40px"></i><div><b>--ut-grad</b> <code>#6ff06b → #19d6a6 → #00bfd0</code> · Primärknopf, Fortschritt, aktive Markierung, Fenster-Haarlinie</div></div>
+      <div class="sw" style="margin-top:8px"><i style="background:var(--ut-grad);height:40px"></i><div><b>--ut-grad</b> <code>#6ff06b → #19d6a6 → #00bfd0</code> · primary button, progress, active marker, window hairline</div></div>
     </section>
 
     <section>
       <div class="ut-section-title">App-Icons</div>
       <div class="icons" id="icons"></div>
-      <p class="ut-faint" style="margin-top:10px">PNG aus dem Icon-Set (256/128/64 px). Mesh, Pakete, Protokolle und Einstellungen sind SVG-Ergänzungen im selben Stil.</p>
+      <p class="ut-faint" style="margin-top:10px">PNG from the icon set (256/128/64 px). Mesh, packages, logs and settings are SVG additions in the same style.</p>
     </section>
 
     <section>
       <div class="ut-section-title">Typografie</div>
       <div class="ut-card">
-        <h1>Überschrift 1 · 28 px</h1><h2>Überschrift 2 · 20 px</h2><h3>Überschrift 3 · 16 px</h3>
-        <p>Fließtext 14 px, Systemschrift. <span class="ut-muted">Sekundärtext</span> · <span class="ut-faint">Hinweistext</span> · <a href="#">Link</a> · <kbd>Ctrl</kbd> <kbd>L</kbd></p>
+        <h1>Heading 1 · 28 px</h1><h2>Heading 2 · 20 px</h2><h3>Heading 3 · 16 px</h3>
+        <p>Body text 14 px, system font. <span class="ut-muted">Secondary text</span> · <span class="ut-faint">Hint text</span> · <a href="#">Link</a> · <kbd>Ctrl</kbd> <kbd>L</kbd></p>
         <code>Monospace: /dev/md127 · btrfs · 1.8 TB</code>
       </div>
     </section>
 
     <section>
-      <div class="ut-section-title">Knöpfe</div>
+      <div class="ut-section-title">Buttons</div>
       <div class="row">
-        <button class="ut-btn ut-btn--primary">Primär</button>
-        <button class="ut-btn">Sekundär</button>
+        <button class="ut-btn ut-btn--primary">Primary</button>
+        <button class="ut-btn">Secondary</button>
         <button class="ut-btn ut-btn--ghost">Ghost</button>
-        <button class="ut-btn ut-btn--danger">Löschen</button>
+        <button class="ut-btn ut-btn--danger">Delete</button>
         <button class="ut-btn" disabled>Deaktiviert</button>
         <button class="ut-btn ut-btn--primary ut-btn--sm">Klein</button>
-        <button class="ut-btn ut-btn--primary ut-btn--lg">Groß</button>
+        <button class="ut-btn ut-btn--primary ut-btn--lg">Large</button>
       </div>
     </section>
 
@@ -83,31 +83,31 @@ section { margin-bottom: 34px; }
       <div>
         <div class="ut-section-title">Formulare</div>
         <div class="ut-card">
-          <div class="ut-field"><label>Name der Freigabe</label><input class="ut-input" placeholder="z. B. Fotos"><span class="ut-hint">Erlaubt: Buchstaben, Ziffern, - und _</span></div>
-          <div class="ut-field"><label>Volume</label><select class="ut-select"><option>Volume 1 – 1,1 TB frei</option><option>Altbestand (nur lesen)</option></select></div>
-          <div class="ut-field"><label>Fehlerhaft</label><input class="ut-input" aria-invalid="true" value="Fotos/2026"></div>
+          <div class="ut-field"><label>Share name</label><input class="ut-input" placeholder="e.g. Photos"><span class="ut-hint">Allowed: letters, digits, - and _</span></div>
+          <div class="ut-field"><label>Volume</label><select class="ut-select"><option>Volume 1 – 1,1 TB free</option><option>Legacy (read-only)</option></select></div>
+          <div class="ut-field"><label>Invalid</label><input class="ut-input" aria-invalid="true" value="Photos/2026"></div>
           <div class="row"><label class="ut-switch"><input type="checkbox" checked><i></i>SMB</label><label class="ut-switch"><input type="checkbox"><i></i>NFS</label>
-            <label class="row" style="gap:6px"><input type="checkbox" checked>Papierkorb</label></div>
+            <label class="row" style="gap:6px"><input type="checkbox" checked>Recycle bin</label></div>
         </div>
       </div>
       <div>
         <div class="ut-section-title">Auswahlkarten</div>
-        <label class="ut-choice"><span class="ut-choice__key">B</span><input type="radio" name="w" checked hidden><span><b>Behalten und übernehmen</b><small>Alte Benutzer, Freigaben und Daten bleiben.</small></span></label>
-        <label class="ut-choice"><span class="ut-choice__key">C</span><input type="radio" name="w" hidden><span><b>Behalten, neu einrichten</b><small>Daten bleiben, Einstellungen neu.</small></span></label>
-        <label class="ut-choice ut-choice--danger"><span class="ut-choice__key">A</span><input type="radio" name="w" hidden><span><b>Platte löschen</b><small>Alles auf der Platte geht verloren.</small></span></label>
+        <label class="ut-choice"><span class="ut-choice__key">B</span><input type="radio" name="w" checked hidden><span><b>Keep and take over</b><small>Old users, shares and data stay.</small></span></label>
+        <label class="ut-choice"><span class="ut-choice__key">C</span><input type="radio" name="w" hidden><span><b>Keep, set up anew</b><small>Data stays, new settings.</small></span></label>
+        <label class="ut-choice ut-choice--danger"><span class="ut-choice__key">A</span><input type="radio" name="w" hidden><span><b>Erase the disk</b><small>Everything on the disk is lost.</small></span></label>
       </div>
     </section>
 
     <section>
-      <div class="ut-section-title">Status, Fortschritt, Kennzahlen</div>
+      <div class="ut-section-title">Status, Progress, Kennzahlen</div>
       <div class="row" style="margin-bottom:14px">
-        <span class="ut-pill ut-pill--ok">Gesund</span><span class="ut-pill ut-pill--info ut-pill--live">Synchronisiert</span>
-        <span class="ut-pill ut-pill--warn">Nur lesen</span><span class="ut-pill ut-pill--danger">Ausgefallen</span><span class="ut-pill">Leer</span>
+        <span class="ut-pill ut-pill--ok">Healthy</span><span class="ut-pill ut-pill--info ut-pill--live">Resyncing</span>
+        <span class="ut-pill ut-pill--warn">Read only</span><span class="ut-pill ut-pill--danger">Ausgefallen</span><span class="ut-pill">Empty</span>
         <span class="ut-spinner"></span>
       </div>
       <div class="cols">
         <div class="ut-card"><div class="ut-progress" style="--v:62%"><i></i></div><br><div class="ut-progress ut-progress--warn" style="--v:84%"><i></i></div><br><div class="ut-progress ut-progress--indeterminate"><i></i></div></div>
-        <div class="ut-stat"><div class="ut-stat__label">Belegt</div><div class="ut-stat__value">742<small>GB von 1,8 TB</small></div></div>
+        <div class="ut-stat"><div class="ut-stat__label">Belegt</div><div class="ut-stat__value">742<small>GB of 1,8 TB</small></div></div>
       </div>
     </section>
 
@@ -115,26 +115,26 @@ section { margin-bottom: 34px; }
       <div>
         <div class="ut-section-title">Tabelle</div>
         <div class="ut-card" style="padding:12px 6px">
-          <table class="ut-table"><thead><tr><th>Platte</th><th class="num">Größe</th><th>Zustand</th></tr></thead><tbody>
-            <tr><td>sda · Schacht 1</td><td class="num">2,0 TB</td><td><span class="ut-pill ut-pill--ok">ok</span></td></tr>
-            <tr aria-selected="true"><td>sdb · Schacht 2</td><td class="num">2,0 TB</td><td><span class="ut-pill ut-pill--ok">ok</span></td></tr>
-            <tr><td>sdc · Schacht 3</td><td class="num">4,0 TB</td><td><span class="ut-pill ut-pill--warn">SMART-Warnung</span></td></tr>
+          <table class="ut-table"><thead><tr><th>Disk</th><th class="num">Size</th><th>State</th></tr></thead><tbody>
+            <tr><td>sda · Bay 1</td><td class="num">2,0 TB</td><td><span class="ut-pill ut-pill--ok">ok</span></td></tr>
+            <tr aria-selected="true"><td>sdb · Bay 2</td><td class="num">2,0 TB</td><td><span class="ut-pill ut-pill--ok">ok</span></td></tr>
+            <tr><td>sdc · Bay 3</td><td class="num">4,0 TB</td><td><span class="ut-pill ut-pill--warn">SMART-Warning</span></td></tr>
           </tbody></table>
         </div>
       </div>
       <div>
         <div class="ut-section-title">Ablaufschritte</div>
-        <div class="ut-card"><ol class="ut-steps"><li data-state="done">Stick und Platten erkannt</li><li data-state="done">Stock-Konfiguration gesichert</li><li data-state="active">Systemabbild kopieren</li><li>Bootzustand schreiben</li></ol></div>
+        <div class="ut-card"><ol class="ut-steps"><li data-state="done">Stick and disks found</li><li data-state="done">Stock configuration saved</li><li data-state="active">Copy the system image</li><li>Write the boot state</li></ol></div>
       </div>
     </section>
 
     <section>
-      <div class="ut-section-title">Hinweise und Protokoll</div>
+      <div class="ut-section-title">Callouts and log</div>
       <div style="display:grid;gap:8px">
-        <div class="ut-callout ut-callout--info"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 7.5v3.5M8 5h.01"/></svg><div><b>Info.</b> Fremde Volumes werden zuerst nur lesend eingebunden.</div></div>
-        <div class="ut-callout ut-callout--warn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2 1.5 13.5h13zM8 6.5v3M8 11.5h.01"/></svg><div><b>Achtung.</b> Probelauf aktiv – Befehle werden nur angezeigt.</div></div>
-        <div class="ut-callout ut-callout--danger"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5"/></svg><div><b>Gefahr.</b> Die gewählte Platte wird vollständig gelöscht.</div></div>
-        <div class="ut-callout ut-callout--ok"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="m5.5 8 1.8 1.8L10.8 6"/></svg><div><b>Fertig.</b> UntrashOS ist installiert.</div></div>
+        <div class="ut-callout ut-callout--info"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 7.5v3.5M8 5h.01"/></svg><div><b>Info.</b> Foreign volumes are mounted read-only first.</div></div>
+        <div class="ut-callout ut-callout--warn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2 1.5 13.5h13zM8 6.5v3M8 11.5h.01"/></svg><div><b>Caution.</b> Dry run active – commands are only shown.</div></div>
+        <div class="ut-callout ut-callout--danger"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5"/></svg><div><b>Gefahr.</b> The selected disk will be erased completely.</div></div>
+        <div class="ut-callout ut-callout--ok"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="m5.5 8 1.8 1.8L10.8 6"/></svg><div><b>Done.</b> UntrashOS is installed.</div></div>
         <pre class="ut-log">[ 12.408] zt-slotinit: slot 1.0 verity ok
 [ 12.911] untrash-installer: way B, volume 1 – plan ok
 [ 13.020] copy slot-a.utslot … 42 %</pre>
@@ -142,22 +142,22 @@ section { margin-bottom: 34px; }
     </section>
 
     <section>
-      <div class="ut-section-title">Popups: Menü, Benachrichtigung, Dialog</div>
+      <div class="ut-section-title">Popups: menu, notification, dialog</div>
       <div class="cols static">
         <div class="ut-menu"><div class="ut-menu__label">Volume 1</div>
-          <button class="ut-menu__item">Öffnen<kbd>↵</kbd></button><button class="ut-menu__item">Snapshot anlegen</button>
-          <div class="ut-menu__sep"></div><button class="ut-menu__item ut-menu__item--danger">Volume löschen …</button></div>
-        <div class="ut-toast"><img src="assets/icons/raid-64.png" alt=""><div class="ut-toast__body"><div class="ut-toast__title">Konsistenzprüfung läuft</div><div class="ut-toast__text">RAID 1 · Volume 1 – 62 %</div><div class="ut-toast__time">vor 2 min</div></div></div>
-        <div class="ut-dialog ut-dialog--danger"><div class="ut-dialog__head"><div class="ut-dialog__icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.7 9h5.6l.7-9"/></svg></div><h2>Freigabe löschen?</h2></div>
-          <div class="ut-dialog__body">Die Daten bleiben auf dem Volume, nur die Freigabe verschwindet.</div>
-          <div class="ut-dialog__foot"><button class="ut-btn">Abbrechen</button><button class="ut-btn ut-btn--danger">Löschen</button></div></div>
+          <button class="ut-menu__item">Open<kbd>↵</kbd></button><button class="ut-menu__item">Create snapshot</button>
+          <div class="ut-menu__sep"></div><button class="ut-menu__item ut-menu__item--danger">Delete volume …</button></div>
+        <div class="ut-toast"><img src="assets/icons/raid-64.png" alt=""><div class="ut-toast__body"><div class="ut-toast__title">Consistency check running</div><div class="ut-toast__text">RAID 1 · Volume 1 – 62 %</div><div class="ut-toast__time">2 min ago</div></div></div>
+        <div class="ut-dialog ut-dialog--danger"><div class="ut-dialog__head"><div class="ut-dialog__icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.7 9h5.6l.7-9"/></svg></div><h2>Delete the share?</h2></div>
+          <div class="ut-dialog__body">The data stays on the volume, only the share goes.</div>
+          <div class="ut-dialog__foot"><button class="ut-btn">Cancel</button><button class="ut-btn ut-btn--danger">Delete</button></div></div>
       </div>
     </section>
 
     <section>
-      <div class="ut-section-title">Leisten: Topbar und Dock</div>
+      <div class="ut-section-title">Bars: top bar and dock</div>
       <div class="mini-desk">
-        <div class="ut-topbar"><span class="ut-topbar__item"><img src="assets/logo-mark-48.png" alt=""><span class="ut-topbar__title">Untrash<span style="color:var(--ut-teal)">OS</span></span></span><span class="ut-topbar__item">Speicher-Manager</span><span class="ut-topbar__spacer"></span><span class="ut-topbar__item"><span class="ut-pill ut-pill--ok" style="height:18px">RAID ok</span></span><span class="ut-topbar__item">Fr. 09.10. 20:30</span></div>
+        <div class="ut-topbar"><span class="ut-topbar__item"><img src="assets/logo-mark-48.png" alt=""><span class="ut-topbar__title">Untrash<span style="color:var(--ut-teal)">OS</span></span></span><span class="ut-topbar__item">Storage-Manager</span><span class="ut-topbar__spacer"></span><span class="ut-topbar__item"><span class="ut-pill ut-pill--ok" style="height:18px">RAID ok</span></span><span class="ut-topbar__item">Fri. 09.10. 20:30</span></div>
         <div class="ut-dock" id="mini-dock"></div>
       </div>
     </section>

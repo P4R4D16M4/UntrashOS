@@ -247,9 +247,9 @@ with tempfile.TemporaryDirectory() as W:
     check("recycle expiry 30 days", s["recycle"]["expire_days"] == 30)
     check("USB name table", s["usb"]["names"] == {"0123456789abcdef0123456789abcdef": "USB-Platte"})
     check("cloud apps that were on are listed (tokens not transferable)", s["unsupported"] == [
-        "Dropbox war an: unter Cloud das Konto neu verbinden und den Auftrag anlegen",
-        "Upload Manager YouTube war an: in UntrashOS bewusst weggelassen",
-        "Zeitplan „monatlich nach Woche“ (reboot) nicht übernommen"])
+        "Dropbox was on: connect the account again under Cloud and create the job",
+        "Upload Manager YouTube was on: left out of UntrashOS on purpose",
+        "Schedule “monthly by week” (reboot) not taken over"])
     check("UPnP forwardings from upnp.db", s["upnp"]["services"] == {"HTTP": 8000, "WEBDAV_HTTP": 5002})
     check("power: always on after power loss, schedule from backupjob.db (Mon+Fri on 07:30, daily off 23:15)",
           s["power"]["pwron"] == "always" and s["power"]["schedule_active"] and s["power"]["schedule"] == [
@@ -473,17 +473,17 @@ with tempfile.TemporaryDirectory() as W:
     nenv = dict(os.environ, ZT_NOTIFY_CONF=nconf, ZT_NOTIFY_STATE=os.path.join(W, "nstate"), ZT_NOTIFY_VOLROOTS=W + "/vols")
     NOTIFY = os.path.join(FILES, "usr/lib/untrash/untrash-notify")
     r = subprocess.run([NOTIFY, "test"], env=nenv, stdout=subprocess.PIPE, text=True)
-    check("test mail to alert + log recipients", r.returncode == 0 and len(got) == 2 and "Subject: NAS-Test Testnachricht" in got[0])
+    check("test mail to alert + log recipients", r.returncode == 0 and len(got) == 2 and "Subject: NAS-Test Test message" in got[0])
     got.clear()
     r = subprocess.run([NOTIFY, "DegradedArray", "/dev/md2"], env=nenv, stdout=subprocess.PIPE, text=True)
     check("mdadm DegradedArray -> alert mail", r.returncode == 0 and len(got) == 1 and "To: admin@example.net" in got[0]
-          and "beeintr" in got[0])
+          and "degraded" in got[0])
     got.clear()
     subprocess.run([NOTIFY, "RebuildStarted", "/dev/md2"], env=nenv, stdout=subprocess.PIPE)
     check("mdadm RebuildStarted: journal only", got == [])
     r = subprocess.run([NOTIFY], env=dict(nenv, SMARTD_MESSAGE="Device: /dev/sda, 8 Currently unreadable sectors",
                                           SMARTD_DEVICE="/dev/sda", SMARTD_FAILTYPE="CurrentPendingSector"), stdout=subprocess.PIPE)
-    check("smartd warning -> alert mail", r.returncode == 0 and len(got) == 1 and "SMART-Warnung /dev/sda" in got[0])
+    check("smartd warning -> alert mail", r.returncode == 0 and len(got) == 1 and "SMART warning /dev/sda" in got[0])
     srv.shutdown()
 
     # untrash-syslogd: one UDP message in the stock file layout

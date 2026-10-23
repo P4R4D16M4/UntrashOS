@@ -85,7 +85,7 @@ def main():
         rc, o, e = cl("auth-start", "dropbox", e=fe)
         check("auth-start (simulated provider)", rc == 0 and json.loads(o)["url"].startswith("https://provider.example/"))
         rc, o, e = cl("auth-finish", "Box", "https://evil.example/?state=teststate123&code=x", e=fe)
-        check("foreign return address refused", rc != 0 and "Rücksprung" in e)
+        check("foreign return address refused", rc != 0 and "return address" in e)
         rc, o, e = cl("auth-finish", "Box", "http://localhost:53682/?state=teststate123&error=access_denied", e=fe)
         check("denied login reported", rc != 0 and "abgelehnt" in e)
         rc, o, e = cl("auth-finish", "Box", "http://localhost:53682/?state=teststate123&code=abc", e=fe)
