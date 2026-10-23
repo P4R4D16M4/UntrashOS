@@ -68,8 +68,11 @@ if [ "$ZT_BOOT" = file ]; then
 	[ "$ZT_HOST_RW" = 1 ] && [ -f "$U/swap.img" ] && SWAPFILE=$U/swap.img
 	log "slot file $ZT_FILE on $ZT_HOST_DEV ($ZT_HOST_FS) slot=$SLOT state=${STATE:-none}"
 else
-	# The slot this kernel was started from (loader substitutes it in the cmdline).
-	SLOT=$(sed -n 's/.*dm-mod\.waitfor=PARTLABEL=\([^ ]*\).*/\1/p' /proc/cmdline)
+	# The slot this kernel was started from (loader substitutes it in the
+	# cmdline): untrash.part= (through the slot initrd) or dm-mod.waitfor=
+	# (loaders before 1.0.3, no initrd).
+	SLOT=$(sed -n 's/.*untrash\.part=\([^ ]*\).*/\1/p' /proc/cmdline)
+	[ -n "$SLOT" ] || SLOT=$(sed -n 's/.*dm-mod\.waitfor=PARTLABEL=\([^ ]*\).*/\1/p' /proc/cmdline)
 	i=0
 	while [ $i -lt 10 ]; do
 		if [ -n "$SLOT" ] && S=$(part_dev "$SLOT"); then
@@ -126,12 +129,13 @@ fi
 # ut-bootstate (way A); the installer stick reads it from the stick) ->
 # .link files, applied by udev when pfe registers eth0/eth1.  Without them
 # pfe uses its built-in default, the same on every NAS.
-devenv=
+devenv=; installdir=
 if [ "$ZT_BOOT" = file ]; then
 	if [ -f "$ZT_HOST/.untrash/device.env" ]; then devenv=$(cat "$ZT_HOST/.untrash/device.env")
 	else
 		for f in "$ZT_HOST"/UNTRASH/install-*/device.env; do
-			[ -f "$f" ] && grep -q 'RESULT DONE' "${f%/device.env}/install.log" 2>/dev/null && devenv=$(cat "$f")
+			[ -f "$f" ] && grep -q 'RESULT DONE' "${f%/device.env}/install.log" 2>/dev/null &&
+				devenv=$(cat "$f") && installdir=${f%/device.env}
 		done
 	fi
 elif [ -n "$DISK" ] && BS=$(part_dev ut-bootstate "$DISK"); then
@@ -147,10 +151,19 @@ for n in 0 1; do
 done
 
 # board: network firmware before udev loads the drivers (NAS542: the PFE PE
-# firmware from the NAS's own stock kernel, cached on the state;
-# docs/board-interface.md)
+# firmware from the NAS's own stock kernel, kernel<ACTIVE_SLOT> = the slot the
+# loader did not go into, cached on the state; on the installer stick the
+# source is the copy of that kernel in the install run, and the installer
+# seeds the cache of the installed system; docs/board-interface.md)
 if [ -x /usr/lib/untrash/untrash-pfe-firmware ]; then
-	/usr/lib/untrash/untrash-pfe-firmware /state/firmware/pfe || log "no PFE firmware: no network"
+	stockslot=$(echo "$devenv" | sed -n 's/^ACTIVE_SLOT=\([12]\)$/\1/p' | head -1)
+	stockfile=
+	[ -n "$installdir" ] && case $stockslot in
+		1) stockfile=$installdir/mtd4-before-a.bin ;;
+		2) stockfile=$installdir/mtd6-before-a.bin ;;
+	esac
+	/usr/lib/untrash/untrash-pfe-firmware /state/firmware/pfe "${stockslot:-1}" "$stockfile" ||
+		log "no PFE firmware: no network"
 fi
 
 if [ -n "$DISK" ] && SWAP=$(part_dev ut-swap "$DISK"); then

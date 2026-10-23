@@ -431,6 +431,8 @@ def do_wipe_install(req, info):
     else:
         JOB.add("No stock MAC addresses on the stick: UntrashOS uses the driver's")
     run(["mkfs.btrfs", "-f", "-L", "ut-data", part_of(disk["path"], 5)])
+    run(["wipefs", "-a", part_of(disk["path"], 3)])   # fresh state: no leftovers of the old disk content
+    seed_state(part_of(disk["path"], 3))
     clear_install_marker(stick)
     JOB.add("Done: restarting starts UntrashOS %s from %s" % (slot["version"], disk["name"]))
 
@@ -439,16 +441,51 @@ MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 
 def device_record(info):
-    """Stock MACs of this NAS (PartnerKey device.env of the newest completed
-    install run) as the text UntrashOS reads at boot (untrash-init: way A in
-    block 1 of ut-bootstate, ways B/C in /.untrash/device.env)."""
+    """Stock MACs and stock kernel slot of this NAS (PartnerKey device.env of
+    the newest completed install run) as the text UntrashOS reads at boot
+    (untrash-init: way A in block 1 of ut-bootstate, ways B/C in
+    /.untrash/device.env).  ACTIVE_SLOT tells untrash-pfe-firmware which
+    kernel partition holds the stock kernel with the PFE firmware."""
     for b in reversed(info["backups"]):
         if b["stock"]:
             lines = ["%s=%s" % (k, b["device"].get(k, "")) for k in ("ETH0_MAC", "ETH1_MAC")
                      if MAC_RE.match(b["device"].get(k, ""))]
+            if b["device"].get("ACTIVE_SLOT") in ("1", "2"):
+                lines.append("ACTIVE_SLOT=%s" % b["device"]["ACTIVE_SLOT"])
             if lines:
                 return ("\n".join(lines) + "\n").encode()
     return None
+
+
+PFE_CACHE = os.environ.get("ZT_INSTALLER_PFE", "/state/firmware/pfe")   # untrash-init of this run
+SEED_MNT = "/run/untrash/seed-state"
+
+
+def seed_state(target):
+    """Put the PFE PE firmware this installer runs with (untrash-init took it
+    from the stock kernel copy on the stick) into the state of the installed
+    system (ut-state partition or /.untrash/state.img), so that system never
+    has to read the NAND for it.  An empty target becomes ext4 ut-state,
+    exactly as untrash-init would format it; a non-ext4 one is left alone."""
+    if not DRYRUN and not os.path.isfile(os.path.join(PFE_CACHE, "class_c2000.elf")):
+        JOB.add("No PFE firmware in the installer: the system reads it itself on first start")
+        return
+    if DRYRUN or sh(["wipefs", "-n", target], check=False).strip() == "":
+        run(["mkfs.ext4", "-q", "-F", "-L", "ut-state", "-E", "lazy_itable_init=1,lazy_journal_init=1", target])
+    elif sh(["blkid", "-p", "-o", "value", "-s", "TYPE", target], check=False).strip() != "ext4":
+        JOB.add("State %s is not ext4: PFE firmware not stored" % target)
+        return
+    run(["mkdir", "-p", SEED_MNT])
+    opts = "rw,noatime" + (",loop" if not target.startswith("/dev/") else "")
+    run(["mount", "-t", "ext4", "-o", opts, target, SEED_MNT])
+    try:
+        run(["mkdir", "-p", os.path.join(SEED_MNT, "firmware")])
+        run(["rm", "-rf", os.path.join(SEED_MNT, "firmware", "pfe")])
+        run(["cp", "-a", PFE_CACHE, os.path.join(SEED_MNT, "firmware", "pfe")])
+        run(["sync"])
+    finally:
+        run(["umount", SEED_MNT])
+    JOB.add("PFE firmware stored in the system state")
 
 
 def sha256_file(path):
@@ -711,6 +748,7 @@ def do_keep_install(req, info, takeover):
                 run(["fallocate", "-l", str(STATE_IMG), os.path.join(u, "state.img")])
             else:
                 JOB.add("state.img present: kept")
+            seed_state(os.path.join(u, "state.img"))
             if DRYRUN or not os.path.exists(os.path.join(u, "swap.img")):
                 run(["fallocate", "-l", str(SWAP_IMG), os.path.join(u, "swap.img")])
                 run(["chmod", "600", os.path.join(u, "swap.img")])
