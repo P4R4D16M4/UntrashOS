@@ -56,9 +56,9 @@ out; items marked *optional* are skipped when missing.
 | Item | Used by | Contract |
 |---|---|---|
 | `/usr/lib/untrash/untrash-power boot\|shutdown\|tick\|next` | untrash-config, Desk power settings, `untrash-power*.service` | power-loss mode, Wake-on-LAN, scheduled power-on/off; `next` prints JSON `{"on": …, "off": …, "off_action": …}` |
-| `/usr/lib/untrash/pylib/untrash_bays.py` → `bays()` | untrash-storage (disks, bay LEDs) | list of bays with disk link, presence and LED paths |
+| `/usr/lib/untrash/pylib/untrash_bays.py` → `bays()` | untrash-storage (disks, bay LEDs) | `{"disk1": "/dev/sdb", …}`: internal disks by bay |
 | `/usr/lib/untrash/untrash-pfe-firmware CACHE` | untrash-init, before systemd | prepares network firmware; *optional* |
-| `/run/untrash/fan.json` | Desk status (untrash_live) | `{"temp_c": …, "level": …}` written by the board's fan control; *optional* |
+| `/run/untrash/fan.json` | Desk status (untrash_live) | JSON with `temp_c` and `time` (stale after 60 s), written by the board's fan control; *optional* |
 | `/sys/bus/platform/devices/*buzzer*/play` | untrash-sound | write `"<hz> <ms>"`, one square-wave voice; *optional* |
 | `/dev/watchdog` | untrash-init, untrash-wdt | a hardware watchdog |
 

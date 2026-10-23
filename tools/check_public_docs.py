@@ -3,7 +3,8 @@ from pathlib import Path
 import re
 import sys
 
-ROOT = Path(__file__).resolve().parents[1]
+# check_public_docs.py [DIR]: every *.md below DIR (default: this repository)
+ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 SKIP = {".git", "build", "inputs"}
 
 patterns = {
