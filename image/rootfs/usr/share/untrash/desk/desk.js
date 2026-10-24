@@ -415,7 +415,9 @@ VIEWS.overview = async b => {
 };
 
 /* files ---------------------------------------------------------------- */
-const FS = { share: null, path: '' };
+const FS = { share: null, path: '', sel: new Set(), last: null, sort: 'name', dir: 1, filter: '', search: null, entries: [], recycle: false };
+let CLIP = null;                                  // { op: 'cut' | 'copy', share, from, items: [names] }
+const XFER = [];                                  // uploads and copy/move jobs shown in the Files window
 /* opens a document in the office server's editor (WOPI) in a new tab: the
    token goes as a form POST, never in the address bar */
 async function officeOpen(share, path) {
@@ -430,13 +432,196 @@ async function officeOpen(share, path) {
     w.document.body.append(f); f.submit();
   } catch (e) { if (w) w.close(); fail(e); }
 }
+/* context menu at x, y: items [{ label, fn, danger, disabled }] or 'sep' */
+function ctxMenu(x, y, items) {
+  $$('.ut-ctx').forEach(m => m.remove());
+  const m = document.createElement('div');
+  m.className = 'ut-menu ut-ctx'; m.setAttribute('role', 'menu');
+  m.innerHTML = items.map((it, i) => it === 'sep' ? '<div class="ut-menu__sep"></div>'
+    : `<button class="ut-menu__item${it.danger ? ' ut-menu__item--danger' : ''}" role="menuitem" data-i="${i}"${it.disabled ? ' disabled' : ''}>${esc(it.label)}${it.key ? `<kbd>${esc(it.key)}</kbd>` : ''}</button>`).join('');
+  document.body.append(m);
+  m.style.left = Math.max(4, Math.min(innerWidth - m.offsetWidth - 4, x)) + 'px';
+  m.style.top = Math.max(4, Math.min(innerHeight - m.offsetHeight - 4, y)) + 'px';
+  const close = () => { m.remove(); document.removeEventListener('pointerdown', out, true); document.removeEventListener('keydown', esck, true); };
+  const out = e => { if (!m.contains(e.target)) close(); };
+  const esck = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  setTimeout(() => { document.addEventListener('pointerdown', out, true); document.addEventListener('keydown', esck, true); });
+  m.onclick = e => { const b = e.target.closest('[data-i]'); if (b && !b.disabled) { close(); items[+b.dataset.i].fn(); } };
+  const first = m.querySelector('button:enabled'); if (first) first.focus();
+}
+const fpath = n => (FS.path ? FS.path + '/' : '') + n;
+const nItems = n => n === 1 ? UTI18N.tr('1 item') : UTI18N.tr('%s items').replace('%s', n);
+const fsel = () => FS.entries.filter(e => FS.sel.has(e.name));
+
+/* transfers (uploads with progress, copy/move jobs of the NAS) */
+function xferPanel() {
+  const b = body('files'), box = b && $('#fxfer', b);
+  if (!box) return;
+  const live = XFER.filter(x => !x.gone);
+  box.hidden = !live.length;
+  box.innerHTML = live.map((x, i) => {
+    const pct = x.total ? Math.min(100, Math.round(100 * x.done / x.total)) : (x.state === 'running' ? 0 : 100);
+    const label = x.kind === 'up' ? UTI18N.tr('Upload') : UTI18N.tr(x.op === 'move' ? 'Move' : 'Copy');
+    const st = x.state === 'running' ? `${pct} %` : esc(UTI18N.tr({ done: 'done', errors: 'with errors', cancelled: 'cancelled' }[x.state] || x.state));
+    return `<div class="ut-xfer"><span class="ut-xfer__name"><b>${esc(label)}</b> <span translate="no">${esc(x.name || '')}</span></span>
+      <div class="ut-progress" style="--v:${pct}%"><i></i></div><span class="ut-faint">${st}</span>
+      ${x.state === 'running' ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-xc="${i}">Cancel</button>` : `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-xd="${i}" aria-label="Close">✕</button>`}
+      ${(x.errors || []).length ? `<div class="ut-faint ut-xfer__err" translate="no">${x.errors.map(esc).join('<br>')}</div>` : ''}</div>`;
+  }).join('');
+  $$('[data-xc]', box).forEach(btn => btn.onclick = () => { const x = live[+btn.dataset.xc]; x.cancel && x.cancel(); });
+  $$('[data-xd]', box).forEach(btn => btn.onclick = () => { live[+btn.dataset.xd].gone = true; xferPanel(); });
+}
+function uploadFile(share, path, file, dirs) {
+  return new Promise((resolve, reject) => {
+    const x = { kind: 'up', name: (dirs ? dirs + '/' : '') + file.name, total: file.size, done: 0, state: 'running' };
+    XFER.push(x); xferPanel();
+    const r = new XMLHttpRequest();
+    r.open('POST', '/api/files/upload?' + new URLSearchParams(Object.assign({ share, path, name: file.name }, dirs ? { dirs } : {})));
+    r.setRequestHeader('X-UT', '1'); r.setRequestHeader('Content-Type', 'application/octet-stream');
+    r.upload.onprogress = e => { x.done = e.loaded; xferPanel(); };
+    const end = (state, err) => { x.state = state; if (err) x.errors = [err]; xferPanel(); if (state === 'done') setTimeout(() => { x.gone = true; xferPanel(); }, 4000); };
+    r.onload = () => { if (r.status === 200) { end('done'); resolve(); } else { let m = 'Error ' + r.status; try { m = JSON.parse(r.responseText).error || m; } catch (e) { } end('errors', m); reject(new Error(m)); } };
+    r.onerror = () => { end('errors', UTI18N.tr('Transfer aborted.')); reject(new Error('Transfer aborted.')); };
+    r.onabort = () => { end('cancelled'); reject(new Error('Cancelled.')); };
+    x.cancel = () => r.abort();
+    r.send(file);
+  });
+}
+/* files dropped or picked: [{ file, dirs }] (dirs = subfolder path for folder uploads) */
+async function uploadAll(share, path, list) {
+  for (const it of list) { try { await uploadFile(share, path, it.file, it.dirs); } catch (e) { if (e.message !== 'Cancelled.') toast(it.file.name, e.message, 'danger'); } }
+  if (FS.share === share && body('files')) render('files');
+}
+/* the files of a drop, folders read recursively (webkitGetAsEntry) */
+async function droppedFiles(dt) {
+  const out = [], walk = (entry, dirs) => new Promise(res => {
+    if (entry.isFile) entry.file(f => { out.push({ file: f, dirs }); res(); }, () => res());
+    else if (entry.isDirectory) {
+      const rd = entry.createReader(), all = [];
+      const more = () => rd.readEntries(async es => { if (es.length) { all.push(...es); more(); } else { for (const e of all) await walk(e, (dirs ? dirs + '/' : '') + entry.name); res(); } }, () => res());
+      more();
+    } else res();
+  });
+  const entries = [...(dt.items || [])].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (entries.length) { for (const e of entries) await walk(e, ''); return out; }
+  return [...dt.files].map(f => ({ file: f, dirs: '' }));
+}
+async function startTransfer(op, share, from, names, dst, conflict = 'rename') {
+  const r = await api('files/transfer', { op, conflict, items: names.map(n => ({ share, path: (from ? from + '/' : '') + n })), dst });
+  const x = { kind: 'job', id: r.job, op, name: names.length === 1 ? names[0] : nItems(names.length), total: 0, done: 0, state: 'running',
+    cancel: () => api('files/jobs/cancel', { job: r.job }).catch(fail) };
+  XFER.push(x); xferPanel(); pollJobs();
+}
+const pollJobs = single(async () => {
+  while (XFER.some(x => x.kind === 'job' && x.state === 'running')) {
+    try {
+      const js = (await apiRaw('files/jobs')).jobs;
+      for (const x of XFER.filter(x => x.kind === 'job' && x.state === 'running')) {
+        const j = js.find(j => j.id === x.id); if (!j) { x.state = 'errors'; continue; }
+        Object.assign(x, { total: j.total, done: j.done, state: j.state, errors: j.errors });
+        if (j.state !== 'running') {
+          if (body('files')) render('files');
+          if (j.state === 'done') setTimeout(() => { x.gone = true; xferPanel(); }, 4000);
+        }
+      }
+      xferPanel();
+    } catch (e) { break; }
+    await new Promise(r => setTimeout(r, 900));
+  }
+});
+
+function fileOpen(b, e) {
+  const n = e.name, rel = fpath;
+  if (e.dir) { FS.path = rel(n); FS.sel.clear(); FS.search = null; return render('files'); }
+  const files = FS.entries.filter(x => !x.dir);
+  if (/^(audio|video)$/.test(mediaKind(n))) openPlayer(files.filter(x => /^(audio|video)$/.test(mediaKind(x.name))).map(x => x.name), n, rel);
+  else if (mediaKind(n) === 'img') viewer(files.filter(x => mediaKind(x.name) === 'img').map(x => x.name), n, rel);
+  else if (/^(pdf|text)$/.test(mediaKind(n))) docViewer(n, rel(n), e.size || 0);
+  else location.href = '/api/files/download?' + new URLSearchParams({ share: FS.share, path: rel(n) });
+}
+function fileDownload(items) {
+  if (items.length === 1 && !items[0].dir) location.href = '/api/files/download?' + new URLSearchParams({ share: FS.share, path: fpath(items[0].name) });
+  else location.href = '/api/files/zip?' + new URLSearchParams({ share: FS.share, path: FS.path, names: JSON.stringify(items.map(e => e.name)) });
+}
+function fileCut(op, items) {
+  if (!items.length) return;
+  CLIP = { op, share: FS.share, from: FS.path, items: items.map(e => e.name) };
+  toast(UTI18N.tr(op === 'cut' ? 'Cut' : 'Copied'), nItems(items.length) + ' · ' + UTI18N.tr('Paste in the target folder'));
+  render('files');
+}
+async function filePaste(dstPath = FS.path) {
+  if (!CLIP) return;
+  const same = CLIP.share === FS.share && CLIP.from === dstPath;
+  if (CLIP.op === 'cut' && same) return;
+  const there = dstPath === FS.path ? FS.entries.map(e => e.name) : [];
+  const clash = !same && CLIP.items.filter(n => there.includes(n));
+  const go = async conflict => {
+    const c = CLIP;
+    try { await startTransfer(c.op === 'cut' ? 'move' : 'copy', c.share, c.from, c.items, { share: FS.share, path: dstPath }, conflict); if (c.op === 'cut') CLIP = null; }
+    catch (e) { fail(e); }
+  };
+  if (clash && clash.length) {
+    const d = dialog({ title: 'Names already exist', ok: 'Keep both',
+      body: `<p>${esc(UTI18N.tr('Already in this folder:'))} <b translate="no">${clash.slice(0, 5).map(esc).join(', ')}${clash.length > 5 ? ' …' : ''}</b></p>
+        <p class="ut-faint">Keep both: the new ones get a number, e.g. “name (2)”.</p>
+        <div class="row"><button class="ut-btn ut-btn--danger" data-cf="overwrite">Replace</button><button class="ut-btn" data-cf="skip">Skip these</button></div>`,
+      onOk: () => go('rename') });
+    $$('[data-cf]', d).forEach(x => x.onclick = () => { d.remove(); go(x.dataset.cf); });
+  } else go('rename');
+}
+function fileDelete(items) {
+  if (!items.length) return;
+  dialog({ kind: 'danger', title: items.length === 1 ? 'Delete?' : UTI18N.tr('Delete %s items?').replace('%s', items.length), ok: 'Delete', okCls: 'ut-btn--danger',
+    body: `<p translate="no"><b>${items.slice(0, 6).map(e => esc(e.name)).join(', ')}${items.length > 6 ? ' …' : ''}</b></p>
+      <p>${FS.recycle && !/^recycle(\/|$)/.test(FS.path) ? esc(UTI18N.tr('They go to the recycle bin of the share (folder “recycle”).')) : esc(UTI18N.tr('They will be deleted permanently.'))}</p>`,
+    onOk: async () => { await api('files/op', { op: 'delete', share: FS.share, paths: items.map(e => fpath(e.name)) }); FS.sel.clear(); render('files'); } });
+}
+function fileRename(e) {
+  dialog({ title: 'Rename', body: field('rn', 'New name', e.name), ok: 'Rename',
+    onOk: s => api('files/op', { op: 'rename', share: FS.share, path: fpath(e.name), name: $('#rn', s).value }).then(() => { FS.sel = new Set([$('#rn', s).value]); render('files'); }) });
+  setTimeout(() => { const i = $('#rn'); if (i) { const dot = e.dir ? -1 : e.name.lastIndexOf('.'); i.setSelectionRange(0, dot > 0 ? dot : e.name.length); } });
+}
+async function fileProps(e) {
+  const d = dialog({ title: 'Properties', ok: 'Close', body: `<p><b translate="no">${esc(e.name)}</b></p><p class="ut-faint mono" translate="no">${esc(FS.share + '/' + fpath(e.name))}</p>
+    <p>${esc(UTI18N.tr('Modified'))}: ${new Date(e.mtime * 1000).toLocaleString(UTI18N.locale)}</p><p id="psz">${e.dir ? '<span class="ut-spinner"></span>' : esc(UTI18N.tr('Size')) + ': ' + size(e.size)}</p>` });
+  if (e.dir) {
+    try { const r = await api('files/size?' + new URLSearchParams({ share: FS.share, path: fpath(e.name) }));
+      const p = $('#psz', d); if (p) p.textContent = `${UTI18N.tr('Size')}: ${size(r.size)} · ${UTI18N.tr('%s files').replace('%s', r.files)} · ${UTI18N.tr('%s folders').replace('%s', r.dirs)}${r.partial ? ' (' + UTI18N.tr('counting stopped after 10 s') + ')' : ''}`; }
+    catch (x) { const p = $('#psz', d); if (p) p.textContent = x.message; }
+  }
+}
+function fileMenu(b, x, y, e) {
+  const items = fsel(), one = items.length === 1 ? items[0] : null;
+  const M = [];
+  if (e) {
+    M.push({ label: 'Open', key: 'Enter', fn: () => fileOpen(b, e), disabled: !one });
+    if (one && !one.dir && OFFICE.exts.includes((one.name.split('.').pop() || '').toLowerCase())) M.push({ label: 'Open in Office', fn: () => officeOpen(FS.share, fpath(one.name)) });
+    M.push({ label: one && !one.dir ? 'Download' : 'Download as ZIP', fn: () => fileDownload(items) }, 'sep',
+      { label: 'Cut', key: 'Ctrl+X', fn: () => fileCut('cut', items) }, { label: 'Copy', key: 'Ctrl+C', fn: () => fileCut('copy', items) });
+    if (one && one.dir && CLIP) M.push({ label: 'Paste into this folder', fn: () => filePaste(fpath(one.name)) });
+    M.push({ label: 'Rename', key: 'F2', fn: () => fileRename(one), disabled: !one }, 'sep',
+      { label: 'Share link…', fn: () => linkDialog(FS.share, fpath(one.name), one.name), disabled: !one },
+      { label: 'Export…', fn: () => exportDialog(FS.share, fpath(one.name), one.name, !!one.dir), disabled: !one });
+    if (one && one.dir && ME.admin) M.push({ label: 'As share…', fn: () => shareFromFolder(FS.share, fpath(one.name), one.name) });
+    M.push({ label: 'Properties', fn: () => fileProps(one), disabled: !one }, 'sep', { label: 'Delete', key: 'Del', danger: true, fn: () => fileDelete(items) });
+  } else {
+    M.push({ label: 'New folder', fn: () => $('#mk', b).click() }, { label: 'Upload files', fn: () => $('#up', b).click() }, { label: 'Upload a folder', fn: () => $('#upd', b).click() },
+      { label: CLIP ? 'Paste (' + CLIP.items.length + ')' : 'Paste', key: 'Ctrl+V', disabled: !CLIP, fn: () => filePaste() }, 'sep',
+      { label: 'Select all', key: 'Ctrl+A', fn: () => { FS.sel = new Set(FS.entries.map(x => x.name)); render('files'); } },
+      { label: 'Download this folder as ZIP', fn: () => fileDownload([]) });
+  }
+  ctxMenu(x, y, M);
+}
+let OFFICE = { exts: [] };
+
 VIEWS.files = async b => {
   const [sh, office] = await Promise.all([api('shares'), api('office').catch(() => ({ exts: [] }))]);
+  OFFICE = office;
   const isDoc = n => (office.exts || []).includes((n.split('.').pop() || '').toLowerCase()) && n.includes('.');
   const all = (sh.shares || []).filter(s => s.enabled !== false);
   // shares whose folder is missing (stock volume not present) are listed but not opened
   const list = all.filter(s => s.present !== false), gone = all.filter(s => s.present === false);
-  if (!list.some(s => s.name === FS.share)) { FS.share = list.length ? list[0].name : null; FS.path = ''; }
+  if (!list.some(s => s.name === FS.share)) { FS.share = list.length ? list[0].name : null; FS.path = ''; FS.sel.clear(); }
   const side = sidebar('files', [['#', 'Shares']].concat(list.map(s => ['s:' + s.name, s.name]),
     gone.length ? [['#', 'Volume missing']].concat(gone.map(s => ['x:' + s.name, s.name])) : []), 's:' + FS.share);
   let main = '<div class="empty">No share available.</div>';
@@ -444,54 +629,167 @@ VIEWS.files = async b => {
   if (FS.share) {
     // an error (folder gone meanwhile, no access) stays in the main area: the
     // share list remains usable
-    try { r = await api('files?' + new URLSearchParams({ share: FS.share, path: FS.path })); }
-    catch (e) { main = `<div class="ut-callout ut-callout--danger">${esc(FS.share)}: ${esc(e.message)}</div>`; }
+    try {
+      r = FS.search ? await api('files/search?' + new URLSearchParams({ share: FS.share, path: FS.path, q: FS.search }))
+        : await api('files?' + new URLSearchParams({ share: FS.share, path: FS.path }));
+    } catch (e) { main = `<div class="ut-callout ut-callout--danger">${esc(FS.share)}: ${esc(e.message)}</div>`; FS.search = null; }
   }
   if (r) {
+    FS.recycle = !!r.recycle;
+    const res = FS.search ? r.results.map(x => Object.assign({}, x, { name: x.path, label: x.path })) : r.entries;
+    const cmp = { name: (a, c) => a.name.localeCompare(c.name, undefined, { numeric: true, sensitivity: 'base' }), size: (a, c) => (a.size || 0) - (c.size || 0), mtime: (a, c) => a.mtime - c.mtime }[FS.sort];
+    const flt = FS.filter.toLowerCase();
+    FS.entries = res.filter(e => !flt || FS.search || e.name.toLowerCase().includes(flt))
+      .sort((a, c) => (c.dir - a.dir) || FS.dir * cmp(a, c));
+    for (const n of [...FS.sel]) if (!FS.entries.some(e => e.name === n)) FS.sel.delete(n);
     const parts = FS.path ? FS.path.split('/') : [];
-    const crumbs = `<span class="crumbs" translate="no"><button data-p="">${esc(FS.share)}</button>${parts.map((p, i) => ` / <button data-p="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`).join('')}</span>`;
-    main = `<div class="row" style="margin-bottom:10px">${crumbs}<span class="ut-spacer"></span>
-      <button class="ut-btn ut-btn--sm ut-btn--ghost" id="exps">Exports</button><button class="ut-btn ut-btn--sm ut-btn--ghost" id="lnks">Shared links</button><button class="ut-btn ut-btn--sm" id="mk">New folder</button><label class="ut-btn ut-btn--sm ut-btn--primary">Upload<input type="file" id="up" multiple hidden></label></div>
-      <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr></thead><tbody>
-      ${r.entries.map(e => `<tr class="fileline" data-name="${esc(e.name)}" data-dir="${e.dir ? 1 : ''}" data-size="${e.size || 0}"><td translate="no">${e.dir ? '📁 ' : ''}${esc(e.name)}</td><td class="num">${e.dir ? '' : size(e.size)}</td>
-        <td>${new Date(e.mtime * 1000).toLocaleString(UTI18N.locale)}</td><td class="ut-rowbtns">${!e.dir && isDoc(e.name) ? '<button class="ut-btn ut-btn--sm" data-office>Open in Office</button>' : ''}<button class="ut-btn ut-btn--ghost ut-btn--sm" data-exp>Export</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-lnk>Share…</button>${e.dir && ME.admin ? '<button class="ut-btn ut-btn--ghost ut-btn--sm" data-mkshare>As share</button>' : ''}<button class="ut-btn ut-btn--ghost ut-btn--sm" data-ren>Rename</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-del>Delete</button></td></tr>`).join('')}
-      </tbody></table></div>${r.entries.length ? '' : '<div class="empty">Empty</div>'}`;
+    const crumbs = `<span class="crumbs" translate="no"><button data-p="" data-drop="">${esc(FS.share)}</button>${parts.map((p, i) => ` / <button data-p="${esc(parts.slice(0, i + 1).join('/'))}" data-drop="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`).join('')}</span>`;
+    const n = FS.sel.size, arrow = k => FS.sort === k ? (FS.dir > 0 ? ' ▲' : ' ▼') : '';
+    const cut = CLIP && CLIP.op === 'cut' && CLIP.share === FS.share && CLIP.from === FS.path ? new Set(CLIP.items) : new Set();
+    main = `<div class="row ut-files__bar">${crumbs}<span class="ut-spacer"></span>
+        <input class="ut-input ut-files__search" id="fq" type="search" placeholder="${esc(UTI18N.tr('Filter, Enter = search subfolders'))}" value="${esc(FS.search || FS.filter)}" aria-label="Search"></div>
+      <div class="row ut-files__bar">
+        <button class="ut-btn ut-btn--sm" id="mk">New folder</button>
+        <label class="ut-btn ut-btn--sm ut-btn--primary">Upload<input type="file" id="up" multiple hidden></label>
+        <label class="ut-btn ut-btn--sm">Upload a folder<input type="file" id="upd" webkitdirectory hidden></label>
+        <span class="ut-files__sep"></span>
+        <button class="ut-btn ut-btn--sm ut-btn--ghost" data-fa="dl"${n ? '' : ' disabled'}>Download</button>
+        <button class="ut-btn ut-btn--sm ut-btn--ghost" data-fa="cut"${n ? '' : ' disabled'}>Cut</button>
+        <button class="ut-btn ut-btn--sm ut-btn--ghost" data-fa="copy"${n ? '' : ' disabled'}>Copy</button>
+        <button class="ut-btn ut-btn--sm ${CLIP ? '' : 'ut-btn--ghost'}" data-fa="paste"${CLIP ? '' : ' disabled'}>${CLIP ? esc(UTI18N.tr('Paste (%s)').replace('%s', CLIP.items.length)) : 'Paste'}</button>
+        <button class="ut-btn ut-btn--sm ut-btn--ghost" data-fa="ren"${n === 1 ? '' : ' disabled'}>Rename</button>
+        <button class="ut-btn ut-btn--sm ut-btn--ghost ut-btn--danger" data-fa="del"${n ? '' : ' disabled'}>Delete</button>
+        <span class="ut-spacer"></span><button class="ut-btn ut-btn--sm ut-btn--ghost" id="exps">Exports</button><button class="ut-btn ut-btn--sm ut-btn--ghost" id="lnks">Shared links</button></div>
+      ${FS.search ? `<div class="ut-callout ut-files__info"><div>${esc(UTI18N.tr('Search results for “%s”').replace('%s', FS.search))} · ${r.results.length}${r.partial ? ' (' + esc(UTI18N.tr('stopped early, narrow the search')) + ')' : ''} <button class="ut-btn ut-btn--sm ut-btn--ghost" id="fqx">Back to the folder</button></div></div>` : ''}
+      <div class="ut-table-wrap ut-files" id="flist" tabindex="0"><table class="ut-table"><thead><tr>
+        <th class="ut-files__ck"><input type="checkbox" id="fall" aria-label="Select all"${n && n === FS.entries.length ? ' checked' : ''}></th>
+        <th><button class="ut-th" data-sort="name">Name${arrow('name')}</button></th><th class="num"><button class="ut-th" data-sort="size">Size${arrow('size')}</button></th>
+        <th><button class="ut-th" data-sort="mtime">Modified${arrow('mtime')}</button></th><th></th></tr></thead><tbody>
+      ${FS.entries.map((e, i) => `<tr class="fileline${FS.sel.has(e.name) ? ' is-sel' : ''}${cut.has(e.name) ? ' is-cut' : ''}" data-i="${i}" draggable="${FS.search ? 'false' : 'true'}"${e.dir ? ` data-drop="${esc(fpath(e.name))}"` : ''}>
+        <td class="ut-files__ck">${FS.search ? '' : `<input type="checkbox" data-ck${FS.sel.has(e.name) ? ' checked' : ''} aria-label="${esc(UTI18N.tr('Select'))}">`}</td>
+        <td translate="no"><button class="ut-files__name" data-open>${e.dir ? '📁 ' : ''}${esc(e.name)}</button></td><td class="num">${e.dir ? '' : size(e.size)}</td>
+        <td>${new Date(e.mtime * 1000).toLocaleString(UTI18N.locale)}</td>
+        <td class="ut-rowbtns">${!e.dir && isDoc(e.name) && !FS.search ? '<button class="ut-btn ut-btn--sm" data-office>Open in Office</button>' : ''}${FS.search ? '' : `<button class="ut-btn ut-btn--ghost ut-btn--sm" data-more aria-label="${esc(UTI18N.tr('More'))}">⋯</button>`}</td></tr>`).join('')}
+      </tbody></table>${FS.entries.length ? '' : `<div class="empty">${FS.search ? esc(UTI18N.tr('Nothing found.')) : esc(UTI18N.tr('Empty. Drop files here to upload them.'))}</div>`}</div>
+      <div class="ut-files__foot ut-faint">${n ? esc(UTI18N.tr('%s selected').replace('%s', n)) + ' · ' : ''}${esc(nItems(FS.entries.length))}</div>
+      <div id="fxfer" class="ut-files__xfer" hidden></div>`;
   }
   b.innerHTML = side + `<div class="ut-window__main">${main}</div>`;
-  $$('[data-nav]', b).forEach(n => n.onclick = () => {
-    if (n.dataset.nav.startsWith('x:')) { toast(n.dataset.nav.slice(2), 'This share\'s folder is on a volume that is not present.', 'warn'); return; }
-    FS.share = n.dataset.nav.slice(2); FS.path = ''; render('files');
+  xferPanel();
+  $$('[data-nav]', b).forEach(nv => nv.onclick = () => {
+    if (nv.dataset.nav.startsWith('x:')) { toast(nv.dataset.nav.slice(2), 'This share\'s folder is on a volume that is not present.', 'warn'); return; }
+    FS.share = nv.dataset.nav.slice(2); FS.path = ''; FS.sel.clear(); FS.search = null; FS.filter = ''; render('files');
   });
-  $$('.crumbs button', b).forEach(c => c.onclick = () => { FS.path = c.dataset.p; render('files'); });
-  const rel = n => (FS.path ? FS.path + '/' : '') + n;
-  $$('.fileline', b).forEach(tr => {
-    tr.onclick = e => {
-      if (e.target.closest('[data-office]')) return officeOpen(FS.share, rel(tr.dataset.name));
-      if (e.target.closest('[data-exp]')) return exportDialog(FS.share, rel(tr.dataset.name), tr.dataset.name, !!tr.dataset.dir);
-      if (e.target.closest('[data-lnk]')) return linkDialog(FS.share, rel(tr.dataset.name), tr.dataset.name);
-      if (e.target.closest('[data-mkshare]')) return shareFromFolder(FS.share, rel(tr.dataset.name), tr.dataset.name);
-      if (e.target.closest('[data-del]')) return dialog({ kind: 'danger', title: 'Delete?', body: `<p>${esc(tr.dataset.name)} will be deleted permanently.</p>`, ok: 'Delete', okCls: 'ut-btn--danger',
-        onOk: () => api('files/op', { op: 'delete', share: FS.share, path: rel(tr.dataset.name) }).then(() => render('files')) });
-      if (e.target.closest('[data-ren]')) return dialog({ title: 'Rename', body: field('rn', 'New name', tr.dataset.name), ok: 'Rename',
-        onOk: s => api('files/op', { op: 'rename', share: FS.share, path: rel(tr.dataset.name), name: $('#rn', s).value }).then(() => render('files')) });
-      if (tr.dataset.dir) { FS.path = rel(tr.dataset.name); render('files'); }
-      else if (/^(audio|video)$/.test(mediaKind(tr.dataset.name))) openPlayer($$('.fileline', b).filter(x => !x.dataset.dir && /^(audio|video)$/.test(mediaKind(x.dataset.name))).map(x => x.dataset.name), tr.dataset.name, rel);
-      else if (mediaKind(tr.dataset.name) === 'img') viewer($$('.fileline', b).filter(x => !x.dataset.dir && mediaKind(x.dataset.name) === 'img').map(x => x.dataset.name), tr.dataset.name, rel);
-      else if (/^(pdf|text)$/.test(mediaKind(tr.dataset.name))) docViewer(tr.dataset.name, rel(tr.dataset.name), +tr.dataset.size || 0);
-      else location.href = '/api/files/download?' + new URLSearchParams({ share: FS.share, path: rel(tr.dataset.name) });
-    };
-  });
-  const lk = $('#lnks', b); if (lk) lk.onclick = () => linksDialog();
-  const ex = $('#exps', b); if (ex) ex.onclick = () => exportsDialog();
-  const mk = $('#mk', b); if (mk) mk.onclick = () => dialog({ title: 'New folder', body: field('nd', 'Name'), ok: 'Create',
-    onOk: s => api('files/op', { op: 'mkdir', share: FS.share, path: FS.path, name: $('#nd', s).value }).then(() => render('files')) });
-  const up = $('#up', b); if (up) up.onchange = async () => {
-    for (const f of up.files) {
-      toast('Upload', f.name);
-      try { await api('files/upload?' + new URLSearchParams({ share: FS.share, path: FS.path, name: f.name }), f, true); } catch (e) { fail(e); }
-    }
+  if (!r) return;
+  const list_ = $('#flist', b);
+  $$('.crumbs button', b).forEach(c => c.onclick = () => { FS.path = c.dataset.p; FS.sel.clear(); FS.search = null; render('files'); });
+  const entry = tr => FS.entries[+tr.dataset.i];
+  const select = (tr, ev) => {
+    const e = entry(tr), names = FS.entries.map(x => x.name);
+    if (ev.shiftKey && FS.last && names.includes(FS.last)) {
+      const [a, c] = [names.indexOf(FS.last), names.indexOf(e.name)].sort((x, y) => x - y);
+      if (!(ev.ctrlKey || ev.metaKey)) FS.sel.clear();
+      names.slice(a, c + 1).forEach(x => FS.sel.add(x));
+    } else if (ev.ctrlKey || ev.metaKey) { FS.sel.has(e.name) ? FS.sel.delete(e.name) : FS.sel.add(e.name); FS.last = e.name; }
+    else { FS.sel = new Set([e.name]); FS.last = e.name; }
     render('files');
   };
+  $$('.fileline', b).forEach(tr => {
+    tr.onclick = ev => {
+      const e = entry(tr);
+      if (FS.search) {             // a search hit: go to its folder, the file selected
+        const pp = e.path.split('/'), nm = pp.pop();
+        FS.search = null; FS.filter = ''; FS.path = e.dir ? e.path : pp.join('/'); FS.sel = new Set(e.dir ? [] : [nm]); FS.last = nm;
+        return render('files');
+      }
+      if (ev.target.closest('[data-office]')) return officeOpen(FS.share, fpath(e.name));
+      if (ev.target.closest('[data-more]')) { if (!FS.sel.has(e.name)) { FS.sel = new Set([e.name]); FS.last = e.name; } const rc = ev.target.getBoundingClientRect(); return fileMenu(b, rc.left, rc.bottom + 4, e); }
+      if (ev.target.closest('[data-ck]')) { FS.sel.has(e.name) ? FS.sel.delete(e.name) : FS.sel.add(e.name); FS.last = e.name; return render('files'); }
+      if (ev.target.closest('[data-open]') && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey) return fileOpen(b, e);
+      select(tr, ev);
+    };
+    tr.ondblclick = ev => { if (!FS.search && !ev.target.closest('button') && !ev.target.closest('input')) fileOpen(b, entry(tr)); };
+    tr.oncontextmenu = ev => { ev.preventDefault(); if (FS.search) return; const e = entry(tr); if (!FS.sel.has(e.name)) { FS.sel = new Set([e.name]); FS.last = e.name; render('files'); } fileMenu(body('files'), ev.clientX, ev.clientY, e); };
+    tr.ondragstart = ev => {
+      const e = entry(tr);
+      if (!FS.sel.has(e.name)) { FS.sel = new Set([e.name]); FS.last = e.name; tr.classList.add('is-sel'); }
+      ev.dataTransfer.setData('application/x-untrash-files', JSON.stringify({ share: FS.share, from: FS.path, items: [...FS.sel] }));
+      ev.dataTransfer.effectAllowed = 'copyMove';
+    };
+  });
+  list_.oncontextmenu = ev => { if (!ev.target.closest('.fileline')) { ev.preventDefault(); fileMenu(b, ev.clientX, ev.clientY, null); } };
+  // drop: files from the computer upload, entries of this window move (Ctrl: copy)
+  const dropTarget = ev => ev.target.closest('[data-drop]');
+  b.ondragover = ev => {
+    if (!ev.target.closest('#flist, .crumbs')) return;
+    ev.preventDefault();
+    const internal = [...ev.dataTransfer.types].includes('application/x-untrash-files');
+    ev.dataTransfer.dropEffect = internal ? (ev.ctrlKey || ev.altKey ? 'copy' : 'move') : 'copy';
+    $$('.is-drop', b).forEach(x => x.classList.remove('is-drop'));
+    (dropTarget(ev) || list_).classList.add('is-drop');
+  };
+  b.ondragleave = ev => { if (!b.contains(ev.relatedTarget)) $$('.is-drop', b).forEach(x => x.classList.remove('is-drop')); };
+  b.ondrop = async ev => {
+    if (!ev.target.closest('#flist, .crumbs')) return;
+    ev.preventDefault();
+    $$('.is-drop', b).forEach(x => x.classList.remove('is-drop'));
+    const t = dropTarget(ev), dst = t ? t.dataset.drop : FS.path;
+    const raw = ev.dataTransfer.getData('application/x-untrash-files');
+    if (raw) {
+      const d = JSON.parse(raw);
+      if (d.share === FS.share && d.from === dst) return;
+      if (d.items.some(nm => dst === (d.from ? d.from + '/' : '') + nm)) return;      // onto itself
+      try { await startTransfer(ev.ctrlKey || ev.altKey ? 'copy' : 'move', d.share, d.from, d.items, { share: FS.share, path: dst }); } catch (x) { fail(x); }
+      return;
+    }
+    const files = await droppedFiles(ev.dataTransfer);
+    if (files.length) uploadAll(FS.share, dst, files);
+  };
+  // keyboard
+  list_.onkeydown = ev => {
+    const k = ev.key.toLowerCase(), ctl = ev.ctrlKey || ev.metaKey, items = fsel();
+    if (ctl && k === 'a') { ev.preventDefault(); FS.sel = new Set(FS.entries.map(x => x.name)); render('files'); }
+    else if (ctl && k === 'c') { ev.preventDefault(); fileCut('copy', items); }
+    else if (ctl && k === 'x') { ev.preventDefault(); fileCut('cut', items); }
+    else if (ctl && k === 'v') { ev.preventDefault(); filePaste(); }
+    else if (k === 'delete') { ev.preventDefault(); fileDelete(items); }
+    else if (k === 'f2' && items.length === 1) { ev.preventDefault(); fileRename(items[0]); }
+    else if (k === 'enter' && items.length === 1) { ev.preventDefault(); fileOpen(b, items[0]); }
+    else if (k === 'backspace' && FS.path && !FS.search) { ev.preventDefault(); FS.path = FS.path.split('/').slice(0, -1).join('/'); FS.sel.clear(); render('files'); }
+    else if (k === 'escape') { FS.sel.clear(); render('files'); }
+    else if (k === 'arrowdown' || k === 'arrowup') {
+      ev.preventDefault();
+      const names = FS.entries.map(x => x.name), i = names.indexOf(FS.last), j = Math.max(0, Math.min(names.length - 1, i + (k === 'arrowdown' ? 1 : -1)));
+      if (names[j]) { if (ev.shiftKey) FS.sel.add(names[j]); else FS.sel = new Set([names[j]]); FS.last = names[j]; render('files'); }
+    }
+  };
+  if (!document.activeElement || document.activeElement === document.body || b.contains(document.activeElement) && !document.activeElement.matches('input, textarea, select'))
+    list_.focus({ preventScroll: true });
+  const fall = $('#fall', b); if (fall) fall.onchange = () => { FS.sel = fall.checked ? new Set(FS.entries.map(x => x.name)) : new Set(); render('files'); };
+  $$('[data-sort]', b).forEach(x => x.onclick = () => { FS.dir = FS.sort === x.dataset.sort ? -FS.dir : 1; FS.sort = x.dataset.sort; render('files'); });
+  $$('[data-fa]', b).forEach(x => x.onclick = () => {
+    const items = fsel();
+    ({ dl: () => fileDownload(items), cut: () => fileCut('cut', items), copy: () => fileCut('copy', items), paste: () => filePaste(),
+       ren: () => fileRename(items[0]), del: () => fileDelete(items) })[x.dataset.fa]();
+  });
+  const fq = $('#fq', b);
+  fq.oninput = () => {
+    if (FS.search) return;
+    FS.filter = fq.value;
+    const flt = fq.value.toLowerCase();
+    $$('.fileline', b).forEach(tr => { tr.hidden = !!flt && !entry(tr).name.toLowerCase().includes(flt); });
+  };
+  fq.onkeydown = ev => {
+    if (ev.key === 'Enter' && fq.value.trim().length >= 2) { FS.search = fq.value.trim(); FS.filter = ''; FS.sel.clear(); render('files'); }
+    if (ev.key === 'Escape') { fq.value = ''; FS.filter = ''; FS.search = null; render('files'); }
+  };
+  const fqx = $('#fqx', b); if (fqx) fqx.onclick = () => { FS.search = null; render('files'); };
+  const lk = $('#lnks', b); if (lk) lk.onclick = () => linksDialog();
+  const ex = $('#exps', b); if (ex) ex.onclick = () => exportsDialog();
+  $('#mk', b).onclick = () => dialog({ title: 'New folder', body: field('nd', 'Name'), ok: 'Create',
+    onOk: s => api('files/op', { op: 'mkdir', share: FS.share, path: FS.path, name: $('#nd', s).value }).then(() => { FS.sel = new Set([$('#nd', s).value]); render('files'); }) });
+  $('#up', b).onchange = e => uploadAll(FS.share, FS.path, [...e.target.files].map(f => ({ file: f, dirs: '' })));
+  $('#upd', b).onchange = e => uploadAll(FS.share, FS.path, [...e.target.files].map(f => ({ file: f, dirs: (f.webkitRelativePath || '').split('/').slice(0, -1).join('/') })));
 };
 
 /* photo / music / video viewer (stock Photo, Music and Video apps) */

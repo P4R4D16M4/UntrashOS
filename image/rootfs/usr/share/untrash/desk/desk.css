@@ -216,3 +216,27 @@ tr.ut-ab-blocked td { color: var(--ut-danger); }
   border: 1px solid var(--ut-line-2); border-radius: var(--ut-r-md); background: color-mix(in srgb, var(--ut-accent) 8%, transparent); }
 .ut-qr { width: min(280px, 100%); margin: 8px auto; border-radius: var(--ut-r-md); overflow: hidden; }
 .ut-qr svg { display: block; width: 100%; height: auto; }
+
+/* Files: selection, cut, drop targets, toolbar, transfers */
+.ut-files__bar { margin-bottom: 8px; gap: 6px; flex-wrap: wrap; }
+.ut-files__sep { width: 1px; align-self: stretch; background: var(--ut-line-2); margin: 2px 4px; }
+.ut-files__search { width: min(260px, 100%); }
+.ut-files__info { margin-bottom: 8px; }
+.ut-files { outline: none; border-radius: var(--ut-r-md); }
+.ut-files:focus-visible { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ut-accent) 50%, transparent); }
+.ut-files.is-drop, .ut-files tr.is-drop td, .crumbs button.is-drop { background: color-mix(in srgb, var(--ut-accent) 16%, transparent); }
+.ut-files__ck { width: 28px; }
+.ut-files tr.fileline { cursor: default; user-select: none; }
+.ut-files tr.is-sel td { background: color-mix(in srgb, var(--ut-accent) 12%, transparent); }
+.ut-files tr.is-cut td { opacity: .55; }
+.ut-files__name { border: 0; background: none; color: var(--ut-fg); font: inherit; padding: 0; cursor: pointer; text-align: left; }
+.ut-files__name:hover { text-decoration: underline; color: var(--ut-accent); }
+.ut-th { border: 0; background: none; color: inherit; font: inherit; padding: 0; cursor: pointer; text-transform: inherit; letter-spacing: inherit; }
+.ut-files__foot { margin-top: 6px; font-size: var(--ut-fs-xs); }
+.ut-files__xfer { margin-top: 8px; display: grid; gap: 6px; }
+.ut-xfer { display: grid; grid-template-columns: minmax(0, 1fr) 160px auto auto; gap: 10px; align-items: center; padding: 6px 10px;
+  border: 1px solid var(--ut-line-2); border-radius: var(--ut-r-md); background: color-mix(in srgb, var(--ut-ink) 4%, transparent); }
+.ut-xfer__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ut-xfer__err { grid-column: 1 / -1; color: var(--ut-danger); }
+.ut-ctx { position: fixed; z-index: 120; }
+@media (max-width: 640px) { .ut-xfer { grid-template-columns: minmax(0, 1fr) auto; } .ut-xfer .ut-progress { grid-column: 1 / -1; } }

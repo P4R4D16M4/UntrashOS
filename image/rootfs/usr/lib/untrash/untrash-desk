@@ -2006,11 +2006,63 @@ def files_list(user, q):
         except OSError:
             continue
         out.append({"name": e.name, "dir": e.is_dir(follow_symlinks=False), "size": st.st_size, "mtime": int(st.st_mtime)})
-    return {"entries": out, "path": os.path.relpath(full, base) if full != base else ""}
+    return {"entries": out, "path": os.path.relpath(full, base) if full != base else "", "recycle": share_recycle(q.get("share", ""))}
+
+
+RECYCLE_DIR = "recycle"            # Samba vfs recycle:repository of a share with recycle = y (stock)
+
+
+def share_recycle(share):
+    c = db()
+    try:
+        r = c.execute("SELECT recycle FROM smb_share WHERE s_name=?", (share,)).fetchone()
+        return bool(r and r[0] == "y")
+    finally:
+        c.close()
+
+
+def own(path, user, mode=0o777):
+    """New files and folders as uploads make them: the user's, group everyone."""
+    os.chmod(path, mode)
+    if not TEST:
+        os.chown(path, owner_of(user), 500)
+
+
+def free_name(path):
+    """path, or "name (2).ext", "name (3).ext", ... if it exists."""
+    if not os.path.lexists(path):
+        return path
+    d, n = os.path.split(path)
+    stem, ext = (n, "") if os.path.isdir(path) else os.path.splitext(n)
+    i = 2
+    while os.path.lexists(os.path.join(d, "%s (%d)%s" % (stem, i, ext))):
+        i += 1
+    return os.path.join(d, "%s (%d)%s" % (stem, i, ext))
+
+
+def to_recycle(base, full):
+    """Into the share's recycle bin, the folder tree kept, as Samba's
+    recycle module does (keeptree, versions: "Copy #n of name")."""
+    rel = os.path.relpath(full, base)
+    dst = os.path.join(base, RECYCLE_DIR, rel)
+    os.makedirs(os.path.dirname(dst), mode=0o777, exist_ok=True)
+    if os.path.lexists(dst):
+        d, n = os.path.split(dst)
+        i = 1
+        while os.path.lexists(os.path.join(d, "Copy #%d of %s" % (i, n))):
+            i += 1
+        dst = os.path.join(d, "Copy #%d of %s" % (i, n))
+    os.rename(full, dst)
 
 
 def files_op(user, req):
     op, share = req.get("op"), req.get("share", "")
+    if op == "delete" and isinstance(req.get("paths"), list):          # several at once
+        n = 0
+        for pth in req["paths"][:5000]:
+            files_op(user, {"op": "delete", "share": share, "path": str(pth)})
+            n += 1
+        return {"deleted": n}
     _b, full = resolve(user, share, req.get("path", ""), write=True)
     name = req.get("name", "")
     if op in ("mkdir", "rename") and (not name or "/" in name or name in (".", "..")):
@@ -2024,6 +2076,12 @@ def files_op(user, req):
     elif op == "delete":
         if full == _b:
             raise Fail("The share itself remains.")
+        if not os.path.lexists(full):
+            raise Fail("Not found.", 404)
+        rel = os.path.relpath(full, _b)
+        if share_recycle(share) and rel.split("/")[0] != RECYCLE_DIR and not req.get("permanent"):
+            to_recycle(_b, full)
+            return {"recycled": True}
         if os.path.isdir(full) and not os.path.islink(full):
             shutil.rmtree(full)
         else:
@@ -2038,6 +2096,214 @@ def files_op(user, req):
     else:
         raise Fail("Unknown action.")
     return {}
+
+
+# ------------------------------------------------- copy / move (background jobs)
+
+FILE_JOBS = {}                 # id -> job (memory; finished jobs are kept an hour)
+
+
+def files_transfer(user, req):
+    """Copy or move items (any shares the user may use) into a folder.
+    conflict: rename (default, "name (2)"), overwrite, skip."""
+    op, conflict = req.get("op"), req.get("conflict") or "rename"
+    if op not in ("copy", "move") or conflict not in ("rename", "overwrite", "skip"):
+        raise Fail("Unknown action.")
+    dst = req.get("dst") or {}
+    _db, dfull = resolve(user, str(dst.get("share") or ""), str(dst.get("path") or ""), write=True)
+    if not os.path.isdir(dfull):
+        raise Fail("The target is not a folder.", 404)
+    items = []
+    for it in (req.get("items") or [])[:5000]:
+        b, f = resolve(user, str(it.get("share") or ""), str(it.get("path") or ""), write=(op == "move"))
+        if f == b:
+            raise Fail("A whole share cannot be copied or moved here; choose its contents.")
+        if not os.path.lexists(f):
+            raise Fail("Not found: %s" % it.get("path"), 404)
+        if dfull == f or dfull.startswith(f + "/"):
+            raise Fail("A folder cannot go into itself.")
+        items.append(f)
+    if not items:
+        raise Fail("Nothing selected.")
+    now = time.time()
+    for k in [k for k, j in FILE_JOBS.items() if j["state"] != "running" and now - j["t"] > 3600]:
+        del FILE_JOBS[k]
+    jid = secrets.token_hex(6)
+    job = {"id": jid, "user": user, "op": op, "state": "running", "total": 0, "done": 0, "files": 0, "current": "",
+           "errors": [], "skipped": 0, "cancel": False, "t": now, "dst": str(dst.get("path") or "") or str(dst.get("share") or "")}
+    FILE_JOBS[jid] = job
+    threading.Thread(target=transfer_run, args=(job, items, dfull, conflict), daemon=True).start()
+    return {"job": jid}
+
+
+def transfer_run(job, items, dfull, conflict):
+    class Cancelled(Exception):
+        pass
+
+    def err(msg):
+        if len(job["errors"]) < 20:
+            job["errors"].append(msg)
+
+    def copy_file(src, dst):
+        tmp = dst + ".untrash-part"
+        try:
+            with open(src, "rb") as fi, open(tmp, "wb") as fo:
+                while True:
+                    if job["cancel"]:
+                        raise Cancelled()
+                    b = fi.read(1 << 20)
+                    if not b:
+                        break
+                    fo.write(b)
+                    job["done"] += len(b)
+            st = os.stat(src)
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+            own(tmp, job["user"])
+            os.replace(tmp, dst)
+            job["files"] += 1
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def copy_tree(src, dst):
+        if os.path.islink(src):
+            err("%s: links are not copied" % os.path.basename(src))
+            return False
+        if os.path.isdir(src):
+            os.mkdir(dst)
+            own(dst, job["user"])
+            ok = True
+            for e in sorted(os.listdir(src)):
+                if e in (IMP.RECYCLE_FN, IMP.RECYCLE_RBM_FN):
+                    continue
+                job["current"] = e
+                try:
+                    ok = copy_tree(os.path.join(src, e), os.path.join(dst, e)) and ok
+                except OSError as x:
+                    err("%s: %s" % (e, x.strerror or x))
+                    ok = False
+            return ok
+        copy_file(src, dst)
+        return True
+
+    def size(p):
+        if os.path.islink(p):
+            return 0
+        if os.path.isfile(p):
+            return os.path.getsize(p)
+        t = 0
+        for d, _ds, fs in os.walk(p):
+            for f in fs:
+                fp = os.path.join(d, f)
+                if not os.path.islink(fp):
+                    try:
+                        t += os.path.getsize(fp)
+                    except OSError:
+                        pass
+        return t
+
+    try:
+        job["total"] = sum(size(f) for f in items)
+        for src in items:
+            name = os.path.basename(src)
+            job["current"] = name
+            target = os.path.join(dfull, name)
+            if job["op"] == "move" and os.path.dirname(src) == dfull:
+                job["skipped"] += 1                  # moved onto itself: nothing to do
+                continue
+            if os.path.lexists(target):
+                if conflict == "skip":
+                    job["skipped"] += 1
+                    continue
+                if conflict == "rename" or target == src:
+                    target = free_name(target)
+                else:                                # overwrite: the old one goes
+                    if os.path.isdir(target) and not os.path.islink(target):
+                        shutil.rmtree(target)
+                    else:
+                        os.unlink(target)
+            try:
+                if job["op"] == "move":
+                    try:
+                        os.rename(src, target)       # same file system: instant
+                        job["done"] += size(target)
+                        job["files"] += 1
+                        continue
+                    except OSError as x:
+                        if x.errno != 18:            # EXDEV: other volume, copy + delete
+                            raise
+                if copy_tree(src, target) and job["op"] == "move":
+                    if os.path.isdir(src) and not os.path.islink(src):
+                        shutil.rmtree(src)
+                    else:
+                        os.unlink(src)
+            except OSError as x:
+                err("%s: %s" % (name, x.strerror or x))
+        job["state"] = "done" if not job["errors"] else "errors"
+    except Cancelled:
+        job["state"] = "cancelled"
+    except Exception as x:  # noqa: BLE001 - a job must end with a state
+        err(str(x))
+        job["state"] = "errors"
+    job["current"], job["t"] = "", time.time()
+
+
+def file_jobs(user):
+    return {"jobs": [{k: v for k, v in j.items() if k not in ("user", "cancel")} for j in FILE_JOBS.values() if j["user"] == user]}
+
+
+def file_job_cancel(user, req):
+    j = FILE_JOBS.get(str(req.get("job") or ""))
+    if not j or j["user"] != user:
+        raise Fail("No such job.", 404)
+    j["cancel"] = True
+    return {}
+
+
+def files_search(user, q):
+    """Names containing q below a folder (case-insensitive), at most 300
+    hits or 8 seconds."""
+    base, full = resolve(user, q.get("share", ""), q.get("path", ""))
+    needle = (q.get("q") or "").strip().lower()
+    if len(needle) < 2:
+        raise Fail("At least 2 characters.")
+    out, t0, partial = [], time.time(), False
+    for d, dirs, files in os.walk(full):
+        dirs[:] = sorted(x for x in dirs if x not in (IMP.RECYCLE_FN, IMP.RECYCLE_RBM_FN, ".system", ".media"))
+        for n in dirs + sorted(files):
+            if needle in n.lower():
+                fp = os.path.join(d, n)
+                try:
+                    st = os.stat(fp, follow_symlinks=False)
+                except OSError:
+                    continue
+                out.append({"path": os.path.relpath(fp, base), "name": n, "dir": n in dirs, "size": st.st_size, "mtime": int(st.st_mtime)})
+        if len(out) >= 300 or time.time() - t0 > 8:
+            partial = True
+            break
+    return {"results": out[:300], "partial": partial}
+
+
+def files_size(user, q):
+    """Size of a folder (files, folders), at most 10 seconds of counting."""
+    _b, full = resolve(user, q.get("share", ""), q.get("path", ""))
+    total = files = dirs = 0
+    t0, partial = time.time(), False
+    for d, ds, fs in os.walk(full):
+        dirs += len(ds)
+        for f in fs:
+            fp = os.path.join(d, f)
+            if not os.path.islink(fp):
+                try:
+                    total += os.path.getsize(fp)
+                    files += 1
+                except OSError:
+                    pass
+        if time.time() - t0 > 10:
+            partial = True
+            break
+    return {"size": total, "files": files, "dirs": dirs, "partial": partial}
 
 
 # ------------------------------------------------------------- feedback
@@ -2555,6 +2821,15 @@ def files_upload(user, q, handler, length):
     if not name or "/" in name or name in (".", "..") or length > 64 * 1024 ** 3:
         raise Fail("Invalid file name.")
     _b, full = resolve(user, q.get("share", ""), q.get("path", ""), write=True)
+    if q.get("dirs"):                     # folder upload: the file's subfolders below path
+        for part in q["dirs"].split("/"):
+            if not part or part in (".", "..") or part.startswith("."):
+                raise Fail("Invalid folder name.")
+            full = os.path.join(full, part)
+            if not os.path.isdir(full):
+                os.mkdir(full)
+                own(full, user)
+        _b, full = resolve(user, q.get("share", ""), os.path.join(q.get("path", ""), q["dirs"]), write=True)
     dst = os.path.join(full, name)
     tmp = os.path.join(full, ".%s.untrash-upload" % name)
     with open(tmp, "wb") as f:
@@ -3438,6 +3713,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.stream_media(full, q)
         if p == "/api/files/op" and method == "POST":
             return self.reply(200, files_op(user, self.json_body()))
+        if p == "/api/files/transfer" and method == "POST":
+            return self.reply(200, files_transfer(user, self.json_body()))
+        if p == "/api/files/jobs" and method == "GET":
+            return self.reply(200, file_jobs(user))
+        if p == "/api/files/jobs/cancel" and method == "POST":
+            return self.reply(200, file_job_cancel(user, self.json_body()))
+        if p == "/api/files/search" and method == "GET":
+            return self.reply(200, files_search(user, q))
+        if p == "/api/files/size" and method == "GET":
+            return self.reply(200, files_size(user, q))
+        if p == "/api/files/zip" and method == "GET":
+            base, full = resolve(user, q.get("share", ""), q.get("path", ""))
+            try:
+                names = json.loads(q.get("names") or "[]")
+            except ValueError:
+                raise Fail("Invalid selection.")
+            if not os.path.isdir(full) or not isinstance(names, list):
+                raise Fail("Not a folder.", 404)
+            if names:
+                sel = [resolve(user, q.get("share", ""), os.path.join(q.get("path", ""), str(n)))[1] for n in names[:5000]]
+                zname = os.path.basename(full) or q.get("share", "download")
+            else:
+                sel, zname = [full], os.path.basename(full) or q.get("share", "download")
+            return self.zip_stream(sel, zname)
         if p == "/api/files/upload" and method == "POST":
             return self.reply(200, files_upload(user, q, self, int(self.headers.get("Content-Length") or 0)))
         if p == "/api/tv" and method == "GET":
@@ -3669,8 +3968,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(full)
         if not os.path.isdir(full):
             return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>The file no longer exists.</p>"), "text/html; charset=utf-8")
+        return self.zip_stream([full], os.path.basename(full.rstrip("/")) or "download")
+
+    def zip_stream(self, items, name):
+        """Files and folders as one ZIP (stored, streamed while it is made;
+        hidden files, links and recycle bins left out)."""
         import zipfile
-        name = os.path.basename(full.rstrip("/")) or "download"
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Disposition", "attachment; filename*=UTF-8''%s.zip" % urllib.parse.quote(name))
@@ -3694,13 +3997,23 @@ class Handler(BaseHTTPRequestHandler):
                 s.w.flush()
         try:
             with zipfile.ZipFile(Out(self.wfile), "w", zipfile.ZIP_STORED, allowZip64=True) as z:
-                for d, dirs, files in os.walk(full):
-                    dirs[:] = [x for x in dirs if not x.startswith(".") and x not in (IMP.RECYCLE_FN,)]
-                    for f in files:
-                        fp = os.path.join(d, f)
-                        if os.path.islink(fp) or f.startswith("."):
-                            continue
-                        z.write(fp, os.path.join(name, os.path.relpath(fp, full)))
+                for full in items:
+                    if os.path.islink(full):
+                        continue
+                    top = os.path.basename(full.rstrip("/")) or name
+                    if os.path.isfile(full):
+                        z.write(full, top)
+                        continue
+                    for d, dirs, files in os.walk(full):
+                        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in (IMP.RECYCLE_FN,)]
+                        rel = os.path.relpath(d, full)
+                        if not files and not dirs:
+                            z.writestr(os.path.join(top, rel if rel != "." else "", "").replace("/./", "/"), b"")   # empty folder
+                        for f in files:
+                            fp = os.path.join(d, f)
+                            if os.path.islink(fp) or f.startswith("."):
+                                continue
+                            z.write(fp, os.path.join(top, os.path.relpath(fp, full)))
         except (BrokenPipeError, ConnectionResetError):
             pass
 

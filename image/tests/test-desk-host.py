@@ -252,6 +252,70 @@ def main():
             check("admin rename + delete", a.req("/api/files/op", {"op": "rename", "share": "mixed", "path": "neu.txt", "name": "n2.txt"})[0] == 200
                   and a.req("/api/files/op", {"op": "delete", "share": "mixed", "path": "n2.txt"})[0] == 200
                   and not os.path.exists(r + "/i-data/aaaa0001/mixed/n2.txt"))
+            # file manager: recycle bin, copy/move jobs, ZIP, search, size, folder upload
+            mx = r + "/i-data/aaaa0001/mixed"
+            check("delete on a share with recycle bin moves it there (tree kept)", os.path.isfile(mx + "/recycle/n2.txt"))
+            open(mx + "/n2.txt", "w").write("again")
+            a.req("/api/files/op", {"op": "delete", "share": "mixed", "path": "n2.txt"})
+            check("a second delete of the same name: Samba's \"Copy #1 of\"", os.path.isfile(mx + "/recycle/Copy #1 of n2.txt"))
+            check("delete inside the recycle bin is permanent", a.req("/api/files/op", {"op": "delete", "share": "mixed", "path": "recycle/n2.txt"})[0] == 200
+                  and not os.path.exists(mx + "/recycle/n2.txt"))
+            st, fl = a.req("/api/files?share=mixed&path=")
+            check("the listing says the share has a recycle bin", fl.get("recycle") is True and a.req("/api/files?share=groups&path=")[1].get("recycle") is False)
+            os.makedirs(mx + "/fm/sub/leer")
+            open(mx + "/fm/a.txt", "w").write("A" * 3000)
+            open(mx + "/fm/sub/b.txt", "w").write("B")
+            check("several deleted at once", a.req("/api/files/op", {"op": "delete", "share": "mixed", "paths": ["fm/zz1", "fm/zz2"]})[0] == 404)
+            def job_wait(cl, jid):
+                for _i in range(100):
+                    js = [j for j in cl.req("/api/files/jobs")[1]["jobs"] if j["id"] == jid]
+                    if js and js[0]["state"] != "running":
+                        return js[0]
+                    time.sleep(0.1)
+                return {}
+            def xfer(cl, body):
+                st, j = cl.req("/api/files/transfer", body)
+                return (st, job_wait(cl, j["job"])) if st == 200 else (st, j)
+            st, j = xfer(a, {"op": "copy", "items": [{"share": "mixed", "path": "fm"}], "dst": {"share": "groups", "path": ""}})
+            g0 = r + "/i-data/aaaa0001/groups"
+            check("copy a folder to another share (tree, empty folder, bytes counted)", st == 200 and j.get("state") == "done"
+                  and open(g0 + "/fm/sub/b.txt").read() == "B" and os.path.isdir(g0 + "/fm/sub/leer") and j["done"] == 3001 and j["total"] == 3001
+                  and os.path.isdir(mx + "/fm"))
+            st, j = xfer(a, {"op": "copy", "items": [{"share": "mixed", "path": "fm/a.txt"}], "dst": {"share": "mixed", "path": "fm"}})
+            check("copy into the same folder: \"a (2).txt\"", j.get("state") == "done" and os.path.isfile(mx + "/fm/a (2).txt"))
+            open(g0 + "/fm/a.txt", "w").write("old")
+            xfer(a, {"op": "copy", "items": [{"share": "mixed", "path": "fm/a.txt"}], "dst": {"share": "groups", "path": "fm"}, "conflict": "skip"})
+            check("conflict skip keeps the old file", open(g0 + "/fm/a.txt").read() == "old")
+            xfer(a, {"op": "copy", "items": [{"share": "mixed", "path": "fm/a.txt"}], "dst": {"share": "groups", "path": "fm"}, "conflict": "overwrite"})
+            check("conflict overwrite replaces it", open(g0 + "/fm/a.txt").read() == "A" * 3000)
+            st, j = xfer(a, {"op": "move", "items": [{"share": "mixed", "path": "fm/a (2).txt"}, {"share": "mixed", "path": "fm/sub"}], "dst": {"share": "groups", "path": ""}})
+            check("move two items to another share", j.get("state") == "done" and os.path.isfile(g0 + "/a (2).txt") and os.path.isfile(g0 + "/sub/b.txt")
+                  and not os.path.exists(mx + "/fm/sub") and not os.path.exists(mx + "/fm/a (2).txt"))
+            check("a folder cannot go into itself", a.req("/api/files/transfer", {"op": "move", "items": [{"share": "groups", "path": "fm"}], "dst": {"share": "groups", "path": "fm/sub"}})[0] == 400)
+            check("a whole share is not copied", a.req("/api/files/transfer", {"op": "copy", "items": [{"share": "groups", "path": ""}], "dst": {"share": "mixed", "path": ""}})[0] == 400)
+            check("alice (read only on mixed) cannot move out of it", u.req("/api/files/transfer", {"op": "move", "items": [{"share": "mixed", "path": "readme.txt"}], "dst": {"share": "mixed", "path": "fm"}})[0] == 403)
+            check("bob (no access) cannot copy from mixed", b.req("/api/files/transfer", {"op": "copy", "items": [{"share": "mixed", "path": "readme.txt"}], "dst": {"share": "guestplus", "path": ""}})[0] == 403)
+            check("jobs are per user", not any(j for j in u.req("/api/files/jobs")[1]["jobs"]))
+            import io, zipfile
+            st, zb = a.req("/api/files/zip?" + urllib.parse.urlencode({"share": "groups", "path": "fm"}))
+            zn = sorted(zipfile.ZipFile(io.BytesIO(zb)).namelist()) if st == 200 else []
+            check("a folder as ZIP (with its empty folder)", zn == ["fm/a.txt", "fm/sub/b.txt", "fm/sub/leer/"], )
+            st, zb = a.req("/api/files/zip?" + urllib.parse.urlencode({"share": "groups", "path": "", "names": json.dumps(["a (2).txt", "sub"])}))
+            zf = zipfile.ZipFile(io.BytesIO(zb)) if st == 200 else None
+            check("a selection as ZIP", zf and sorted(zf.namelist()) == ["a (2).txt", "sub/b.txt", "sub/leer/"] and zf.read("a (2).txt") == b"A" * 3000)
+            check("ZIP keeps the rights (bob)", b.req("/api/files/zip?" + urllib.parse.urlencode({"share": "mixed", "path": ""}))[0] == 403)
+            check("ZIP refuses names outside the folder", a.req("/api/files/zip?" + urllib.parse.urlencode({"share": "groups", "path": "fm", "names": json.dumps(["../../mixed"])}))[0] == 403)
+            st, sr = a.req("/api/files/search?" + urllib.parse.urlencode({"share": "groups", "path": "", "q": "B.TX"}))
+            check("search below a folder (case-insensitive)", st == 200 and [x["path"] for x in sr["results"]] == ["fm/sub/b.txt", "sub/b.txt"])
+            check("search needs 2 characters", a.req("/api/files/search?share=groups&path=&q=b")[0] == 400)
+            st, sz = a.req("/api/files/size?share=groups&path=fm")
+            check("folder size", st == 200 and sz["size"] == 3001 and sz["files"] == 2 and sz["dirs"] == 2)
+            st, _ = a.req("/api/files/upload?" + urllib.parse.urlencode({"share": "groups", "path": "", "name": "c.txt", "dirs": "Neu/tief"}), raw=b"C")
+            check("folder upload makes the subfolders", st == 200 and open(g0 + "/Neu/tief/c.txt").read() == "C")
+            check("folder upload refuses .. and hidden folders", a.req("/api/files/upload?" + urllib.parse.urlencode({"share": "groups", "path": "", "name": "x", "dirs": "../x"}), raw=b"x")[0] == 400
+                  and a.req("/api/files/upload?" + urllib.parse.urlencode({"share": "groups", "path": "", "name": "x", "dirs": ".ssh"}), raw=b"x")[0] == 400)
+            shutil.rmtree(mx + "/fm")
+            shutil.rmtree(mx + "/recycle")
             # media viewer: inline only for media types, sandboxed, with Range
             open(r + "/i-data/aaaa0001/mixed/bild.jpg", "wb").write(b"\xff\xd8\xff" + bytes(range(256)) * 4)
             open(r + "/i-data/aaaa0001/mixed/boese.html", "w").write("<script>alert(1)</script>")
