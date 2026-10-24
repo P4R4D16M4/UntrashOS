@@ -180,6 +180,26 @@ try:
                                                                           and acct not in open(NODES["a"]["dir"] + "/smb-mesh.conf").read()))
     check("co-op: a member cannot offer to itself / unknown nodes", "error" in cli("a", "share", sa["node"], "{}") and "error" in cli("a", "share", "0" * 16, "{}"))
 
+    # UntrashApp: an app invitation; the app (a stand-in: untrash-mesh with ZT_MESH_KIND=app) joins and is linked to alice on a
+    pd = os.path.join(W, "app")
+    os.makedirs(pd)
+    appenv = dict(NODES["c"]["env"], ZT_MESH_DIR=pd + "/state", ZT_MESH_KIND="app", ZT_MESH_FAKE_WG=pd + "/wg.json",
+                  ZT_MESH_HOSTS=pd + "/hosts", ZT_MESH_ADDRMAP=pd + "/addrmap")
+    open(pd + "/hosts", "w").write("")
+    open(pd + "/addrmap", "w").write("{}")
+    inv = cli("a", "invite", "1", "alice")
+    r = subprocess.run([TOOL, "rename", "alices-phone"], env=appenv, stdout=subprocess.PIPE, text=True)
+    r = subprocess.run([TOOL, "join", inv["invitation"]], env=appenv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    joined = json.loads(r.stdout.strip().splitlines()[-1])
+    app_node = joined.get("node")
+    am = [x for x in cli("a", "status")["members"] if x["node"] == app_node]
+    check("app: joined with an app invitation, kind app, linked to alice on a", joined.get("mesh") and am and am[0]["kind"] == "app" and am[0]["user"] == "alice")
+    check("app: the link is local to a (b knows the app, not its user)", wait(lambda: any(x["node"] == app_node and x["kind"] == "app" and x["user"] is None
+                                                                                        for x in cli("b", "status")["members"])))
+    check("app: b's admin side cannot link a NAS as app", "error" in cli("b", "app-link", nb, "alice"))
+    cli("a", "remove", app_node)
+    check("app: removed -> the link goes", wait(lambda: app_node not in jf("a", "state/apps.json")))
+
     # off-site mirror: a asks b to keep a copy of its volume /i-data/v1 (DRBD faked)
     VOL, SIZE = "/i-data/v1", 64 << 20
     json.dump({"mounts": {VOL: "/dev/vg/lv_v1"}, "sizes": {"/dev/vg/lv_v1": SIZE}}, open(NODES["a"]["dir"] + "/drbd.json", "w"))

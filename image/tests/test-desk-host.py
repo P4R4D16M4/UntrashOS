@@ -16,6 +16,7 @@ in the rendered smb.conf exactly), file browser with the stock rights
 (alice ro / bob deny on "mixed", path traversal refused), settings
 validation, first setup (way A), way D (rollback marker on a test stick).
 """
+import base64
 import hashlib
 import http.cookiejar
 import json
@@ -99,6 +100,7 @@ def env_for(r, stick, port):
                 ZT_MESH_FAKE_WG=r + "/mesh-wg.json", ZT_MESH_HOSTS=r + "/hosts", ZT_MESH_SMB=r + "/etc/samba/untrash-mesh.conf",
                 ZT_MESH_PDATA=r + "/p-data", ZT_MESH_FAKE_MOUNT=r + "/mesh-mounts.json", ZT_MESH_FAKE_ACCOUNTS=r + "/mesh-accounts.json",
                 ZT_MESH_ENDPOINTS="192.168.1.20:51820", ZT_MESH_JOIN_HOST="127.0.0.1",
+                ZT_MESH_ADDRMAP="{}",                  # PC test: the app reaches the Desk over 127.0.0.1, not the mesh
                 ZT_DESK_TESTPW=PW, ZT_DESK_STICK=stick,
                 ZT_IMPORT_TOOL=os.path.join(FILES, "usr/sbin/untrash-import-zyxel"),
                 ZT_CONFIG_TOOL=os.path.join(FILES, "usr/sbin/untrash-config"),
@@ -530,6 +532,103 @@ def main():
             check("co-op: share made on the partner volume", st == 200 and any(x["name"] == "VonB" and x["path"] == "/p-data/nas-b-Photos/VonB"
                                                                               for x in a.req("/api/shares")[1]["shares"]))
             a.req("/api/shares/delete", {"name": "VonB"})
+
+            # UntrashApp (docs/architecture/app-api.md): pairing, signed requests, sign-in, confirmations
+            sig = os.path.join(r, "zt-sig")
+            def app_key(n):
+                sec, pub = os.path.join(r, n + ".sec"), os.path.join(r, n + ".pub")
+                subprocess.run([sig, "keygen", sec, pub], check=True)
+                pk = open(pub, "rb").read().hex()
+                return {"sec": sec, "pub": pk, "node": hashlib.sha256(bytes.fromhex(pk)).hexdigest()[:16]}
+            def app_req(k, method, path, body=None, ts=None, nonce=None, tamper=False):
+                raw = json.dumps(body).encode() if body is not None else b""
+                ts, nonce = str(int(ts or time.time())), nonce or os.urandom(12).hex()
+                msg = "\n".join(["UTAPP1", method, path, ts, nonce, hashlib.sha256(raw + (b" " if tamper else b"")).hexdigest()]).encode()
+                mf, sf = os.path.join(r, "appmsg"), os.path.join(r, "appsig")
+                open(mf, "wb").write(msg)
+                subprocess.run([sig, "sign", k["sec"], mf, sf], check=True)
+                rq = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), data=raw if method == "POST" else None, method=method)
+                rq.add_header("Authorization", "UntrashApp node=%s, ts=%s, nonce=%s, sig=%s" % (k["node"], ts, nonce, open(sf, "rb").read().hex()))
+                try:
+                    with urllib.request.urlopen(rq) as resp:
+                        return resp.status, json.loads(resp.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read() or b"{}")
+            st, pj = a.req("/api/mesh/pair", {"user": "alice", "hours": 1})
+            inv = json.loads(base64.urlsafe_b64decode(pj.get("invitation", "") + "=" * (-len(pj.get("invitation", "")) % 4)) or b"{}")
+            mst = json.load(open(r + "/etc/untrash/mesh/mesh.json"))
+            check("app: pairing invitation marked for the app, linked to alice", st == 200 and inv.get("k") == "app"
+                  and any(i.get("app") == "alice" for i in mst["invites"].values()))
+            check("app: pairing needs a known user", a.req("/api/mesh/pair", {"user": "nobody"})[0] == 404 and u.req("/api/mesh/pair", {"user": "alice"})[0] == 403)
+            ka, kb = app_key("app-alice"), app_key("app-admin")
+            for k, nm in ((ka, "alices-phone"), (kb, "admin-phone")):     # as untrash-mesh's join would add them
+                mst["roster"]["members"][k["node"]] = {"pub": k["pub"], "wg": "x", "name": nm, "role": "member", "kind": "app", "added": 1}
+            json.dump(mst, open(r + "/etc/untrash/mesh/mesh.json", "w"))
+            st, mj = a.req("/api/mesh/app-link", {"node": ka["node"], "user": "alice"})
+            check("app: linked to alice (shown in the mesh status)", st == 200 and any(x["node"] == ka["node"] and x["user"] == "alice" for x in mj["members"]))
+            check("app: only app members can be linked", a.req("/api/mesh/app-link", {"node": mj["node"], "user": "alice"})[0] == 400)
+            st, info = app_req(ka, "GET", "/api/app/info")
+            check("app: signed request acts as alice", st == 200 and info["user"] == "alice" and info["api"] == 1 and not info["admin"])
+            check("app: alice's app is no admin", app_req(ka, "GET", "/api/overview")[0] == 403)
+            check("app: app endpoints refuse a browser session", u.req("/api/app/info")[0] == 403)
+            check("app: an unlinked app is refused", app_req(kb, "GET", "/api/app/info")[0] == 401)
+            check("app: a tampered body is refused", app_req(ka, "POST", "/api/app/answer", {"id": "x"}, tamper=True)[0] == 401)
+            check("app: an old request is refused", app_req(ka, "GET", "/api/app/info", ts=time.time() - 600)[0] == 401)
+            n1 = os.urandom(12).hex()
+            check("app: a replayed nonce is refused", app_req(ka, "GET", "/api/app/info", nonce=n1)[0] == 200
+                  and app_req(ka, "GET", "/api/app/info", nonce=n1)[0] == 401)
+            check("app: uploads (streamed bodies) are not for the app in v1", app_req(ka, "POST", "/api/files/upload", {})[0] == 400)
+            # sign-in without password: only once alice chose "password or app"
+            b2 = Client(port)
+            st, lj = b2.req("/api/login/app", {"user": "alice"})
+            check("app login: request made, but alice (password only) does not see it", st == 200 and lj["code"] >= 10
+                  and app_req(ka, "GET", "/api/app/requests")[1]["requests"] == [])
+            check("app login: an unknown user gets the same answer", b2.req("/api/login/app", {"user": "nobody"})[0] == 200)
+            check("app login: sign-in change needs the password", u.req("/api/signin", {"mode": "app", "password": "x"})[0] == 403)
+            check("app login: alice chooses password or app", u.req("/api/signin", {"mode": "app", "password": PW})[1].get("signin") == "app")
+            st, lj = b2.req("/api/login/app", {"user": "alice"})
+            rq = app_req(ka, "GET", "/api/app/requests")[1]["requests"]
+            check("app login: the app sees it with three numbers, one is the browser's", len(rq) == 1 and lj["code"] in rq[0]["choices"]
+                  and len(set(rq[0]["choices"])) == 3 and rq[0]["kind"] == "login")
+            wrong = next(c for c in rq[0]["choices"] if c != lj["code"])
+            check("app login: the wrong number denies it", app_req(ka, "POST", "/api/app/answer", {"id": rq[0]["id"], "approve": True, "code": wrong})[1]["state"] == "denied"
+                  and b2.req("/api/login/app?id=" + lj["id"])[1]["state"] == "denied" and b2.req("/api/me")[0] == 401)
+            st, lj = b2.req("/api/login/app", {"user": "alice"})
+            check("app login: pending until the app answers", b2.req("/api/login/app?id=" + lj["id"])[1]["state"] == "pending")
+            rid = app_req(ka, "GET", "/api/app/requests")[1]["requests"][0]["id"]
+            app_req(ka, "POST", "/api/app/answer", {"id": rid, "approve": True, "code": lj["code"]})
+            check("app login: approved -> the browser is signed in as alice", b2.req("/api/login/app?id=" + lj["id"])[1]["state"] == "approved"
+                  and b2.req("/api/me")[1].get("user") == "alice")
+            check("app login: the approval works once", Client(port).req("/api/login/app?id=" + lj["id"])[1]["state"] == "used")
+            # two factors: password, then the app
+            u.req("/api/signin", {"mode": "both", "password": PW})
+            b3 = Client(port)
+            st, lj = b3.req("/api/login", {"user": "alice", "password": PW})
+            check("2fa: the password alone gives no session", st == 200 and lj.get("second") and b3.req("/api/me")[0] == 401)
+            check("2fa: sign-in without password no longer shown", b3.req("/api/login/app", {"user": "alice"})[0] == 200
+                  and [x["kind"] for x in app_req(ka, "GET", "/api/app/requests")[1]["requests"]] == ["login2"])
+            rid = app_req(ka, "GET", "/api/app/requests")[1]["requests"][0]["id"]
+            app_req(ka, "POST", "/api/app/answer", {"id": rid, "approve": True, "code": lj["code"]})
+            check("2fa: after the app the session is there", b3.req("/api/login/app?id=" + lj["second"])[1]["state"] == "approved"
+                  and b3.req("/api/me")[1].get("user") == "alice")
+            # confirmations: admin with two factors confirms resetting alice's sign-in in the app
+            a.req("/api/mesh/app-link", {"node": kb["node"], "user": "admin"})
+            check("confirm: admin sets two factors", a.req("/api/signin", {"mode": "both", "password": PW})[1].get("signin") == "both")
+            st, cj = a.req("/api/users/signin", {"user": "alice", "mode": "password"})
+            check("confirm: the action waits for the app (428)", st == 428 and cj.get("confirm") and cj["action"] == "Reset the sign-in of a user")
+            rq = app_req(kb, "GET", "/api/app/requests")[1]["requests"]
+            check("confirm: the app sees the action and the user", rq and rq[0]["kind"] == "confirm" and rq[0]["detail"] == "alice")
+            app_req(kb, "POST", "/api/app/answer", {"id": rq[0]["id"], "approve": True, "code": cj["code"]})
+            check("confirm: the browser sees the approval", a.req("/api/confirm?id=" + cj["confirm"])[1]["state"] == "approved")
+            check("confirm: repeated with the confirmation it runs", a.req("/api/users/signin", {"user": "alice", "mode": "password", "confirm": cj["confirm"]})[0] == 200
+                  and next(x for x in a.req("/api/users")[1]["users"] if x["name"] == "alice")["signin"] == "password")
+            check("confirm: a confirmation is used once", a.req("/api/users/signin", {"user": "alice", "mode": "password", "confirm": cj["confirm"]})[0] == 428)
+            check("confirm: it is bound to the user it named", a.req("/api/users/signin", {"user": "bob", "mode": "password", "confirm": cj["confirm"]})[0] == 428)
+            check("confirm: the admin's app itself needs no extra confirmation", app_req(kb, "POST", "/api/users/signin", {"user": "alice", "mode": "password"})[0] == 200)
+            check("confirm: the other app cannot answer admin's requests", app_req(ka, "POST", "/api/app/answer", {"id": rq[0]["id"], "approve": True, "code": cj["code"]})[0] == 404)
+            a.req("/api/mesh/app-link", {"node": kb["node"], "user": ""})
+            check("app: without a linked app the sign-in is the password again", a.req("/api/me")[1]["signin"] == "password"
+                  and a.req("/api/users/signin", {"user": "alice", "mode": "password"})[0] == 200)
             st, mj = a.req("/api/mesh/leave", {})
             check("mesh: left", st == 200 and mj["mesh"] is None)
             # updates: settings, check, the downloaded release, downgrade guard (untrash-update: test-update-host.py)

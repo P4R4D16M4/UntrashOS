@@ -18,6 +18,8 @@
   untrash-mesh mirror-decline ID | mirror-stop ID
   untrash-mesh mirror-up DEV VOLPATH  at mount time (untrash-import-zyxel): the
                                       mirrored device to mount, or {"error"}
+  untrash-mesh invite HOURS USER      an invitation for the UntrashApp, linked to Desk USER
+  untrash-mesh app-link NODE USER     link an app member to a Desk user ("" = unlink)
   untrash-mesh run                    the daemon (untrash-mesh.service)
 
 Co-op mode: a node offers some of its shares to a member, read-only or
@@ -659,7 +661,9 @@ def default_name():
     return n if NAME_RE.match(n) else "untrash"
 
 
-def cmd_invite(hours=24):
+def cmd_invite(hours=24, app_user=None):
+    """An invitation; with APP_USER one for the UntrashApp, linked on this
+    node to that Desk user when the app joins (docs/architecture/app-api.md)."""
     with LOCK:
         st = state()
         nid = identity()[0]
@@ -667,7 +671,7 @@ def cmd_invite(hours=24):
             raise SystemExit("only an admin of a mesh can invite")
         sec, iid = secrets.token_hex(16), secrets.token_hex(4)
         exp = int(time.time() + 3600 * float(hours))
-        st.setdefault("invites", {})[iid] = {"secret": sec, "exp": exp}
+        st.setdefault("invites", {})[iid] = dict({"secret": sec, "exp": exp}, **({"app": app_user} if app_user else {}))
         jsave("mesh.json", st)
         if not E("ZT_MESH_JOIN_HOST"):
             upnp_refresh(True)                  # open the join port before the text leaves this NAS
@@ -676,8 +680,9 @@ def cmd_invite(hours=24):
         hostlist = [e.rsplit(":", 1)[0].strip("[]") for e in rec.get("ep", [])]
         if E("ZT_MESH_JOIN_HOST"):
             hostlist = [E("ZT_MESH_JOIN_HOST")]
-    return {"invitation": b64({"v": PROTO, "i": iid, "s": sec, "m": st["mesh"]["id"], "n": st["mesh"]["name"],
-                               "h": hostlist, "p": JOIN_PORT, "e": exp}), "expires": exp}
+    return {"invitation": b64(dict({"v": PROTO, "i": iid, "s": sec, "m": st["mesh"]["id"], "n": st["mesh"]["name"],
+                                    "h": hostlist, "p": JOIN_PORT, "e": exp}, **({"k": "app"} if app_user else {}))),
+            "expires": exp}
 
 
 def cmd_join(text):
@@ -694,7 +699,8 @@ def cmd_join(text):
             raise SystemExit("already in a mesh: leave it first")
         nid, pub, wg = identity()
         st["name"] = st.get("name") or default_name()
-        req = {"i": inv["i"], "node": nid, "pub": pub, "wg": wg, "name": st["name"], "kind": "nas", "ep": local_endpoints()}
+        req = {"i": inv["i"], "node": nid, "pub": pub, "wg": wg, "name": st["name"], "kind": E("ZT_MESH_KIND", "nas"),
+               "ep": local_endpoints()}          # ZT_MESH_KIND=app: PC test stand-in for the UntrashApp
         req["mac"] = mac(inv["s"], req)
     last, ans, until = None, None, time.time() + float(E("ZT_MESH_JOIN_WAIT", "30"))
     while ans is None:                     # its join port may open a moment after the invitation
@@ -759,12 +765,16 @@ class JoinHandler(http.server.BaseHTTPRequestHandler):
             ros = dict(st["roster"])
             ms = dict(ros["members"])
             ms[req["node"]] = {"pub": req["pub"], "wg": str(req.get("wg", ""))[:64], "name": safe_name(req.get("name")),
-                               "role": "member", "kind": "app" if req.get("kind") == "app" else "nas",
+                               "role": "member", "kind": "app" if req.get("kind") == "app" or inv.get("app") else "nas",
                                "added": int(time.time()), "ep": [str(e)[:80] for e in (req.get("ep") or [])][:8]}
             ros.update(members=ms, seq=ros["seq"] + 1, by=nid)
             ros.pop("sig", None)
             st["roster"] = sign(ros)
             jsave("mesh.json", st)
+            if inv.get("app"):
+                apps = jload("apps.json", {})
+                apps[req["node"]] = {"user": inv["app"], "t": int(time.time())}
+                jsave("apps.json", apps)
             items = list(book().values())
         ans = {"roster": st["roster"], "items": items}
         ans["mac"] = mac(inv["secret"], ans)
@@ -776,6 +786,31 @@ class JoinHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
         log("%s joined" % ms[req["node"]]["name"])
         threading.Thread(target=forward, args=([st["roster"]],), daemon=True).start()
+
+
+def cmd_app_link(node, user):
+    """Link an app member to a Desk user of this node (the Desk checks the
+    user exists); USER "" removes the link."""
+    with LOCK:
+        m = members().get(node)
+        if not m or m.get("kind") != "app":
+            raise SystemExit("not an app in this mesh")
+        apps = jload("apps.json", {})
+        if user:
+            apps[node] = {"user": user, "t": int(time.time())}
+        else:
+            apps.pop(node, None)
+        jsave("apps.json", apps)
+    return status()
+
+
+def apps_prune(st):
+    """Links of apps that are no longer members go."""
+    with LOCK:
+        apps = jload("apps.json", {})
+        keep = {k: v for k, v in apps.items() if (members(st).get(k) or {}).get("kind") == "app"}
+        if keep != apps:
+            jsave("apps.json", keep)
 
 
 def safe_name(n):
@@ -833,6 +868,7 @@ def cmd_leave():
             if o["state"] not in ENDED:
                 o.update(state="stopped", sent=True)   # mounted directly from the next start on
         jsave("mirrors_out.json", outs)
+        jsave("apps.json", {})
     for mp in sorted(h for h in mounted() if h.startswith(PDATA + "/")):
         unmount(mp)
     jsave("volumes.json", {})
@@ -866,14 +902,15 @@ def status():
     out["mirrors"], out["mirror_copies"] = mirrors_status()
     if st.get("mesh"):
         out["address"] = address(st["mesh"]["id"], pub)
-        now = time.time()
+        now, apps = time.time(), jload("apps.json", {})
         for k, m in members(st).items():
             rec, p = bk.get(k) or {}, peers.get(m["wg"]) or {}
             out["members"].append({"node": k, "name": rec.get("name") or m.get("name"), "role": m.get("role"), "kind": m.get("kind"),
                                    "address": address(st["mesh"]["id"], m["pub"]), "self": k == nid,
                                    "endpoints": rec.get("ep", []), "seq": rec.get("seq"), "seen": rec.get("time"),
                                    "handshake": p.get("handshake") or None, "endpoint": p.get("endpoint"),
-                                   "online": k == nid or bool(p.get("handshake") and now - p["handshake"] < 180)})
+                                   "online": k == nid or bool(p.get("handshake") and now - p["handshake"] < 180),
+                                   "user": (apps.get(k) or {}).get("user") if m.get("kind") == "app" else None})
     return out
 
 
@@ -1601,6 +1638,7 @@ def cmd_run():
             send_offers()
             partner_volumes(st)
             mirrors_tick(st)
+            apps_prune(st)
             if not sync_srv:
                 host = "127.0.0.1" if E("ZT_MESH_ADDRMAP") else address(st["mesh"]["id"], pub)
                 try:
@@ -1659,8 +1697,10 @@ def main():
             out = status()
         elif a[:1] == ["create"] and len(a) == 2:
             out = cmd_create(a[1])
-        elif a[:1] == ["invite"] and len(a) <= 2:
-            out = cmd_invite(a[1] if len(a) == 2 else 24)
+        elif a[:1] == ["invite"] and len(a) <= 3:
+            out = cmd_invite(a[1] if len(a) >= 2 else 24, a[2] if len(a) == 3 else None)
+        elif a[:1] == ["app-link"] and len(a) == 3:
+            out = cmd_app_link(a[1], a[2])
         elif a[:1] == ["join"] and len(a) == 2:
             out = cmd_join(a[1])
         elif a[:1] == ["remove"] and len(a) == 2:

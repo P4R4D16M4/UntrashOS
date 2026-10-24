@@ -33,8 +33,41 @@ async function apiRaw(path, body, raw) {
   let j = {};
   try { j = await r.json(); } catch (e) { }
   if (r.status === 401 && path !== 'login') { boot(); throw new Error(j.error || 'Please sign in'); }
+  // users with sign-in "password and app" confirm some actions in the UntrashApp
+  if (r.status === 428 && j.confirm && !raw) {
+    await appWait({ title: j.action, code: j.code, poll: () => apiRaw('confirm?id=' + encodeURIComponent(j.confirm)) });
+    return apiRaw(path, Object.assign({}, body, { confirm: j.confirm }));
+  }
   if (!r.ok) throw new Error(j.error || ('Error ' + r.status));
   return j;
+}
+/* waits until the UntrashApp answers a request: shows the number to choose
+   in the app; resolves on approval, throws on denial or timeout */
+function appWait({ title, code, poll, into }) {
+  return new Promise((resolve, reject) => {
+    const html = `<div class="ut-appwait"><img src="${ICON('mesh')}" alt=""><p>${esc(UTI18N.tr('Open the UntrashApp and choose this number:'))}</p>
+      <div class="ut-appwait__code" translate="no">${esc(String(code))}</div><p class="ut-faint" id="awt"></p></div>`;
+    let box, s;
+    if (into) { box = into; box.innerHTML = html + '<button class="ut-btn ut-btn--ghost" data-x type="button">Cancel</button>'; }
+    else {
+      s = document.createElement('div'); s.className = 'ut-scrim';
+      s.innerHTML = `<div class="ut-dialog" role="dialog" aria-modal="true"><div class="ut-dialog__head"><h2>${esc(UTI18N.tr(title || 'Confirm in the UntrashApp'))}</h2></div>
+        <div class="ut-dialog__body">${html}</div><div class="ut-dialog__foot"><button class="ut-btn" data-x>Cancel</button></div></div>`;
+      document.body.append(s); box = s;
+    }
+    const t0 = Date.now(), stop = (fn, x) => { clearInterval(iv); if (s) s.remove(); fn(x); };
+    box.querySelector('[data-x]').onclick = () => stop(reject, new Error(UTI18N.tr('Cancelled.')));
+    const iv = setInterval(async () => {
+      const left = Math.max(0, 120 - Math.round((Date.now() - t0) / 1000)), t = box.querySelector('#awt');
+      if (t) t.textContent = UTI18N.tr('%s s left').replace('%s', left);
+      try {
+        const r = await poll();
+        if (r.state === 'approved') stop(resolve, r);
+        else if (r.state === 'denied') stop(reject, new Error(UTI18N.tr('Declined in the UntrashApp.')));
+        else if (r.state !== 'pending') stop(reject, new Error(UTI18N.tr('No answer from the UntrashApp.')));
+      } catch (e) { stop(reject, e); }
+    }, 1500);
+  });
 }
 function toast(title, text = '', kind = '') {
   const t = document.createElement('div');
@@ -92,13 +125,29 @@ function loginScreen(st) {
     <div class="ut-field"><label for="p">Password</label><input class="ut-input" id="p" type="password" autocomplete="current-password"></div>
     <div id="lerr" class="ut-callout ut-callout--danger" hidden></div>
     <button class="ut-btn ut-btn--primary ut-btn--lg" style="width:100%">Sign in</button>
+    <button class="ut-btn ut-btn--ghost" id="lapp" type="button" style="width:100%;margin-top:8px">Sign in with the UntrashApp</button>
+    <div id="lwait"></div>
     <div class="ut-login__foot">Sign in with your existing password (as on the Zyxel firmware)<br><a href="/manual/" target="_blank" rel="noopener">User guide</a></div></form></main>`;
   $('#p').focus();
   $('#lf').onsubmit = async e => {
     e.preventDefault();
-    try { await api('login', { user: $('#u').value.trim(), password: $('#p').value }); boot(); }
+    try {
+      const r = await api('login', { user: $('#u').value.trim(), password: $('#p').value });
+      if (r.second) await loginWait(r.second, r.code);       // second factor
+      boot();
+    } catch (err) { $('#lerr').hidden = false; $('#lerr').textContent = err.message; }
+  };
+  $('#lapp').onclick = async () => {
+    $('#lerr').hidden = true;
+    try { const r = await api('login/app', { user: $('#u').value.trim() }); await loginWait(r.id, r.code); boot(); }
     catch (err) { $('#lerr').hidden = false; $('#lerr').textContent = err.message; }
   };
+}
+async function loginWait(id, code) {
+  const w = $('#lwait'), hide = $$('#lf > .ut-field, #lf > .ut-btn');
+  hide.forEach(x => x.hidden = true);
+  try { await appWait({ code, into: w, poll: () => apiRaw('login/app?id=' + encodeURIComponent(id)) }); }
+  finally { w.innerHTML = ''; hide.forEach(x => x.hidden = false); }
 }
 function setupScreen(st) {
   $('#app').innerHTML = `<main class="ut-login"><form class="ut-login__card" id="sf">
@@ -206,10 +255,10 @@ function desk(st) {
   $('#user-btn').onclick = () => {
     const d = dialog({ title: 'Account', body: `<p>Signed in as <b translate="no">${esc(ME.user)}</b>.</p>
       <div class="ut-field"><label for="ulang">Language of this browser</label>${langSel('ulang', UTI18N.own, true)}</div>
-      <div class="ut-section-title">Appearance</div>${appearanceFields()}`, ok: 'Sign out',
+      ${signinFields()}<div class="ut-section-title">Appearance</div>${appearanceFields()}`, ok: 'Sign out',
       onOk: async () => { await api('logout', {}); location.reload(); } });
     $('#ulang', d).onchange = e => UTI18N.set(e.target.value);
-    appearanceBind(d);
+    appearanceBind(d); signinBind(d);
   };
   const tick = () => $('#clock') && ($('#clock').textContent = new Date().toLocaleString(UTI18N.locale, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }));
   tick(); setInterval(tick, 15000);
@@ -657,7 +706,9 @@ VIEWS.users = async (b, sel) => {
     <button class="ut-btn ut-btn--primary" id="mkuser">Create</button></div>`;
   if (sel === '_ng') main = `<h2>New group</h2><div class="form">${field('gn', 'Name')}${field('gd', 'Description')}<button class="ut-btn ut-btn--primary" id="mkgrp">Create</button></div>`;
   if (u) main = `<h2>${esc(u.name)}</h2><p class="ut-faint">UID ${u.uid}${u.admin ? ' · Administrator' : ''}${u.description ? ' · ' + esc(u.description) : ''}</p>
-    <p>Groups: ${u.groups.map(esc).join(', ') || '–'}</p><div class="form">${field('np1', 'New password', '', 'type=password autocomplete=new-password')}${field('np2', 'Repeat', '', 'type=password autocomplete=new-password')}
+    <p>Groups: ${u.groups.map(esc).join(', ') || '–'}</p>
+    <p>${esc(UTI18N.tr('Sign-in'))}: ${esc(UTI18N.tr({ password: 'password only', app: 'password or app', both: 'password and app' }[u.signin] || 'password only'))}${(u.apps || []).length ? ` · ${esc(UTI18N.tr('app'))} <span translate="no">${u.apps.map(a => esc(a.name)).join(', ')}</span>` : ''}
+      ${u.signin !== 'password' ? ' <button class="ut-btn ut-btn--sm ut-btn--ghost" id="sireset">Reset to password</button>' : ''}</p><div class="form">${field('np1', 'New password', '', 'type=password autocomplete=new-password')}${field('np2', 'Repeat', '', 'type=password autocomplete=new-password')}
     <div class="row"><button class="ut-btn ut-btn--primary" id="setpw">Set password</button><span class="ut-spacer"></span>${u.builtin ? '' : '<button class="ut-btn ut-btn--danger" id="deluser">Delete user</button>'}</div></div>`;
   if (g) main = `<h2>${esc(g.name)}</h2><p class="ut-faint">GID ${g.gid}${g.description ? ' · ' + esc(g.description) : ''}</p>
     ${g.builtin ? '<p>All users belong to everyone.</p>' : `<div class="ut-field"><label>Members</label><div class="row">${us.users.filter(x => x.name !== 'pc-guest').map(x => `<label><input type="checkbox" data-mem="${esc(x.name)}"${g.members.includes(x.name) ? ' checked' : ''}> ${esc(x.name)}</label>`).join(' ')}</div></div>
@@ -684,6 +735,9 @@ VIEWS.users = async (b, sel) => {
   });
   on('deluser', () => dialog({ kind: 'danger', title: 'Delete user?', body: `<p><b>${esc(u.name)}</b> loses all rights. Files are kept.</p>`, ok: 'Delete', okCls: 'ut-btn--danger',
     onOk: () => api('users/delete', { name: u.name }).then(() => render('users')) }));
+  on('sireset', () => dialog({ kind: 'danger', title: 'Reset the sign-in?', ok: 'Reset', okCls: 'ut-btn--danger',
+    body: `<p><b translate="no">${esc(u.name)}</b> signs in with the password only again, for example after losing the phone.</p>`,
+    onOk: () => api('users/signin', { user: u.name, mode: 'password' }).then(() => render('users', 'u:' + u.name)) }));
   on('setmem', () => save('groups/members', { name: g.name, members: $$('[data-mem]', b).filter(x => x.checked).map(x => x.dataset.mem) }, 'users', 'g:' + g.name));
   on('delgrp', () => dialog({ kind: 'danger', title: 'Delete group?', body: `<p>The group <b>${esc(g.name)}</b> and their share rights are removed.</p>`, ok: 'Delete', okCls: 'ut-btn--danger',
     onOk: () => api('groups/delete', { name: g.name }).then(() => render('users')) }));
@@ -1117,12 +1171,30 @@ VIEWS.logs = async (b, unit = '') => {
 };
 
 /* account ---------------------------------------------------------------- */
+/* the user's own sign-in (password / password or app / password and app) */
+function signinFields() {
+  if (!(ME.apps || []).length) return `<div class="ut-section-title">Sign-in</div><p class="ut-faint">With the UntrashApp you can sign in by confirming on your phone, or use it as a second factor. An administrator pairs the app in UntrashMesh.</p>`;
+  return `<div class="ut-section-title">Sign-in</div><p class="ut-faint">${esc(UTI18N.tr('Paired app:'))} <b translate="no">${ME.apps.map(a => esc(a.name)).join(', ')}</b></p>
+    <div class="ut-field"><label for="sim">Sign in with</label><select class="ut-select" id="sim">${[['password', 'Password only'], ['app', 'Password or the UntrashApp'], ['both', 'Password and the UntrashApp (two factors)']]
+      .map(([k, n]) => `<option value="${k}"${ME.signin === k ? ' selected' : ''}>${esc(UTI18N.tr(n))}</option>`).join('')}</select></div>
+    ${field('sip', 'Current password', '', 'type=password autocomplete=current-password')}
+    <p class="ut-faint">With two factors, installing updates, deleting users and similar actions also need a confirmation in the app. Lost phone: an administrator resets the sign-in under Users; for admin, the RESET button on the NAS does.</p>
+    <button class="ut-btn" id="sis" type="button">Save sign-in</button>`;
+}
+function signinBind(root) {
+  const b = $('#sis', root);
+  if (b) b.onclick = async () => {
+    try { const r = await api('signin', { mode: $('#sim', root).value, password: $('#sip', root).value }); ME.signin = r.signin; $('#sip', root).value = ''; toast('Saved'); }
+    catch (e) { fail(e); }
+  };
+}
+
 VIEWS.account = async b => {
   b.innerHTML = `<div class="ut-window__main"><div class="form"><p>Signed in as <b>${esc(ME.user)}</b>.</p>
     ${field('op', 'Current password', '', 'type=password autocomplete=current-password')}${field('np1', 'New password', '', 'type=password autocomplete=new-password')}${field('np2', 'Repeat', '', 'type=password autocomplete=new-password')}
     <button class="ut-btn ut-btn--primary" id="pw">Change password</button> <button class="ut-btn" id="lo">Sign out</button>
-    <div class="ut-section-title">Appearance</div>${appearanceFields()}</div></div>`;
-  appearanceBind(b);
+    ${signinFields()}<div class="ut-section-title">Appearance</div>${appearanceFields()}</div></div>`;
+  appearanceBind(b); signinBind(b);
   $('#pw', b).onclick = () => {
     if ($('#np1', b).value !== $('#np2', b).value) return fail(new Error('The passwords do not match.'));
     save('password', { old: $('#op', b).value, password: $('#np1', b).value });
@@ -1258,24 +1330,26 @@ VIEWS.mesh = async b => {
       <div class="ut-card"><h3>Start a mesh</h3>${field('mnew', 'Name of the mesh', 'home')}<button class="ut-btn ut-btn--primary" id="mcreate">Create the mesh</button></div>
       <div class="ut-card"><h3>Join a mesh</h3><p class="ut-faint">Paste the invitation an admin of the mesh created on their device.</p>
         <textarea class="ut-textarea" id="minv" rows="3" placeholder="Invitation" translate="no"></textarea>
-        <button class="ut-btn ut-btn--primary" id="mjoin" style="margin-top:8px">Join</button></div></div>`;
+        <button class="ut-btn ut-btn--primary" id="mjoin" style="margin-top:8px">Join</button></div>
+      <p class="ut-faint">The UntrashApp is paired over UntrashMesh as well: create a mesh first, then choose Pair the UntrashApp.</p></div>`;
     $('#mcreate', b).onclick = () => save('mesh/create', { name: $('#mnew', b).value }, 'mesh');
     $('#mjoin', b).onclick = () => save('mesh/join', { invitation: $('#minv', b).value }, 'mesh');
   } else {
     const rows = m.members.map(x => `<tr><td><b translate="no">${esc(x.name)}</b>${x.self ? ' <span class="ut-pill ut-pill--plain">' + esc(UTI18N.tr('this NAS')) + '</span>' : ''}
         <div class="ut-faint mono" translate="no">${esc(x.name)}.mesh · ${esc(x.address)}</div></td>
-      <td>${x.role === 'admin' ? 'Admin' : 'Member'} · ${x.kind === 'app' ? 'App' : 'NAS'}</td>
+      <td>${x.role === 'admin' ? 'Admin' : 'Member'} · ${x.kind === 'app' ? 'App' : 'NAS'}${x.kind === 'app' ? `<div class="ut-faint">${x.user ? esc(UTI18N.tr('signs in as %s').replace('%s', x.user)) : esc(UTI18N.tr('not linked to a user'))}</div>` : ''}</td>
       <td><span class="ut-pill ${x.online ? 'ut-pill--ok' : ''}">${x.online ? 'online' : 'not reachable'}</span>
         <div class="ut-faint" translate="no">${esc(x.endpoint || (x.endpoints || [])[0] || '')}</div></td>
       <td class="ut-faint">${x.self ? '' : ago(x.handshake || x.seen)}</td>
-      <td class="ut-rowbtns">${!x.self ? `<button class="ut-btn ut-btn--sm" data-mshare="${esc(x.node)}" data-mname="${esc(x.name)}">Share…</button>` : ''}${m.admin && !x.self ? ` <button class="ut-btn ut-btn--sm ut-btn--ghost" data-mrm="${esc(x.node)}" data-mname="${esc(x.name)}">Remove</button>` : ''}
+      <td class="ut-rowbtns">${x.kind === 'app' ? `<button class="ut-btn ut-btn--sm" data-mlink="${esc(x.node)}" data-mname="${esc(x.name)}" data-muser="${esc(x.user || '')}">Link…</button>`
+        : !x.self ? `<button class="ut-btn ut-btn--sm" data-mshare="${esc(x.node)}" data-mname="${esc(x.name)}">Share…</button>` : ''}${m.admin && !x.self ? ` <button class="ut-btn ut-btn--sm ut-btn--ghost" data-mrm="${esc(x.node)}" data-mname="${esc(x.name)}">Remove</button>` : ''}
         ${(m.offers || {})[x.node] && Object.keys(m.offers[x.node]).length ? `<div class="ut-faint" translate="no">${esc(Object.entries(m.offers[x.node]).map(([k, v]) => k + (v === 'ro' ? ' (r)' : ' (rw)')).join(', '))}</div>` : ''}</td></tr>`).join('');
     const pvs = (m.partner_volumes || []).map(v => `<tr><td><b translate="no">${esc(v.share)}</b> <span class="ut-faint">@ <span translate="no">${esc(v.partner)}</span></span><div class="ut-faint mono" translate="no">${esc(v.path)}</div></td>
       <td>${v.mode === 'ro' ? esc(UTI18N.tr('read only')) : esc(UTI18N.tr('read/write'))}</td>
       <td><span class="ut-pill ${v.mounted ? 'ut-pill--ok' : ''}">${v.mounted ? esc(UTI18N.tr('mounted')) : esc(UTI18N.tr('partner not reachable'))}</span></td>
       <td class="ut-faint">${v.mounted ? gb(v.free) + ' ' + esc(UTI18N.tr('free')) : ''}</td></tr>`).join('');
     b.innerHTML = `<div class="ut-window__main ut-mesh"><div class="row"><img src="${ICON('mesh')}" alt="" style="width:40px;height:40px"><h2 style="margin:0">UntrashMesh <span translate="no">${esc(m.mesh.name)}</span></h2>
-        <span class="ut-spacer"></span>${m.admin ? '<button class="ut-btn ut-btn--primary" id="minvite">Invite a device</button>' : ''}</div>
+        <span class="ut-spacer"></span><button class="ut-btn" id="mpair">Pair the UntrashApp</button>${m.admin ? ' <button class="ut-btn ut-btn--primary" id="minvite">Invite a device</button>' : ''}</div>
       ${me}
       <div class="ut-section-title">Members</div>
       <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Role</th><th>State</th><th>Last contact</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
@@ -1296,6 +1370,23 @@ VIEWS.mesh = async b => {
         $('#mcopy', d).onclick = () => { $('#minvt', d).select(); navigator.clipboard ? navigator.clipboard.writeText(r.invitation).then(() => toast('Copied', '')) : document.execCommand('copy'); };
       } catch (e) { fail(e); }
     };
+    const userSel = async (id, cur, none) => `<select class="ut-select" id="${id}">${none ? `<option value="">${esc(UTI18N.tr('not linked'))}</option>` : ''}${(await api('users')).users
+      .filter(u => u.name !== 'pc-guest').map(u => `<option value="${esc(u.name)}"${u.name === cur ? ' selected' : ''} translate="no">${esc(u.name)}</option>`).join('')}</select>`;
+    $('#mpair', b).onclick = async () => {
+      if (!m.admin) return toast('Only an admin of the mesh can pair', 'Pair the app on the NAS that created the mesh, then link it to a user here.');
+      dialog({ title: 'Pair the UntrashApp', ok: 'Show the code',
+        body: `<p>The app joins UntrashMesh and signs in on this NAS as the user you choose. It can confirm sign-ins and actions of that user.</p>
+          <div class="ut-field"><label for="mpu">Signs in as</label>${await userSel('mpu', ME.user)}</div>`,
+        onOk: async d => {
+          const r = await api('mesh/pair', { user: $('#mpu', d).value, hours: 1 });
+          dialog({ title: 'Pair the UntrashApp', ok: 'Done', body: `<p>In the UntrashApp choose <b>Pair with a NAS</b> and scan this code. It works once, until ${ago(r.expires)}.</p>
+            <div class="ut-qr">${UTQR.svg(r.invitation, 'M')}</div>
+            <details><summary>Show as text</summary><textarea class="ut-textarea mono" rows="4" readonly translate="no">${esc(r.invitation)}</textarea></details>`, onOk: () => render('mesh') });
+        } });
+    };
+    $$('[data-mlink]', b).forEach(x => x.onclick = async () => dialog({ title: UTI18N.tr('Link %s').replace('%s', x.dataset.mname), ok: 'Save',
+      body: `<p>The Desk user this app signs in as on this NAS. Without a link the app is only a mesh member here.</p><div class="ut-field"><label for="mlu">Signs in as</label>${await userSel('mlu', x.dataset.muser, true)}</div>`,
+      onOk: d => save('mesh/app-link', { node: x.dataset.mlink, user: $('#mlu', d).value }, 'mesh') }));
     $$('[data-mshare]', b).forEach(x => x.onclick = async () => {
       const sh = (await api('shares')).shares.filter(s => s.enabled && s.present && !s.path.startsWith('/p-data/'));
       const cur = (m.offers || {})[x.dataset.mshare] || {};
