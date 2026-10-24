@@ -416,8 +416,23 @@ VIEWS.overview = async b => {
 
 /* files ---------------------------------------------------------------- */
 const FS = { share: null, path: '' };
+/* opens a document in the office server's editor (WOPI) in a new tab: the
+   token goes as a form POST, never in the address bar */
+async function officeOpen(share, path) {
+  const w = window.open('', '_blank');
+  try {
+    const r = await api('office/open', { share, path, lang: UTI18N.lang });
+    const f = w.document.createElement('form');
+    f.method = 'POST'; f.action = r.url;
+    for (const [k, v] of [['access_token', r.access_token], ['access_token_ttl', r.access_token_ttl]]) {
+      const i = w.document.createElement('input'); i.type = 'hidden'; i.name = k; i.value = v; f.append(i);
+    }
+    w.document.body.append(f); f.submit();
+  } catch (e) { if (w) w.close(); fail(e); }
+}
 VIEWS.files = async b => {
-  const sh = await api('shares');
+  const [sh, office] = await Promise.all([api('shares'), api('office').catch(() => ({ exts: [] }))]);
+  const isDoc = n => (office.exts || []).includes((n.split('.').pop() || '').toLowerCase()) && n.includes('.');
   const all = (sh.shares || []).filter(s => s.enabled !== false);
   // shares whose folder is missing (stock volume not present) are listed but not opened
   const list = all.filter(s => s.present !== false), gone = all.filter(s => s.present === false);
@@ -439,7 +454,7 @@ VIEWS.files = async b => {
       <button class="ut-btn ut-btn--sm ut-btn--ghost" id="exps">Exports</button><button class="ut-btn ut-btn--sm ut-btn--ghost" id="lnks">Shared links</button><button class="ut-btn ut-btn--sm" id="mk">New folder</button><label class="ut-btn ut-btn--sm ut-btn--primary">Upload<input type="file" id="up" multiple hidden></label></div>
       <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr></thead><tbody>
       ${r.entries.map(e => `<tr class="fileline" data-name="${esc(e.name)}" data-dir="${e.dir ? 1 : ''}" data-size="${e.size || 0}"><td translate="no">${e.dir ? '📁 ' : ''}${esc(e.name)}</td><td class="num">${e.dir ? '' : size(e.size)}</td>
-        <td>${new Date(e.mtime * 1000).toLocaleString(UTI18N.locale)}</td><td class="ut-rowbtns"><button class="ut-btn ut-btn--ghost ut-btn--sm" data-exp>Export</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-lnk>Share…</button>${e.dir && ME.admin ? '<button class="ut-btn ut-btn--ghost ut-btn--sm" data-mkshare>As share</button>' : ''}<button class="ut-btn ut-btn--ghost ut-btn--sm" data-ren>Rename</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-del>Delete</button></td></tr>`).join('')}
+        <td>${new Date(e.mtime * 1000).toLocaleString(UTI18N.locale)}</td><td class="ut-rowbtns">${!e.dir && isDoc(e.name) ? '<button class="ut-btn ut-btn--sm" data-office>Open in Office</button>' : ''}<button class="ut-btn ut-btn--ghost ut-btn--sm" data-exp>Export</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-lnk>Share…</button>${e.dir && ME.admin ? '<button class="ut-btn ut-btn--ghost ut-btn--sm" data-mkshare>As share</button>' : ''}<button class="ut-btn ut-btn--ghost ut-btn--sm" data-ren>Rename</button><button class="ut-btn ut-btn--ghost ut-btn--sm" data-del>Delete</button></td></tr>`).join('')}
       </tbody></table></div>${r.entries.length ? '' : '<div class="empty">Empty</div>'}`;
   }
   b.innerHTML = side + `<div class="ut-window__main">${main}</div>`;
@@ -451,6 +466,7 @@ VIEWS.files = async b => {
   const rel = n => (FS.path ? FS.path + '/' : '') + n;
   $$('.fileline', b).forEach(tr => {
     tr.onclick = e => {
+      if (e.target.closest('[data-office]')) return officeOpen(FS.share, rel(tr.dataset.name));
       if (e.target.closest('[data-exp]')) return exportDialog(FS.share, rel(tr.dataset.name), tr.dataset.name, !!tr.dataset.dir);
       if (e.target.closest('[data-lnk]')) return linkDialog(FS.share, rel(tr.dataset.name), tr.dataset.name);
       if (e.target.closest('[data-mkshare]')) return shareFromFolder(FS.share, rel(tr.dataset.name), tr.dataset.name);
@@ -788,7 +804,7 @@ function powerRow(e, i) { return `<tr data-ps="${i}"><td><select class="ut-selec
 VIEWS.settings = async (b, sel = 'services') => {
   const s = await api('settings');
   const side = sidebar('settings', [['#', 'System'], ['language', 'Language'], ['services', 'Services'], ['time', 'Time'], ['power', 'Power'], ['recycle', 'Recycle bin'],
-    ['notify', 'Notification'], ['syslog', 'Syslog'], ['dyndns', 'DynDNS'], ['printers', 'Printers'], ['copybtn', 'COPY button'], ['cert', 'Certificate / HTTPS'], ['#', 'Firmware'], ['stock', 'Back to stock']], sel);
+    ['notify', 'Notification'], ['syslog', 'Syslog'], ['dyndns', 'DynDNS'], ['printers', 'Printers'], ['copybtn', 'COPY button'], ['cert', 'Certificate / HTTPS'], ['office', 'Office'], ['#', 'Firmware'], ['stock', 'Back to stock']], sel);
   let main = '';
   if (sel === 'language') {
     main = `<h2>Language</h2><div class="form"><div class="ut-field"><label for="slang">System language</label>${langSel('slang', s.language || 'en')}</div>
@@ -859,6 +875,18 @@ VIEWS.settings = async (b, sel = 'services') => {
       ${pr.printers.length ? `<div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Model</th><th>Status</th><th>Jobs</th><th></th></tr></thead><tbody>
       ${pr.printers.map(x => `<tr><td>${esc(x.name)}</td><td>${esc(x.model)}</td><td>${esc(x.status)}</td><td class="num">${x.jobs}</td><td><button class="ut-btn ut-btn--sm" data-cancel="${esc(x.name)}">Delete jobs</button></td></tr>`).join('')}</tbody></table></div>` : '<p>No printer known.</p>'}
       <button class="ut-btn ut-btn--primary" id="prsave">Save</button></div>`;
+  } else if (sel === 'office') {
+    const o = await api('office');
+    main = `<h2>Office</h2><div class="form">
+      <p>Documents stay on the NAS; an office server elsewhere edits them in the browser (Collabora Online, Nextcloud Office, ONLYOFFICE). It needs more memory than this NAS has, so it runs on another computer, a server or at a member of your UntrashMesh. Files then shows <b>Open in Office</b> for the document types it supports.</p>
+      ${field('ofs', 'Office server', o.server, 'placeholder="https://office.example.org:9980"')}
+      ${field('ofw', 'Address of this NAS, as the office server reaches it', o.wopi_base, `placeholder="http://${esc(location.hostname)}"`)}
+      ${sw('ofi', o.insecure, 'Accept a self-signed certificate of the office server')}
+      <p class="ut-faint">The office server must be allowed to use this NAS as storage (Collabora: <span class="mono">aliasgroup</span>/<span class="mono">storage.wopi.host</span> in coolwsd.xml). Both fields empty: the office bridge is off.</p>
+      ${o.error ? `<div class="ut-callout ut-callout--danger"><div>${esc(o.error)}</div></div>` : o.enabled ? `<p class="ut-faint">${esc(UTI18N.tr('Supported types:'))} <span class="mono" translate="no">${esc(o.exts.join(' '))}</span></p>` : ''}
+      <div class="row"><button class="ut-btn ut-btn--primary" id="ofsave">Save and check</button></div>
+      <div class="ut-section-title">Nextcloud without the office bridge</div>
+      <p class="ut-faint">A Nextcloud can also use the NAS shares directly: in Nextcloud, External storage → WebDAV with <span class="mono" translate="no">http://${esc(location.hostname)}:5002/webdav/&lt;share&gt;</span> (WebDAV on under Services), or SMB. Nextcloud Office then edits the files on the NAS.</p></div>`;
   } else if (sel === 'cert') {
     const ci = await api('cert'), h = s.services.https;
     main = `<h2>Certificate and HTTPS</h2><div class="form">
@@ -905,6 +933,7 @@ VIEWS.settings = async (b, sel = 'services') => {
   b.innerHTML = side + `<div class="ut-window__main">${main}</div>`;
   navBind(b, 'settings');
   const on = (id, fn) => { const x = $('#' + id, b); if (x) x.onclick = fn; };
+  on('ofsave', () => save('office/settings', { server: $('#ofs', b).value.trim(), wopi_base: $('#ofw', b).value.trim(), insecure: $('#ofi', b).checked }, 'settings', 'office'));
   on('lsave', async () => {
     try {
       await api('settings', { language: $('#slang', b).value });

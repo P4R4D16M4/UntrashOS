@@ -2944,6 +2944,249 @@ def signin_reset(req):
     return {}
 
 
+# ------------------------------------------------- office bridge: WOPI host (docs/architecture/office.md)
+#
+# An office server elsewhere (Collabora Online / Nextcloud Office, ONLYOFFICE)
+# edits documents that stay on the NAS: the Desk asks it how to open a file
+# type (discovery), the browser opens the editor with a short-lived token,
+# and the editor fetches and saves the file here under /wopi with that token.
+# Share rights are checked on every request, as for the Desk's own Files.
+
+OFFICE_CONF = R + "/etc/untrash/office.json"
+WOPI_KEY = R + "/etc/untrash/wopi.key"
+WOPI_TTL = 10 * 3600                      # a token lives as long as a long working day
+WOPI_LOCK_S = 30 * 60                     # WOPI: a lock expires after 30 minutes
+WOPI_LOCKS = {}                           # file id -> (lock string, expiry)
+WOPI_MAX = 512 << 20                      # largest document saved through WOPI
+DISCOVERY = {"t": 0, "url": None, "actions": {}}
+
+
+def office_load():
+    try:
+        c = json.load(open(OFFICE_CONF))
+    except (OSError, ValueError):
+        c = {}
+    return {"server": c.get("server", ""), "wopi_base": c.get("wopi_base", ""), "insecure": bool(c.get("insecure"))}
+
+
+def office_save(req):
+    """Admin: the office server's address and the address under which that
+    server reaches this NAS (WOPISrc); both empty = office bridge off."""
+    srv, base = str(req.get("server") or "").strip().rstrip("/"), str(req.get("wopi_base") or "").strip().rstrip("/")
+    for v, what in ((srv, "Office server"), (base, "Address of this NAS")):
+        if v and not re.fullmatch(r"https?://[A-Za-z0-9.\-\[\]:]+(/[A-Za-z0-9._~/-]*)?", v):
+            raise Fail("%s: an address like https://office.example.org:9980" % what)
+    if bool(srv) != bool(base):
+        raise Fail("Enter both addresses (or neither to switch the office bridge off).")
+    os.makedirs(os.path.dirname(OFFICE_CONF), exist_ok=True)
+    with open(OFFICE_CONF, "w") as f:
+        json.dump({"server": srv, "wopi_base": base, "insecure": bool(req.get("insecure"))}, f)
+    DISCOVERY.update(t=0, url=None, actions={})
+    return office_state(check=bool(srv))
+
+
+def discovery(force=False):
+    """{extension: (action, urlsrc)} from the office server's WOPI discovery
+    (cached for an hour); "edit" wins over "view"."""
+    c = office_load()
+    if not c["server"]:
+        return {}
+    if not force and DISCOVERY["url"] == c["server"] and time.time() - DISCOVERY["t"] < 3600:
+        return DISCOVERY["actions"]
+    import ssl
+    import xml.etree.ElementTree as ET
+    ctx = ssl.create_default_context()
+    if c["insecure"]:
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    try:
+        data = urllib.request.urlopen(c["server"] + "/hosting/discovery", timeout=10, context=ctx).read(4 << 20)
+        root = ET.fromstring(data)
+    except (OSError, urllib.error.URLError, ET.ParseError, ValueError) as e:
+        raise Fail("The office server does not answer (%s)." % (getattr(e, "reason", None) or e), 502)
+    acts = {}
+    for a in root.iter("action"):
+        ext, name, src = (a.get("ext") or "").lower(), a.get("name"), a.get("urlsrc") or ""
+        if ext and name in ("edit", "view") and src.startswith(("http://", "https://")):
+            if ext not in acts or (name == "edit" and acts[ext][0] != "edit"):
+                acts[ext] = (name, re.sub(r"<[^>]*>", "", src))      # placeholders like <ui=UI_LLCC&> stay out
+    DISCOVERY.update(t=time.time(), url=c["server"], actions=acts)
+    return acts
+
+
+def office_state(check=False):
+    c = office_load()
+    out = dict(c, enabled=bool(c["server"]), exts=[])
+    if c["server"] and check:
+        out["exts"] = sorted(discovery(force=True))
+    elif c["server"]:
+        try:
+            out["exts"] = sorted(discovery())
+        except Fail as e:
+            out["error"] = str(e)
+    return out
+
+
+def wopi_key():
+    try:
+        k = open(WOPI_KEY, "rb").read()
+        if len(k) == 32:
+            return k
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(WOPI_KEY), exist_ok=True)
+    k = os.urandom(32)
+    with open(os.open(WOPI_KEY, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+        f.write(k)
+    return k
+
+
+def wopi_id(share, path):
+    """Stable per file, so two people editing the same file share a session."""
+    return hashlib.sha256(("%s\0%s" % (share, path.strip("/"))).encode()).hexdigest()[:32]
+
+
+def wopi_token(user, share, path, exp):
+    body = base64.urlsafe_b64encode(json.dumps({"u": user, "s": share, "p": path.strip("/"), "e": exp},
+                                               separators=(",", ":")).encode()).decode().rstrip("=")
+    return body + "." + hmac.new(wopi_key(), body.encode(), hashlib.sha256).hexdigest()
+
+
+def wopi_check(fid, token, write=False):
+    """(user, share, path, full path) for a valid token of this file id."""
+    try:
+        body, mac = token.split(".", 1)
+        if not hmac.compare_digest(mac, hmac.new(wopi_key(), body.encode(), hashlib.sha256).hexdigest()):
+            raise ValueError
+        t = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except (ValueError, TypeError):
+        raise Fail("Invalid access token.", 401)
+    if t["e"] < time.time() or wopi_id(t["s"], t["p"]) != fid:
+        raise Fail("Invalid access token.", 401)
+    _b, full = resolve(t["u"], t["s"], t["p"], write=write)     # the rights of now, not of the time of opening
+    if not os.path.isfile(full):
+        raise Fail("File not found.", 404)
+    return t["u"], t["s"], t["p"], full
+
+
+def office_open(user, req):
+    """Browser: the editor URL and token for a file of a share."""
+    share, path = str(req.get("share") or ""), str(req.get("path") or "").strip("/")
+    _b, full = resolve(user, share, path)
+    if not os.path.isfile(full):
+        raise Fail("File not found.", 404)
+    if os.path.getsize(full) > WOPI_MAX:
+        raise Fail("Document too large for the office server (over 512 MB).")
+    c = office_load()
+    if not c["server"]:
+        raise Fail("No office server is set up (Settings → Office).")
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    act = discovery().get(ext)
+    if not act:
+        raise Fail("The office server cannot open .%s files." % ext)
+    exp = int(time.time() + WOPI_TTL)
+    src = "%s/wopi/files/%s" % (c["wopi_base"], wopi_id(share, path))
+    lang = re.sub(r"[^a-z-]", "", str(req.get("lang") or "en"))[:5]
+    url = act[1] + ("" if act[1].endswith(("?", "&")) else ("&" if "?" in act[1] else "?")) + \
+        urllib.parse.urlencode({"WOPISrc": src, "lang": lang})
+    return {"url": url, "access_token": wopi_token(user, share, path, exp), "access_token_ttl": exp * 1000, "action": act[0]}
+
+
+def wopi_version(full):
+    st = os.stat(full)
+    return "%d-%d" % (st.st_mtime_ns, st.st_size)
+
+
+def wopi_lock(fid):
+    with LOCK:
+        lk = WOPI_LOCKS.get(fid)
+        if lk and lk[1] < time.time():
+            WOPI_LOCKS.pop(fid, None)
+            return None
+        return lk[0] if lk else None
+
+
+def wopi_handle(handler, method, rest, q):
+    """WOPI host endpoints: CheckFileInfo, GetFile, PutFile, Lock, GetLock,
+    RefreshLock, Unlock, UnlockAndRelock.  No session: the token decides."""
+    m = re.fullmatch(r"files/([0-9a-f]{32})(/contents)?", rest)
+    if not m:
+        raise Fail("Unknown.", 404)
+    fid, contents, token = m.group(1), bool(m.group(2)), q.get("access_token", "")
+    hdr = lambda k: handler.headers.get(k) or ""
+    override = hdr("X-WOPI-Override").upper()
+    if method == "GET" and not contents:                       # CheckFileInfo
+        user, share, path, full = wopi_check(fid, token)
+        st = os.stat(full)
+        try:
+            resolve(user, share, path, write=True)
+            can_write = os.access(full, os.W_OK) or TEST
+        except Fail:
+            can_write = False
+        return handler.reply(200, {
+            "BaseFileName": os.path.basename(full), "Size": st.st_size, "Version": wopi_version(full),
+            "OwnerId": share, "UserId": user, "UserFriendlyName": user, "UserCanWrite": can_write, "ReadOnly": not can_write,
+            "SupportsLocks": True, "SupportsGetLock": True, "SupportsUpdate": True, "UserCanNotWriteRelative": True,
+            "SupportsRename": False, "UserCanRename": False,
+            "LastModifiedTime": datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")})
+    if method == "GET" and contents:                           # GetFile
+        _u, _s, _p, full = wopi_check(fid, token)
+        if os.path.getsize(full) > WOPI_MAX:
+            raise Fail("Document too large.", 413)
+        return handler.reply(200, open(full, "rb").read(), "application/octet-stream",
+                             headers=[("X-WOPI-ItemVersion", wopi_version(full))])
+    if method != "POST":
+        raise Fail("Unknown.", 404)
+    if contents:                                               # PutFile
+        if override not in ("", "PUT"):
+            raise Fail("Unknown.", 400)
+        n = int(hdr("Content-Length") or 0)
+        if n > WOPI_MAX:
+            raise Fail("Document too large.", 413)
+        user, _s, _p, full = wopi_check(fid, token, write=True)
+        body = handler.rfile.read(n) if n else b""
+        cur = wopi_lock(fid)
+        if cur and cur != hdr("X-WOPI-Lock"):
+            # locked by another editor session.  The WOPI rule "no save without
+            # a lock" is not applied: editors that never lock must still save.
+            return handler.reply(409, {"error": "lock mismatch"}, headers=[("X-WOPI-Lock", cur or "")])
+        st = os.stat(full)
+        tmp = os.path.join(os.path.dirname(full), ".%s.untrash-office" % os.path.basename(full))
+        with open(tmp, "wb") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, st.st_mode & 0o7777)
+        if not TEST:
+            os.chown(tmp, st.st_uid, st.st_gid)        # the file keeps its owner (stock rights)
+        os.replace(tmp, full)
+        return handler.reply(200, {}, headers=[("X-WOPI-ItemVersion", wopi_version(full))])
+    if override in ("LOCK", "GET_LOCK", "REFRESH_LOCK", "UNLOCK"):
+        write = override != "GET_LOCK"
+        wopi_check(fid, token, write=write)
+        lock, old, cur = hdr("X-WOPI-Lock"), hdr("X-WOPI-OldLock"), wopi_lock(fid)
+        if override == "GET_LOCK":
+            return handler.reply(200, {}, headers=[("X-WOPI-Lock", cur or "")])
+        if not lock or len(lock) > 1024:
+            raise Fail("X-WOPI-Lock missing.", 400)
+        with LOCK:
+            if override == "LOCK" and old:                     # UnlockAndRelock
+                if cur != old:
+                    return handler.reply(409, {}, headers=[("X-WOPI-Lock", cur or "")])
+                WOPI_LOCKS[fid] = (lock, time.time() + WOPI_LOCK_S)
+            elif override == "LOCK":
+                if cur and cur != lock:
+                    return handler.reply(409, {}, headers=[("X-WOPI-Lock", cur)])
+                WOPI_LOCKS[fid] = (lock, time.time() + WOPI_LOCK_S)
+            elif cur != lock:                                  # REFRESH_LOCK, UNLOCK
+                return handler.reply(409, {}, headers=[("X-WOPI-Lock", cur or "")])
+            elif override == "REFRESH_LOCK":
+                WOPI_LOCKS[fid] = (lock, time.time() + WOPI_LOCK_S)
+            else:
+                WOPI_LOCKS.pop(fid, None)
+        return handler.reply(200, {})
+    return handler.reply(501, {"error": "not supported"})      # PUT_RELATIVE, RENAME_FILE, ...
+
+
 # ------------------------------------------------------------------- HTTP
 
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css",
@@ -2974,7 +3217,7 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/mesh/leave": lambda req: mesh_post("leave", req), "/api/mesh/rename": lambda req: mesh_post("rename", req),
               "/api/mesh/share": lambda req: mesh_post("share", req),
               "/api/mesh/pair": lambda req: mesh_post("pair", req), "/api/mesh/app-link": lambda req: mesh_post("app-link", req),
-              "/api/users/signin": signin_reset,
+              "/api/users/signin": signin_reset, "/api/office/settings": office_save,
               "/api/mesh/mirror-start": lambda req: mesh_post("mirror-start", req),
               "/api/mesh/mirror-accept": lambda req: mesh_post("mirror-accept", req),
               "/api/mesh/mirror-decline": lambda req: mesh_post("mirror-decline", req),
@@ -3075,6 +3318,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.share_link(p[3:], method)
         if p.startswith("/tv/") and method == "GET":
             return self.tv(p[4:])
+        if p.startswith("/wopi/") and method in ("GET", "POST"):
+            return wopi_handle(self, method, p[len("/wopi/"):], q)
         if not p.startswith("/api/"):
             return self.reply(404, {"error": "not found"})
         self.raw_body, self.app = None, None
@@ -3144,6 +3389,11 @@ class Handler(BaseHTTPRequestHandler):
             ck = re.search(r"utsess=([A-Za-z0-9_-]+)", self.headers.get("Cookie") or "")
             SESSIONS.pop(ck.group(1) if ck else "", None)
             return self.reply(200, {}, headers=[("Set-Cookie", "utsess=; Path=/; Max-Age=0")])
+        if p == "/api/office" and method == "GET":
+            st = office_state()
+            return self.reply(200, st if admin else {"enabled": st["enabled"], "exts": st["exts"]})
+        if p == "/api/office/open" and method == "POST":
+            return self.reply(200, office_open(user, self.json_body()))
         if p == "/api/me":
             return self.reply(200, {"user": user, "admin": admin, "prefs": prefs_load(user), "signin": signin_mode(user),
                                     "apps": [{"node": k, "name": a["name"]} for k, a in app_nodes().items() if a["user"] == user]})

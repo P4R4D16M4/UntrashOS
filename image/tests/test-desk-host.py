@@ -18,6 +18,7 @@ validation, first setup (way A), way D (rollback marker on a test stick).
 """
 import base64
 import hashlib
+import hmac
 import http.cookiejar
 import json
 import re
@@ -29,6 +30,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -631,6 +633,93 @@ def main():
                   and a.req("/api/users/signin", {"user": "alice", "mode": "password"})[0] == 200)
             st, mj = a.req("/api/mesh/leave", {})
             check("mesh: left", st == 200 and mj["mesh"] is None)
+            # office bridge: a stand-in office server (discovery only); the test plays the editor (WOPI)
+            import http.server
+            import threading
+            DISC = (b'<?xml version="1.0"?><wopi-discovery><net-zone name="external-http"><app name="writer">'
+                    b'<action ext="odt" name="edit" urlsrc="https://office.test/browser/x/cool.html?&lt;ui=UI_LLCC&amp;&gt;"/>'
+                    b'<action ext="txt" name="view" urlsrc="https://office.test/browser/x/cool.html?"/>'
+                    b'<action ext="txt" name="edit" urlsrc="https://office.test/browser/x/cool.html?"/></app>'
+                    b'<app name="Capabilities"><action ext="" name="getinfo" urlsrc="https://office.test/hosting/capabilities"/></app></net-zone></wopi-discovery>')
+            class OfficeH(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200 if self.path == "/hosting/discovery" else 404)
+                    self.send_header("Content-Type", "text/xml")
+                    self.end_headers()
+                    self.wfile.write(DISC)
+                def log_message(self, *a):
+                    pass
+            osrv = http.server.HTTPServer(("127.0.0.1", 0), OfficeH)
+            threading.Thread(target=osrv.serve_forever, daemon=True).start()
+            office = "http://127.0.0.1:%d" % osrv.server_address[1]
+            check("office: off by default, Files sees no types", a.req("/api/office")[1]["enabled"] is False and u.req("/api/office")[1]["exts"] == [])
+            check("office: both addresses needed", a.req("/api/office/settings", {"server": office, "wopi_base": ""})[0] == 400
+                  and a.req("/api/office/settings", {"server": "javascript:x", "wopi_base": "http://nas"})[0] == 400)
+            check("office: users cannot set it", u.req("/api/office/settings", {"server": office, "wopi_base": "http://nas"})[0] == 403)
+            st, oj = a.req("/api/office/settings", {"server": office, "wopi_base": "http://nas.test"})
+            check("office: saved and checked (types from the discovery, edit over view)", st == 200 and oj["exts"] == ["odt", "txt"])
+            check("office: users see the types, not the addresses", u.req("/api/office")[1] == {"enabled": True, "exts": ["odt", "txt"]})
+            open(r + "/i-data/aaaa0001/mixed/brief.odt", "wb").write(b"ODT-1")
+            check("office: no open for unknown types / missing files", a.req("/api/office/open", {"share": "mixed", "path": "readme.md"})[0] in (400, 404)
+                  and a.req("/api/office/open", {"share": "mixed", "path": "nope.odt"})[0] == 404)
+            check("office: no open without share rights (bob deny)", b.req("/api/office/open", {"share": "mixed", "path": "brief.odt"})[0] == 403)
+            st, op = a.req("/api/office/open", {"share": "mixed", "path": "brief.odt", "lang": "de"})
+            fid = re.search(r"WOPISrc=([^&]+)", op.get("url", ""))
+            fid = urllib.parse.unquote(fid.group(1)).rsplit("/", 1)[1] if fid else ""
+            check("office: editor URL with WOPISrc on the NAS address, placeholders removed", st == 200 and op["url"].startswith("https://office.test/browser/x/cool.html?")
+                  and "WOPISrc=http%3A%2F%2Fnas.test%2Fwopi%2Ffiles%2F" in op["url"] and "UI_LLCC" not in op["url"] and "lang=de" in op["url"]
+                  and op["action"] == "edit" and op["access_token_ttl"] > time.time() * 1000)
+            def wopi(method, path, token, body=None, hdrs=None):
+                rq = urllib.request.Request("http://127.0.0.1:%d/wopi/files/%s?access_token=%s" % (port, path, urllib.parse.quote(token)),
+                                            data=body, method=method)
+                for k, v in (hdrs or {}).items():
+                    rq.add_header(k, v)
+                try:
+                    with urllib.request.urlopen(rq) as resp:
+                        return resp.status, resp.read(), resp.headers
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read(), e.headers
+            tk = op["access_token"]
+            st, info, _h = wopi("GET", fid, tk)
+            info = json.loads(info) if st == 200 else {}
+            check("wopi: CheckFileInfo (name, size, admin may write, locks)", info.get("BaseFileName") == "brief.odt" and info.get("Size") == 5
+                  and info.get("UserCanWrite") is True and info.get("SupportsLocks") is True and info.get("UserId") == "admin")
+            check("wopi: GetFile", wopi("GET", fid + "/contents", tk)[1] == b"ODT-1")
+            check("wopi: a wrong token is refused", wopi("GET", fid, tk[:-2] + ("00" if not tk.endswith("00") else "11"))[0] == 401)
+            check("wopi: the token is bound to its file", wopi("GET", "0" * 32, tk)[0] == 401)
+            check("wopi: PutFile without any lock saves (editors that never lock)",
+                  wopi("POST", fid + "/contents", tk, b"ODT-1", {"X-WOPI-Override": "PUT"})[0] == 200)
+            check("wopi: Lock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "LOCK", "X-WOPI-Lock": "L1"})[0] == 200)
+            st, _b, h = wopi("POST", fid, tk, b"", {"X-WOPI-Override": "LOCK", "X-WOPI-Lock": "L2"})
+            check("wopi: a second lock conflicts and names the current one", st == 409 and h.get("X-WOPI-Lock") == "L1")
+            check("wopi: GetLock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "GET_LOCK"})[2].get("X-WOPI-Lock") == "L1")
+            check("wopi: PutFile with the wrong lock refused", wopi("POST", fid + "/contents", tk, b"BAD", {"X-WOPI-Override": "PUT", "X-WOPI-Lock": "L2"})[0] == 409
+                  and open(r + "/i-data/aaaa0001/mixed/brief.odt", "rb").read() == b"ODT-1")
+            st, _b, h = wopi("POST", fid + "/contents", tk, b"ODT-2 saved", {"X-WOPI-Override": "PUT", "X-WOPI-Lock": "L1"})
+            check("wopi: PutFile with the lock saves the file (new version)", st == 200 and open(r + "/i-data/aaaa0001/mixed/brief.odt", "rb").read() == b"ODT-2 saved"
+                  and h.get("X-WOPI-ItemVersion") and not [x for x in os.listdir(r + "/i-data/aaaa0001/mixed") if "untrash-office" in x])
+            check("wopi: UnlockAndRelock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "LOCK", "X-WOPI-Lock": "L3", "X-WOPI-OldLock": "L1"})[0] == 200)
+            check("wopi: RefreshLock / Unlock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "REFRESH_LOCK", "X-WOPI-Lock": "L3"})[0] == 200
+                  and wopi("POST", fid, tk, b"", {"X-WOPI-Override": "UNLOCK", "X-WOPI-Lock": "L3"})[0] == 200
+                  and wopi("POST", fid, tk, b"", {"X-WOPI-Override": "GET_LOCK"})[2].get("X-WOPI-Lock") == "")
+            check("wopi: PutRelative not supported (501)", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "PUT_RELATIVE"})[0] == 501)
+            st, opu = u.req("/api/office/open", {"share": "mixed", "path": "brief.odt"})
+            st2, iu, _h = wopi("GET", fid, opu.get("access_token", ""))
+            check("wopi: alice (read only on mixed) gets the same file id, may not write", st == 200 and st2 == 200 and json.loads(iu)["UserCanWrite"] is False
+                  and opu["url"] == op["url"].replace("lang=de", "lang=en"))
+            check("wopi: alice's token cannot lock or save", wopi("POST", fid, opu["access_token"], b"", {"X-WOPI-Override": "LOCK", "X-WOPI-Lock": "A"})[0] == 403
+                  and wopi("POST", fid + "/contents", opu["access_token"], b"X", {"X-WOPI-Override": "PUT"})[0] == 403)
+            key = open(r + "/etc/untrash/wopi.key", "rb").read()
+            def forge(body):
+                bb = base64.urlsafe_b64encode(json.dumps(body, separators=(",", ":")).encode()).decode().rstrip("=")
+                return bb + "." + hmac.new(key, bb.encode(), hashlib.sha256).hexdigest()
+            check("wopi: an expired token is refused", wopi("GET", fid, forge({"u": "admin", "s": "mixed", "p": "brief.odt", "e": int(time.time()) - 1}))[0] == 401)
+            check("wopi: rights are checked now, not at opening (bob's token is refused)",
+                  wopi("GET", fid, forge({"u": "bob", "s": "mixed", "p": "brief.odt", "e": int(time.time()) + 99}))[0] == 403)
+            check("wopi: key file only for root", oct(os.stat(r + "/etc/untrash/wopi.key").st_mode & 0o777) == "0o600")
+            a.req("/api/office/settings", {"server": "", "wopi_base": ""})
+            check("office: switched off", a.req("/api/office")[1]["enabled"] is False and a.req("/api/office/open", {"share": "mixed", "path": "brief.odt"})[0] == 400)
+            osrv.shutdown()
             # updates: settings, check, the downloaded release, downgrade guard (untrash-update: test-update-host.py)
             def utslot(ver):
                 head = os.urandom(4096)
