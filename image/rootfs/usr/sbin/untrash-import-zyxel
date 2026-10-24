@@ -604,6 +604,8 @@ def render_smbconf(stock, path_exists=os.path.isdir):
     if extra.get("printers"):
         out += ["", "[printers]", "\tpath = /var/spool/samba", "\tpublic = yes", "\tguest ok = yes",
                 "\tbrowseable = yes", "\twritable = no", "\tprintable = yes", "\tuse client driver = yes"]
+    # UntrashMesh co-op mode: shares offered to mesh partners (untrash-mesh writes it)
+    out += ["", "include = /etc/samba/untrash-mesh.conf"]
     return "\n".join(out) + "\n", skipped
 
 

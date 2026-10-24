@@ -96,7 +96,8 @@ def env_for(r, stick, port):
                         osr + "/third_party/tweetnacl/tweetnacl.c"], check=True)
     return dict(os.environ, ZT_DESK_TEST="1", ZT_DESK_ROOT=r, ZT_DESK_PORT=str(port), ZT_DESK_BIND="127.0.0.1",
                 ZT_MESH_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-mesh"), ZT_MESH_DIR=r + "/etc/untrash/mesh", ZT_SIG=sig,
-                ZT_MESH_FAKE_WG=r + "/mesh-wg.json", ZT_MESH_HOSTS=r + "/hosts",
+                ZT_MESH_FAKE_WG=r + "/mesh-wg.json", ZT_MESH_HOSTS=r + "/hosts", ZT_MESH_SMB=r + "/etc/samba/untrash-mesh.conf",
+                ZT_MESH_PDATA=r + "/p-data", ZT_MESH_FAKE_MOUNT=r + "/mesh-mounts.json", ZT_MESH_FAKE_ACCOUNTS=r + "/mesh-accounts.json",
                 ZT_MESH_ENDPOINTS="192.168.1.20:51820", ZT_MESH_JOIN_HOST="127.0.0.1",
                 ZT_DESK_TESTPW=PW, ZT_DESK_STICK=stick,
                 ZT_IMPORT_TOOL=os.path.join(FILES, "usr/sbin/untrash-import-zyxel"),
@@ -501,6 +502,22 @@ def main():
             check("mesh: not an invitation refused", a.req("/api/mesh/join", {"invitation": "x y z"})[0] == 400)
             st, mj = a.req("/api/mesh/rename", {"name": "keller"})
             check("mesh: renamed", st == 200 and mj["name"] == "keller")
+            check("co-op: unknown member refused", a.req("/api/mesh/share", {"node": "x", "shares": {}})[0] == 400)
+            check("co-op: unknown share refused", a.req("/api/mesh/share", {"node": "0" * 16, "shares": {"nope": "ro"}})[0] == 400)
+            check("co-op: bad right refused", a.req("/api/mesh/share", {"node": "0" * 16, "shares": {"mixed": "admin"}})[0] == 400)
+            # a mounted partner volume (as untrash-mesh reports it) is a volume; a share can live on it
+            os.makedirs(r + "/p-data/nas-b-Photos", exist_ok=True)
+            json.dump({r + "/p-data/nas-b-Photos": {"node": "f" * 16, "partner": "nas-b", "share": "Photos", "mode": "rw", "online": True,
+                                                    "mounted": True, "size": 4 * 10 ** 12, "free": 10 ** 12}},
+                      open(r + "/etc/untrash/mesh/volumes.json", "w"))
+            vols = a.req("/api/shares")[1]["volumes"]
+            pv = [v for v in vols if v["kind"] == "partner"]
+            check("co-op: partner volume listed with the partner's numbers", pv and pv[0]["id"] == "p:nas-b-Photos" and pv[0]["free"] == 10 ** 12
+                  and pv[0]["label"] == "Photos @ nas-b")
+            st, _ = a.req("/api/shares/save", {"new": True, "name": "VonB", "volume": "p:nas-b-Photos", "users": {"admin": "rw"}})
+            check("co-op: share made on the partner volume", st == 200 and any(x["name"] == "VonB" and x["path"] == "/p-data/nas-b-Photos/VonB"
+                                                                              for x in a.req("/api/shares")[1]["shares"]))
+            a.req("/api/shares/delete", {"name": "VonB"})
             st, mj = a.req("/api/mesh/leave", {})
             check("mesh: left", st == 200 and mj["mesh"] is None)
             # updates: settings, check, the downloaded release, downgrade guard (untrash-update: test-update-host.py)

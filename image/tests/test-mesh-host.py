@@ -50,7 +50,9 @@ for i, n in enumerate("abc"):
                             ZT_MESH_HOSTS=d + "/hosts", ZT_MESH_TICK="0.5", ZT_MESH_TEST_SELF="203.0.113.%d:41000" % (10 + i),
                             # never the real router: a's router is the stand-in, b and c have none
                             ZT_UPNPC=os.path.join(HERE, "fake-upnpc") if n == "a" else "/nonexistent/upnpc",
-                            ZT_FAKE_UPNP_STATE=d + "/router.json"),
+                            ZT_FAKE_UPNP_STATE=d + "/router.json",
+                            ZT_MESH_SMB=d + "/smb-mesh.conf", ZT_MESH_PDATA=d + "/p-data", ZT_MESH_FAKE_MOUNT=d + "/mounts.json",
+                            ZT_MESH_FAKE_ACCOUNTS=d + "/accounts.json"),
                 "dir": d, "proc": None}
 
 
@@ -146,11 +148,44 @@ try:
     check("a roster signed by a non-admin is refused", json.load(open(NODES["a"]["dir"] + "/state/mesh.json"))["roster"]["seq"] == ros["seq"])
     check("only admins invite", "error" in cli("b", "invite"))
 
-    # removal
+    # co-op mode: a offers "Photos" read-only to b; b mounts it as a partner volume
+    def jf(n, f):
+        try:
+            return json.load(open(NODES[n]["dir"] + "/" + f))
+        except (OSError, ValueError):
+            return {}
     nc = cli("c", "status")["node"]
+    r = cli("a", "share", nb, json.dumps({"Photos": {"mode": "ro", "path": "/i-data/v1/Photos"}}))
+    check("co-op: offer recorded at a", r.get("offers", {}).get(nb) == {"Photos": "ro"})
+    smb = open(NODES["a"]["dir"] + "/smb-mesh.conf").read()
+    acct = "mesh-" + nb[:8]
+    check("co-op: Samba section only from the mesh prefix, b's account read-only",
+          "[ut-mesh-Photos]" in smb and "path = /i-data/v1/Photos" in smb and "hosts allow = fd" in smb and "hosts deny = ALL" in smb
+          and "valid users = %s" % acct in smb and "read list = %s" % acct in smb)
+    check("co-op: Samba account for b made", acct in jf("a", "accounts.json"))
+    mp = NODES["b"]["dir"] + "/p-data/nas-a-Photos"
+    check("co-op: b mounts it as partner volume nas-a-Photos", wait(lambda: mp in jf("b", "mounts.json")))
+    mnt = jf("b", "mounts.json").get(mp, {})
+    check("co-op: mounted from a's mesh address with b's account", mnt.get("source") == "//%s/ut-mesh-Photos" % sa["address"]
+          and mnt.get("user") == acct and mnt.get("password") == jf("a", "accounts.json")[acct])
+    pv = cli("b", "status")["partner_volumes"]
+    check("co-op: partner volume listed (read-only, mounted)", pv and pv[0]["mode"] == "ro" and pv[0]["mounted"] and pv[0]["partner"] == "nas-a")
+    cli("a", "share", nc, json.dumps({"Photos": {"mode": "rw", "path": "/i-data/v1/Photos"}}))
+    smb = open(NODES["a"]["dir"] + "/smb-mesh.conf").read()
+    check("co-op: second partner c read/write in the same section", "mesh-%s" % nc[:8] in smb and "read list = %s\n" % acct in smb)
+    cli("a", "share", nb, "{}")
+    check("co-op: withdrawn: b unmounts", wait(lambda: mp not in jf("b", "mounts.json")))
+    check("co-op: withdrawn: b's account and Samba rights gone at a", wait(lambda: acct not in jf("a", "accounts.json")
+                                                                          and acct not in open(NODES["a"]["dir"] + "/smb-mesh.conf").read()))
+    check("co-op: a member cannot offer to itself / unknown nodes", "error" in cli("a", "share", sa["node"], "{}") and "error" in cli("a", "share", "0" * 16, "{}"))
+
+    # removal
+
     r = cli("a", "remove", nc)
     check("remove: c out of a's roster", len(r["members"]) == 2)
     check("b learns the removal", wait(lambda: len(cli("b", "status")["members"]) == 2))
+    check("co-op: offers to a removed member go (account, Samba section)", wait(lambda: "mesh-%s" % nc[:8] not in jf("a", "accounts.json")
+                                                                               and "ut-mesh-Photos" not in open(NODES["a"]["dir"] + "/smb-mesh.conf").read()))
     check("c notices and leaves (no mesh, no WireGuard, no hosts block)", wait(lambda: not cli("c", "status")["mesh"]
                                                                               and not os.path.exists(NODES["c"]["dir"] + "/wg.json")
                                                                               and "untrash-mesh" not in open(NODES["c"]["dir"] + "/hosts").read()))

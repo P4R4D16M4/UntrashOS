@@ -316,7 +316,7 @@ VIEWS.overview = async b => {
     ${o.unsupported.length ? `<div class="ut-callout ut-callout--warn" style="margin-bottom:12px"><div><b>Active on stock, not taken over in UntrashOS:</b><ul>${o.unsupported.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div></div>` : ''}
     <div class="ut-section-title">Volumes</div><div class="ut-card">${o.volumes.length ? o.volumes.map(v => {
       const used = v.size ? Math.round(100 * (v.size - v.free) / v.size) : 0;
-      return `<div class="vol"><div><b>${esc(v.label)}</b> <span class="ut-faint">· ${esc(v.path)}${v.kind === 'usb' ? ' · USB' : ''}</span></div><span class="ut-pill ut-pill--ok">ready</span>
+      return `<div class="vol"><div><b>${esc(v.label)}</b> <span class="ut-faint">· ${esc(v.path)}${v.kind === 'usb' ? ' · USB' : v.kind === 'partner' ? ' · ' + esc(UTI18N.tr('partner volume')) : ''}</span></div><span class="ut-pill ut-pill--ok">ready</span>
         <div class="ut-progress ${used > 90 ? 'ut-progress--danger' : used > 75 ? 'ut-progress--warn' : ''}" style="--v:${used}%"><i></i></div><span class="ut-faint">${gb(v.size - v.free)} of ${gb(v.size)} used</span></div>`;
     }).join('') : '<div class="empty">No data volume mounted.</div>'}</div>
     ${o.arrays.length ? `<div class="ut-section-title">RAID</div><div class="ut-card">${o.arrays.map(a => `<div class="row"><b>${esc(a.name)}</b> ${esc(a.level)} [${esc(a.health)}] <span class="ut-pill ${a.degraded ? 'ut-pill--danger' : 'ut-pill--ok'}">${a.degraded ? 'incomplete' : 'healthy'}</span></div>`).join('')}</div>` : ''}
@@ -424,7 +424,7 @@ VIEWS.shares = async (b, sel) => {
   if (sel === '_new' || !s) {
     const pre = SHARE_PREFILL || {}; SHARE_PREFILL = null;
     main = sel === '_new' ? `<h2>New share</h2><div class="form">
-      <div class="ut-field"><label for="sv">Volume</label><select class="ut-select" id="sv">${sh.volumes.filter(v => v.kind === 'intern').map(v => `<option value="${esc(v.id)}"${v.id === pre.volume ? ' selected' : ''}>${esc(v.label)} – ${gb(v.free)} free</option>`).join('')}</select></div>
+      <div class="ut-field"><label for="sv">Volume</label><select class="ut-select" id="sv">${sh.volumes.filter(v => v.kind === 'intern' || v.kind === 'partner').map(v => `<option value="${esc(v.id)}"${v.id === pre.volume ? ' selected' : ''} translate="no">${esc(v.label)} – ${gb(v.free)} ${esc(UTI18N.tr('free'))}${v.kind === 'partner' ? ' · ' + esc(UTI18N.tr(v.mode === 'ro' ? 'partner volume, read only' : 'partner volume')) : ''}</option>`).join('')}</select></div>
       <div class="row" style="gap:16px"><label><input type="radio" name="sk" value="new"${pre.folder ? '' : ' checked'}> New folder</label>
         <label><input type="radio" name="sk" value="dir"${pre.folder ? ' checked' : ''}> Choose an existing folder</label></div>
       <div class="ut-picker" id="spick" hidden><div class="crumbs" id="spc" translate="no"></div><div class="ut-picker__list" id="spl"></div>
@@ -558,6 +558,7 @@ VIEWS.storage = async b => {
     ${s.disks.map(d => { const r = role[d.name]; return `<tr><td>${esc(d.name)}${d.usb ? ' <span class="ut-pill ut-pill--plain">USB</span>' : ''}</td><td>${esc(r ? r.bay : '')}</td><td class="num">${gb(d.size)}</td><td>${esc(d.model)}</td>
       <td><span class="ut-pill ${d.smart === 'ok' ? 'ut-pill--ok' : d.smart === 'fehler' ? 'ut-pill--danger' : 'ut-pill--plain'}">${esc(d.smart)}</span></td><td>${esc(d.temp ? d.temp + ' °C' : '')}</td>
       <td>${r ? esc(ROLE[r.role] || r.role) + ' <span class="ut-faint">' + esc(r.detail) + '</span>' : (d.usb ? 'USB' : '')}</td></tr>`; }).join('')}</tbody></table></div>
+    ${s.volumes.filter(v => v.kind === 'partner').length ? `<div class="ut-section-title">Partner volumes (UntrashMesh)</div><div class="ut-card">${s.volumes.filter(v => v.kind === 'partner').map(v => `<div class="vol"><div><b translate="no">${esc(v.label)}</b> <span class="ut-faint mono">${esc(v.path)}</span>${v.mode === 'ro' ? ' <span class="ut-pill ut-pill--plain">' + esc(UTI18N.tr('read only')) + '</span>' : ''}</div><span class="ut-faint">${gb(v.free)} free of ${gb(v.size)}</span></div>`).join('')}</div>` : ''}
     ${s.volumes.filter(v => v.kind === 'usb').length ? `<div class="ut-section-title">USB</div><div class="ut-card">${s.volumes.filter(v => v.kind === 'usb').map(v => `<div class="vol"><div><b>${esc(v.label)}</b> <span class="ut-faint mono">${esc(v.path)}</span></div><span class="ut-faint">${gb(v.free)} free of ${gb(v.size)}</span></div>`).join('')}</div>` : ''}
     <div class="row"><div class="ut-section-title" style="flex:1">iSCSI</div><button class="ut-btn ut-btn--sm" id="ilun">+ LUN</button><button class="ut-btn ut-btn--sm" id="itgt">+ Target</button></div><div id="iscsi" class="ut-card"><span class="ut-faint">…</span></div>
     <p class="ut-faint">Volumes in the Zyxel firmware format: after “Back to stock” they stay readable.</p></div>`;
@@ -1188,12 +1189,20 @@ VIEWS.mesh = async b => {
       <td><span class="ut-pill ${x.online ? 'ut-pill--ok' : ''}">${x.online ? 'online' : 'not reachable'}</span>
         <div class="ut-faint" translate="no">${esc(x.endpoint || (x.endpoints || [])[0] || '')}</div></td>
       <td class="ut-faint">${x.self ? '' : ago(x.handshake || x.seen)}</td>
-      <td>${m.admin && !x.self ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-mrm="${esc(x.node)}" data-mname="${esc(x.name)}">Remove</button>` : ''}</td></tr>`).join('');
+      <td class="ut-rowbtns">${!x.self ? `<button class="ut-btn ut-btn--sm" data-mshare="${esc(x.node)}" data-mname="${esc(x.name)}">Share…</button>` : ''}${m.admin && !x.self ? ` <button class="ut-btn ut-btn--sm ut-btn--ghost" data-mrm="${esc(x.node)}" data-mname="${esc(x.name)}">Remove</button>` : ''}
+        ${(m.offers || {})[x.node] && Object.keys(m.offers[x.node]).length ? `<div class="ut-faint" translate="no">${esc(Object.entries(m.offers[x.node]).map(([k, v]) => k + (v === 'ro' ? ' (r)' : ' (rw)')).join(', '))}</div>` : ''}</td></tr>`).join('');
+    const pvs = (m.partner_volumes || []).map(v => `<tr><td><b translate="no">${esc(v.share)}</b> <span class="ut-faint">@ <span translate="no">${esc(v.partner)}</span></span><div class="ut-faint mono" translate="no">${esc(v.path)}</div></td>
+      <td>${v.mode === 'ro' ? esc(UTI18N.tr('read only')) : esc(UTI18N.tr('read/write'))}</td>
+      <td><span class="ut-pill ${v.mounted ? 'ut-pill--ok' : ''}">${v.mounted ? esc(UTI18N.tr('mounted')) : esc(UTI18N.tr('partner not reachable'))}</span></td>
+      <td class="ut-faint">${v.mounted ? gb(v.free) + ' ' + esc(UTI18N.tr('free')) : ''}</td></tr>`).join('');
     b.innerHTML = `<div class="ut-window__main ut-mesh"><div class="row"><img src="${ICON('mesh')}" alt="" style="width:40px;height:40px"><h2 style="margin:0">UntrashMesh <span translate="no">${esc(m.mesh.name)}</span></h2>
         <span class="ut-spacer"></span>${m.admin ? '<button class="ut-btn ut-btn--primary" id="minvite">Invite a device</button>' : ''}</div>
       ${me}
       <div class="ut-section-title">Members</div>
       <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Role</th><th>State</th><th>Last contact</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="ut-section-title">Partner volumes</div>
+      ${pvs ? `<div class="ut-table-wrap"><table class="ut-table"><tbody>${pvs}</tbody></table></div><p class="ut-faint">Partner volumes appear under Storage; under Shares you can make shares on them for your own users.</p>`
+        : '<p class="ut-faint">No member shares anything with this NAS yet. A member offers shares with Share… in its own Desk.</p>'}
       <p class="ut-faint">Members reach each other at <span class="mono">name.mesh</span>, for example shares at <span class="mono" translate="no">\\\\${esc(m.members.find(x => !x.self)?.name || 'nas')}.mesh</span>, the Desk at <span class="mono" translate="no">http://${esc(m.members.find(x => !x.self)?.name || 'nas')}.mesh</span>. Over the internet the router needs UPnP or a forwarding of UDP port 51820 on at least one side.</p>
       <div class="row" style="margin-top:12px"><button class="ut-btn ut-btn--ghost ut-btn--danger" id="mleave">Leave the mesh</button></div></div>`;
     const inv = $('#minvite', b);
@@ -1206,6 +1215,16 @@ VIEWS.mesh = async b => {
         $('#mcopy', d).onclick = () => { $('#minvt', d).select(); navigator.clipboard ? navigator.clipboard.writeText(r.invitation).then(() => toast('Copied', '')) : document.execCommand('copy'); };
       } catch (e) { fail(e); }
     };
+    $$('[data-mshare]', b).forEach(x => x.onclick = async () => {
+      const sh = (await api('shares')).shares.filter(s => s.enabled && s.present && !s.path.startsWith('/p-data/'));
+      const cur = (m.offers || {})[x.dataset.mshare] || {};
+      const d = dialog({ title: UTI18N.tr('Share with %s').replace('%s', x.dataset.mname), ok: 'Save',
+        body: `<p>Shares this NAS offers to <b translate="no">${esc(x.dataset.mname)}</b>. They appear there as partner volumes; only over UntrashMesh.</p>
+          <div class="ut-table-wrap"><table class="ut-table"><tbody>${sh.map(s => `<tr><td translate="no">${esc(s.name)}</td><td><select class="ut-select ut-select--sm" data-msh="${esc(s.name)}">
+            ${[['', 'not shared'], ['ro', 'read only'], ['rw', 'read/write']].map(([k, n]) => `<option value="${k}"${(cur[s.name] || '') === k ? ' selected' : ''}>${esc(UTI18N.tr(n))}</option>`).join('')}</select></td></tr>`).join('')}</tbody></table></div>`,
+        onOk: async dd => { const shares = {}; $$('[data-msh]', dd).forEach(e => { if (e.value) shares[e.dataset.msh] = e.value; });
+          await api('mesh/share', { node: x.dataset.mshare, shares }); render('mesh'); } });
+    });
     $$('[data-mrm]', b).forEach(x => x.onclick = () => dialog({ kind: 'danger', title: UTI18N.tr('Remove %s from the mesh?').replace('%s', x.dataset.mname), ok: 'Remove', okCls: 'ut-btn--danger',
       body: '<p>It loses its connection to every member. To come back it needs a new invitation.</p>', onOk: () => save('mesh/remove', { node: x.dataset.mrm }, 'mesh') }));
     $('#mleave', b).onclick = () => dialog({ kind: 'danger', title: 'Leave the mesh?', ok: 'Leave', okCls: 'ut-btn--danger',

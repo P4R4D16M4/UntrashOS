@@ -8,7 +8,18 @@
   untrash-mesh remove NODE            take a member out (admins)
   untrash-mesh leave                  leave the mesh (keys stay, peers are dropped)
   untrash-mesh rename NAME            name of this node in the mesh
+  untrash-mesh share NODE JSON        co-op: offer shares to member NODE,
+                                      {"Photos": {"mode": "ro"|"rw", "path": "/i-data/..."}}
+                                      ({} = offer nothing any more)
   untrash-mesh run                    the daemon (untrash-mesh.service)
+
+Co-op mode: a node offers some of its shares to a member, read-only or
+read/write.  It makes a Samba account for that member (mesh-<id>) and
+Samba sections reachable only from the mesh prefix (/etc/samba/
+untrash-mesh.conf, included by smb.conf), and sends the offer with the
+account over the mesh.  The member mounts each offered share (CIFS, SMB3,
+inside WireGuard) at /p-data/<partner>-<share>: a partner volume, on which
+its admin can make shares for its own users like on any volume.
 
 Links: WireGuard, interface ut-mesh, UDP 51820.  Every node has an IPv6
 address in the mesh's ULA prefix (fd00::/8 + 40 bits of the mesh id), the
@@ -67,7 +78,14 @@ WG_PORT = 51820
 SYNC_PORT = int(E("ZT_MESH_SYNC_PORT", "7340"))
 JOIN_PORT = int(E("ZT_MESH_JOIN_PORT", "7341"))
 IFACE = "ut-mesh"
-HOSTS = E("ZT_MESH_HOSTS", "/etc/hosts")
+# a state directory of its own (PC tests) keeps every other path inside it too,
+# so a test can never write the PC's /etc/samba or mount under /p-data
+_TESTDIR = DIR if E("ZT_MESH_DIR") else None
+SMB_INCLUDE = E("ZT_MESH_SMB", os.path.join(_TESTDIR, "smb-mesh.conf") if _TESTDIR else "/etc/samba/untrash-mesh.conf")
+PDATA = E("ZT_MESH_PDATA", os.path.join(_TESTDIR, "p-data") if _TESTDIR else "/p-data")
+FAKE_MOUNT = E("ZT_MESH_FAKE_MOUNT")        # PC test: mounts recorded in a JSON file
+FAKE_ACCOUNTS = E("ZT_MESH_FAKE_ACCOUNTS")  # PC test: Samba/Unix accounts recorded
+HOSTS = E("ZT_MESH_HOSTS", os.path.join(DIR, "hosts") if E("ZT_MESH_DIR") else "/etc/hosts")
 PROTO = 1
 LOCK = threading.RLock()
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
@@ -494,8 +512,40 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def offer(self, st):
+        """A member offers shares to this node (co-op mode).  The sender is
+        the member whose WireGuard address the request came from."""
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)))
+        except ValueError:
+            return self.send_error(400)
+        src, sender = self.client_address[0], None
+        for k, m in members(st).items():
+            if address(st["mesh"]["id"], m["pub"]) == src:
+                sender = k
+        if E("ZT_MESH_ADDRMAP") and req.get("from") in members(st):
+            sender = req["from"]                 # PC test: no WireGuard addresses
+        if not sender or sender == identity()[0]:
+            return self.send_error(403)
+        shares = [{"name": str(x.get("name")), "mode": "ro" if x.get("mode") == "ro" else "rw"}
+                  for x in (req.get("shares") or [])[:64] if SHARE_RE.match(str(x.get("name", "")))]
+        with LOCK:
+            parts = jload("partners.json", {})
+            if shares:
+                parts[sender] = {"user": str(req.get("user", ""))[:32], "password": str(req.get("password", ""))[:64],
+                                 "shares": shares, "t": int(time.time())}
+            else:
+                parts.pop(sender, None)
+            jsave("partners.json", parts)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
     def do_POST(self):
         st = state()
+        if self.path == "/v1/offer" and st.get("mesh"):
+            return self.offer(st)
         if self.path != "/v1/sync" or not st.get("mesh"):
             return self.send_error(404)
         src = self.client_address[0]
@@ -729,6 +779,14 @@ def cmd_leave():
         st.pop("observed", None)
         jsave("mesh.json", st)
         jsave("book.json", {})
+        for n, o in jload("offers.json", {}).items():
+            accounts("del", o["user"])
+        jsave("offers.json", {})
+        jsave("partners.json", {})
+        smb_render(st)
+    for mp in sorted(h for h in mounted() if h.startswith(PDATA + "/")):
+        unmount(mp)
+    jsave("volumes.json", {})
     wg_down()
     hosts_apply({})
     return status()
@@ -754,6 +812,8 @@ def status():
     peers = wg_peers() if st.get("mesh") else {}
     out = {"node": nid, "name": st.get("name") or default_name(), "pub": pub, "wg": wg, "mesh": st.get("mesh"),
            "admin": nid in admins(st.get("roster")), "invites": len(st.get("invites") or {}), "members": []}
+    out["offers"] = {n: {k: sh["mode"] for k, sh in o.get("shares", {}).items()} for n, o in jload("offers.json", {}).items()}
+    out["partner_volumes"] = [dict(v, path=k) for k, v in sorted(jload("volumes.json", {}).items())]
     if st.get("mesh"):
         out["address"] = address(st["mesh"]["id"], pub)
         now = time.time()
@@ -764,6 +824,229 @@ def status():
                                    "endpoints": rec.get("ep", []), "seq": rec.get("seq"), "seen": rec.get("time"),
                                    "handshake": p.get("handshake") or None, "endpoint": p.get("endpoint"),
                                    "online": k == nid or bool(p.get("handshake") and now - p["handshake"] < 180)})
+    return out
+
+
+# ------------------------------------------------------------ co-op: partner volumes
+
+SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,62}$")
+
+
+def account_for(node):
+    return "mesh-" + node[:8]
+
+
+def accounts(op, user, password=None):
+    """Samba + Unix account of a partner (no login, no home)."""
+    if FAKE_ACCOUNTS:
+        d = json.load(open(FAKE_ACCOUNTS)) if os.path.exists(FAKE_ACCOUNTS) else {}
+        if op == "add":
+            d[user] = password
+        else:
+            d.pop(user, None)
+        json.dump(d, open(FAKE_ACCOUNTS, "w"))
+        return
+    if op == "add":
+        if subprocess.run(["id", user], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            run(["useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "--comment", "UntrashMesh partner", user])
+        subprocess.run(["smbpasswd", "-a", "-s", user], input="%s\n%s\n" % (password, password), text=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    else:
+        run(["smbpasswd", "-x", user], check=False)
+        run(["userdel", user], check=False)
+
+
+def smb_render(st=None):
+    """Samba sections of everything this node offers: one hidden share per
+    offered share, only from the mesh prefix, rights per partner account."""
+    st = st or state()
+    offers = jload("offers.json", {})
+    out = ["# Generated by untrash-mesh (co-op mode): shares offered to mesh partners.",
+           "# Reachable only over UntrashMesh; regenerate instead of editing."]
+    if st.get("mesh"):
+        by_share = {}
+        for node, o in sorted(offers.items()):
+            if node not in members(st):
+                continue
+            for name, sh in sorted(o.get("shares", {}).items()):
+                by_share.setdefault((name, sh["path"]), []).append((o["user"], sh["mode"]))
+        for (name, spath), users in sorted(by_share.items()):
+            out += ["", "[ut-mesh-%s]" % name, "\tpath = %s" % spath, "\tbrowseable = no", "\tread only = no",
+                    "\tfollow symlinks = yes",
+                    "\thosts allow = %s" % prefix(st["mesh"]["id"]), "\thosts deny = ALL",
+                    "\tvalid users = %s" % " ".join(u for u, _m in users)]
+            ro = [u for u, m in users if m == "ro"]
+            if ro:
+                out.append("\tread list = %s" % " ".join(ro))
+    body = "\n".join(out) + "\n"
+    try:
+        old = open(SMB_INCLUDE).read()
+    except OSError:
+        old = None
+    if body != old:
+        os.makedirs(os.path.dirname(SMB_INCLUDE), exist_ok=True)
+        tmp = SMB_INCLUDE + ".tmp"
+        open(tmp, "w").write(body)
+        os.replace(tmp, SMB_INCLUDE)
+        if not FAKE_ACCOUNTS:
+            run(["smbcontrol", "smbd", "reload-config"], check=False)
+
+
+def cmd_share(node, spec):
+    """Offer shares to a member (replaces what it was offered before)."""
+    try:
+        want = json.loads(spec)
+        assert isinstance(want, dict)
+    except (ValueError, AssertionError):
+        raise SystemExit("shares: a JSON object")
+    with LOCK:
+        st = state()
+        if not st.get("mesh") or node not in members(st) or node == identity()[0]:
+            raise SystemExit("unknown member")
+        shares = {}
+        for name, sh in want.items():
+            if not SHARE_RE.match(name) or not isinstance(sh, dict) or sh.get("mode") not in ("ro", "rw") \
+                    or not str(sh.get("path", "")).startswith("/") or ".." in sh["path"]:
+                raise SystemExit("bad share %r" % name)
+            shares[name] = {"mode": sh["mode"], "path": sh["path"]}
+        offers = jload("offers.json", {})
+        o = offers.get(node) or {"user": account_for(node), "password": secrets.token_hex(16)}
+        o.update(shares=shares, sent=False)
+        if shares:
+            accounts("add", o["user"], o["password"])
+            offers[node] = o
+        else:
+            offers[node] = o                      # an empty offer still has to reach the partner
+        jsave("offers.json", offers)
+        smb_render(st)
+    send_offers(wait=True)
+    return status()
+
+
+def send_offers(wait=False):
+    """Every offer not yet acknowledged goes to its partner over the mesh."""
+    st, offers = state(), jload("offers.json", {})
+    nid = identity()[0]
+    def send(node, o):
+        m = members(st).get(node)
+        if not m:
+            return
+        body = {"from": nid, "user": o["user"], "password": o["password"] if o["shares"] else "",
+                "shares": [{"name": n, "mode": sh["mode"]} for n, sh in sorted(o["shares"].items())]}
+        url = sync_url(address(st["mesh"]["id"], m["pub"])).replace("/v1/sync", "/v1/offer")
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode(),
+                                                          headers={"Content-Type": "application/json"}), timeout=8).read()
+        except (OSError, urllib.error.URLError):
+            return
+        with LOCK:
+            cur = jload("offers.json", {})
+            if node in cur and cur[node].get("shares") == o["shares"]:
+                cur[node]["sent"] = True
+                if not o["shares"]:              # withdrawn and acknowledged: account and entry go
+                    accounts("del", o["user"])
+                    del cur[node]
+                jsave("offers.json", cur)
+    threads = [threading.Thread(target=send, args=(n, o), daemon=True) for n, o in offers.items() if not o.get("sent")]
+    for t in threads:
+        t.start()
+    if wait:
+        for t in threads:
+            t.join(15)
+
+
+def offers_prune(st):
+    """Offers to nodes that left the mesh: accounts and Samba sections go."""
+    offers = jload("offers.json", {})
+    gone = [n for n in offers if n not in members(st)]
+    for n in gone:
+        accounts("del", offers[n]["user"])
+        del offers[n]
+    if gone:
+        jsave("offers.json", offers)
+        smb_render(st)
+
+
+def mounted():
+    if FAKE_MOUNT:
+        return set(json.load(open(FAKE_MOUNT))) if os.path.exists(FAKE_MOUNT) else set()
+    try:
+        return {l.split()[1].replace("\\040", " ") for l in open("/proc/mounts") if l.split()[2] == "cifs"}
+    except OSError:
+        return set()
+
+
+def partner_volumes(st):
+    """Mount what partners offer (when they are reachable), unmount what they
+    no longer offer; sizes for the Desk without touching the mounts there."""
+    parts = jload("partners.json", {})
+    for n in [n for n in parts if n not in members(st)]:
+        del parts[n]
+    bk, peers, now = book(), wg_peers(), time.time()
+    want = {}
+    for node, p in parts.items():
+        m = members(st)[node]
+        pname = safe_name((bk.get(node) or {}).get("name") or m.get("name"))
+        online = FAKE_MOUNT or now - (peers.get(m["wg"]) or {}).get("handshake", 0) < 180
+        for sh in p.get("shares", []):
+            mp = os.path.join(PDATA, "%s-%s" % (pname, re.sub(r"[^A-Za-z0-9._-]", "_", sh["name"])))
+            want[mp] = {"node": node, "partner": pname, "share": sh["name"], "mode": sh["mode"], "user": p["user"],
+                        "password": p["password"], "addr": address(st["mesh"]["id"], m["pub"]), "online": bool(online)}
+    have = mounted()
+    for mp in sorted(h for h in have if h.startswith(PDATA + "/") and h not in want):
+        unmount(mp)
+    vols = {}
+    for mp, w in want.items():
+        if mp not in have and w["online"]:
+            try:
+                mount(mp, w)
+            except RuntimeError as e:
+                log("partner volume %s: %s" % (mp, e))
+        vols[mp] = {k: w[k] for k in ("node", "partner", "share", "mode", "online")}
+        vols[mp]["mounted"] = mp in mounted()
+        vols[mp].update(space(mp) if vols[mp]["mounted"] else {"size": 0, "free": 0})
+    jsave("partners.json", parts)
+    jsave("volumes.json", vols)
+
+
+def mount(mp, w):
+    os.makedirs(mp, exist_ok=True)
+    if FAKE_MOUNT:
+        d = json.load(open(FAKE_MOUNT)) if os.path.exists(FAKE_MOUNT) else {}
+        d[mp] = {"source": "//%s/ut-mesh-%s" % (w["addr"], w["share"]), "user": w["user"], "password": w["password"]}
+        json.dump(d, open(FAKE_MOUNT, "w"))
+        return
+    opts = ("ip=%s,username=%s,password=%s,vers=3.1.1,noperm,soft,echo_interval=10,actimeo=5,file_mode=0777,dir_mode=0777%s"
+            % (w["addr"], w["user"], w["password"], ",ro" if w["mode"] == "ro" else ""))
+    run(["mount", "-t", "cifs", "//%s/ut-mesh-%s" % (w["addr"], w["share"].replace(" ", "\\040")), mp, "-o", opts])
+
+
+def unmount(mp):
+    if FAKE_MOUNT:
+        d = json.load(open(FAKE_MOUNT)) if os.path.exists(FAKE_MOUNT) else {}
+        d.pop(mp, None)
+        json.dump(d, open(FAKE_MOUNT, "w"))
+    else:
+        run(["umount", "-l", mp], check=False)
+    try:
+        os.rmdir(mp)
+    except OSError:
+        pass
+
+
+def space(mp):
+    """statvfs in a thread with a timeout: a partner that just went away
+    must not hang the daemon."""
+    out = {"size": 0, "free": 0}
+    def go():
+        try:
+            v = os.statvfs(mp)
+            out.update(size=v.f_blocks * v.f_frsize, free=v.f_bavail * v.f_frsize)
+        except OSError:
+            pass
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(3)
     return out
 
 
@@ -800,6 +1083,10 @@ def cmd_run():
                 continue
             wg_apply(st)
             hosts_apply(st)
+            offers_prune(st)
+            smb_render(st)
+            send_offers()
+            partner_volumes(st)
             if not sync_srv:
                 host = "127.0.0.1" if E("ZT_MESH_ADDRMAP") else address(st["mesh"]["id"], pub)
                 try:
@@ -868,6 +1155,8 @@ def main():
             out = cmd_leave()
         elif a[:1] == ["rename"] and len(a) == 2:
             out = cmd_rename(a[1])
+        elif a[:1] == ["share"] and len(a) == 3:
+            out = cmd_share(a[1], a[2])
         elif a == ["run"]:
             return cmd_run()
         else:

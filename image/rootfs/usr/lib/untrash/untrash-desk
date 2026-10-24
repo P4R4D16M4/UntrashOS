@@ -71,6 +71,8 @@ MANUAL = os.environ.get("ZT_MANUAL_DIR") or next(
 MANUAL_HDR = (("X-Frame-Options", "SAMEORIGIN"), ("Content-Security-Policy", "default-src 'self' data:; style-src 'unsafe-inline'; frame-ancestors 'self'"))
 IDATA = R + "/i-data"
 EDATA = R + "/e-data"
+PDATA = R + "/p-data"                  # UntrashMesh partner volumes (untrash-mesh, co-op mode)
+MESH_VOLUMES = os.environ.get("ZT_MESH_DIR", R + "/etc/untrash/mesh") + "/volumes.json"
 STICK_MNT = R + "/run/untrash/desk-stick"
 UPLOAD_DIR = R + "/var/lib/untrash/upload"
 GUEST, EVERYONE, ADMIN_GROUP = "pc-guest", "everyone", "administrators"
@@ -330,6 +332,16 @@ def mesh_post(op, req):
         return mesh_run("leave")
     if op == "rename":
         return mesh_run("rename", mesh_name(req.get("name"), "Name in the mesh"))
+    if op == "share":
+        if not re.fullmatch(r"[0-9a-f]{16}", str(req.get("node") or "")):
+            raise Fail("Unknown member.")
+        local = {x["name"]: x for x in shares() if x["enabled"] and x["present"] and not x["path"].startswith("/p-data/")}
+        spec = {}
+        for name, mode in (req.get("shares") or {}).items():
+            if mode not in ("ro", "rw") or name not in local:
+                raise Fail("Unknown share or right: %s" % name)
+            spec[name] = {"mode": mode, "path": local[name]["path"]}
+        return mesh_run("share", req["node"], json.dumps(spec))
     raise Fail("Unknown.", 404)
 
 
@@ -515,6 +527,18 @@ def volumes():
                 size = free = 0
             out.append({"id": n, "path": d.replace(R, "", 1), "kind": kind, "label": label or n,
                         "size": size, "free": free, "sysvol": os.path.realpath(IDATA + "/sysvol") == os.path.realpath(d)})
+    # partner volumes: sizes measured by untrash-mesh (a mount of an unreachable
+    # partner must never hang the Desk with statvfs here)
+    try:
+        pv = json.load(open(MESH_VOLUMES))
+    except (OSError, ValueError):
+        pv = {}
+    for mp, v in sorted(pv.items()):
+        if not v.get("mounted"):
+            continue
+        out.append({"id": "p:" + os.path.basename(mp), "path": PDATA.replace(R, "", 1) + "/" + os.path.basename(mp), "kind": "partner",
+                    "label": "%s @ %s" % (v.get("share"), v.get("partner")), "size": v.get("size", 0), "free": v.get("free", 0),
+                    "sysvol": False, "mode": v.get("mode"), "partner": v.get("partner")})
     return out
 
 
@@ -2638,6 +2662,7 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/mesh/create": lambda req: mesh_post("create", req), "/api/mesh/invite": lambda req: mesh_post("invite", req),
               "/api/mesh/join": lambda req: mesh_post("join", req), "/api/mesh/remove": lambda req: mesh_post("remove", req),
               "/api/mesh/leave": lambda req: mesh_post("leave", req), "/api/mesh/rename": lambda req: mesh_post("rename", req),
+              "/api/mesh/share": lambda req: mesh_post("share", req),
               "/api/update/check": lambda req: update_run(["check", "--manual"]),
               "/api/update/download": lambda req: update_run(["download"]),
               "/api/update/settings": update_settings, "/api/stock/rollback": stock_rollback, "/api/raid/job": raid_job,
