@@ -3,3 +3,9 @@
 set -e
 mkdir -p "$BUILDROOT/etc/ssh/sshd_config.d"
 printf 'PermitRootLogin prohibit-password\nPasswordAuthentication no\n' >"$BUILDROOT/etc/ssh/sshd_config.d/10-untrash.conf"
+# drbd-utils (Debian trixie) replaces base-files' /var/lock symlink with a
+# directory (mkosi.sandbox/etc/apt/apt.conf.d): put the symlink back, so
+# lock files stay on the /run tmpfs
+if [ -d "$BUILDROOT/var/lock" ] && [ ! -L "$BUILDROOT/var/lock" ]; then
+	rmdir "$BUILDROOT/var/lock" && ln -s /run/lock "$BUILDROOT/var/lock"
+fi

@@ -1,0 +1,5 @@
+// drbd-utils 9.22.0-1.1 (Debian trixie) ships /var/lock, a path base-files
+// owns (a symlink to /run/lock): without this dpkg refuses the package.
+// After every rootfs build the log must show no other "trying to overwrite"
+// than /var/lock (docs: firmware docs/build.md).
+DPkg::Options:: "--force-overwrite";

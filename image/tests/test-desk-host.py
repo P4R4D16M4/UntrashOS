@@ -505,6 +505,18 @@ def main():
             check("co-op: unknown member refused", a.req("/api/mesh/share", {"node": "x", "shares": {}})[0] == 400)
             check("co-op: unknown share refused", a.req("/api/mesh/share", {"node": "0" * 16, "shares": {"nope": "ro"}})[0] == 400)
             check("co-op: bad right refused", a.req("/api/mesh/share", {"node": "0" * 16, "shares": {"mixed": "admin"}})[0] == 400)
+            # off-site mirror (test-mesh-host.py has the DRBD part)
+            check("mirror: volumes say which one holds the running system", all(v.get("host") is False for v in a.req("/api/storage")[1]["volumes"] if v["kind"] == "intern"))
+            check("mirror: unknown member refused", a.req("/api/mesh/mirror-start", {"volume": "aaaa0001", "node": "x"})[0] == 400)
+            check("mirror: unknown volume refused", a.req("/api/mesh/mirror-start", {"volume": "nope", "node": "0" * 16})[0] == 400)
+            st, mj = a.req("/api/mesh/mirror-start", {"volume": "aaaa0001", "node": "0" * 16})
+            check("mirror: untrash-mesh refusal reaches the Desk", st == 400 and mj.get("error"))
+            check("mirror: bad mirror id refused", a.req("/api/mesh/mirror-stop", {"id": "../x"})[0] == 400
+                  and a.req("/api/mesh/mirror-accept", {"id": "zz", "volume": "aaaa0001"})[0] == 400)
+            check("mirror: unknown mirror refused", a.req("/api/mesh/mirror-decline", {"id": "0" * 8})[0] == 400)
+            check("mirror: users get 403", u.req("/api/mesh/mirror-stop", {"id": "0" * 8})[0] == 403)
+            st, mj = a.req("/api/mesh")
+            check("mirror: status lists mirrors and copies", st == 200 and mj["mirrors"] == [] and mj["mirror_copies"] == [])
             # a mounted partner volume (as untrash-mesh reports it) is a volume; a share can live on it
             os.makedirs(r + "/p-data/nas-b-Photos", exist_ok=True)
             json.dump({r + "/p-data/nas-b-Photos": {"node": "f" * 16, "partner": "nas-b", "share": "Photos", "mode": "rw", "online": True,

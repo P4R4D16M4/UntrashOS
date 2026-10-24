@@ -342,7 +342,26 @@ def mesh_post(op, req):
                 raise Fail("Unknown share or right: %s" % name)
             spec[name] = {"mode": mode, "path": local[name]["path"]}
         return mesh_run("share", req["node"], json.dumps(spec))
+    if op in ("mirror-start", "mirror-accept"):
+        vol = next((v for v in volumes() if v["id"] == req.get("volume") and v["kind"] == "intern"), None)
+        if not vol:
+            raise Fail("Choose a volume.")
+        if op == "mirror-start":
+            if vol.get("host"):
+                raise Fail("The volume of the running system cannot be mirrored.")
+            if not re.fullmatch(r"[0-9a-f]{16}", str(req.get("node") or "")):
+                raise Fail("Unknown member.")
+            return mesh_run("mirror-start", vol["path"], vol["label"], req["node"])
+        return mesh_run("mirror-accept", mirror_id(req), vol["path"])
+    if op in ("mirror-decline", "mirror-stop"):
+        return mesh_run(op, mirror_id(req))
     raise Fail("Unknown.", 404)
+
+
+def mirror_id(req):
+    if not re.fullmatch(r"[0-9a-f]{8}", str(req.get("id") or "")):
+        raise Fail("Unknown mirror.")
+    return req["id"]
 
 
 # ------------------------------------------------------------ appearance per user
@@ -507,6 +526,16 @@ def group_set_members(req):
 
 # ---------------------------------------------------------------- shares
 
+HOST_MNT = os.environ.get("ZT_MESH_HOST_MNT", R + "/run/untrash/host")   # slot file container (ways B/C)
+
+
+def is_host(d):
+    try:
+        return os.path.ismount(HOST_MNT) and os.stat(HOST_MNT).st_dev == os.stat(d).st_dev
+    except OSError:
+        return False
+
+
 def volumes():
     """Mounted data volumes under /i-data (stock and ut-data) and /e-data."""
     out = []
@@ -526,7 +555,8 @@ def volumes():
             except OSError:
                 size = free = 0
             out.append({"id": n, "path": d.replace(R, "", 1), "kind": kind, "label": label or n,
-                        "size": size, "free": free, "sysvol": os.path.realpath(IDATA + "/sysvol") == os.path.realpath(d)})
+                        "size": size, "free": free, "sysvol": os.path.realpath(IDATA + "/sysvol") == os.path.realpath(d),
+                        "host": kind == "intern" and is_host(d)})
     # partner volumes: sizes measured by untrash-mesh (a mount of an unreachable
     # partner must never hang the Desk with statvfs here)
     try:
@@ -2663,6 +2693,10 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/mesh/join": lambda req: mesh_post("join", req), "/api/mesh/remove": lambda req: mesh_post("remove", req),
               "/api/mesh/leave": lambda req: mesh_post("leave", req), "/api/mesh/rename": lambda req: mesh_post("rename", req),
               "/api/mesh/share": lambda req: mesh_post("share", req),
+              "/api/mesh/mirror-start": lambda req: mesh_post("mirror-start", req),
+              "/api/mesh/mirror-accept": lambda req: mesh_post("mirror-accept", req),
+              "/api/mesh/mirror-decline": lambda req: mesh_post("mirror-decline", req),
+              "/api/mesh/mirror-stop": lambda req: mesh_post("mirror-stop", req),
               "/api/update/check": lambda req: update_run(["check", "--manual"]),
               "/api/update/download": lambda req: update_run(["download"]),
               "/api/update/settings": update_settings, "/api/stock/rollback": stock_rollback, "/api/raid/job": raid_job,

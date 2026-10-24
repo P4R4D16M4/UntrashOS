@@ -52,7 +52,8 @@ for i, n in enumerate("abc"):
                             ZT_UPNPC=os.path.join(HERE, "fake-upnpc") if n == "a" else "/nonexistent/upnpc",
                             ZT_FAKE_UPNP_STATE=d + "/router.json",
                             ZT_MESH_SMB=d + "/smb-mesh.conf", ZT_MESH_PDATA=d + "/p-data", ZT_MESH_FAKE_MOUNT=d + "/mounts.json",
-                            ZT_MESH_FAKE_ACCOUNTS=d + "/accounts.json"),
+                            ZT_MESH_FAKE_ACCOUNTS=d + "/accounts.json", ZT_MESH_FAKE_DRBD=d + "/drbd.json",
+                            ZT_MESH_HOST_MNT=d + "/no-host"),
                 "dir": d, "proc": None}
 
 
@@ -179,6 +180,78 @@ try:
                                                                           and acct not in open(NODES["a"]["dir"] + "/smb-mesh.conf").read()))
     check("co-op: a member cannot offer to itself / unknown nodes", "error" in cli("a", "share", sa["node"], "{}") and "error" in cli("a", "share", "0" * 16, "{}"))
 
+    # off-site mirror: a asks b to keep a copy of its volume /i-data/v1 (DRBD faked)
+    VOL, SIZE = "/i-data/v1", 64 << 20
+    json.dump({"mounts": {VOL: "/dev/vg/lv_v1"}, "sizes": {"/dev/vg/lv_v1": SIZE}}, open(NODES["a"]["dir"] + "/drbd.json", "w"))
+    def drbdf(n):
+        return jf(n, "drbd.json")
+    r = cli("a", "mirror-start", VOL, "Data", nb)
+    mo = (r.get("mirrors") or [{}])[0]
+    mid = mo.get("id", "")
+    check("mirror: request recorded at a (size from the device)", mo.get("state") == "requested" and mo.get("size") == SIZE and mo.get("peer") == nb)
+    check("mirror: b sees the request and must agree", wait(lambda: any(c["id"] == mid and c["state"] == "pending" for c in cli("b", "status").get("mirror_copies", []))))
+    check("mirror: the same volume cannot be mirrored twice", "error" in cli("a", "mirror-start", VOL, "Data", nc))
+    check("mirror: not mounted through DRBD before the partner agreed", cli("a", "mirror-up", "/dev/vg/lv_v1", VOL) == {"device": None})
+    bvol = NODES["b"]["dir"] + "/vol"
+    os.makedirs(bvol)
+    r = cli("b", "mirror-accept", mid, bvol)
+    img = bvol + "/.untrash-mirror/%s.img" % mid
+    check("mirror: b keeps the copy in a sparse file of the volume's size", os.path.getsize(img) == SIZE and os.stat(img).st_blocks == 0)
+    check("mirror: b's copy is up as DRBD secondary (metadata once)", wait(lambda: drbdf("b").get("res", {}).get("ut-" + mid, {}).get("log", [])[:2] == ["create-md --force", "up"]))
+    check("mirror: a learns the consent", wait(lambda: cli("a", "status")["mirrors"][0]["state"] == "accepted"))
+    r = cli("a", "mirror-up", "/dev/vg/lv_v1", VOL)
+    om = cli("a", "status")["mirrors"][0]
+    check("mirror: at the next mount a mounts /dev/drbdN", r.get("device") == "/dev/drbd%d" % om["minor"])
+    res = drbdf("a")["res"]["ut-" + mid]
+    check("mirror: first start: metadata, up, primary --force", res["log"] == ["create-md --force", "up", "primary --force"])
+    conf = open(NODES["a"]["dir"] + "/state/drbd/%s.conf" % mid).read()
+    sb = cli("b", "status")
+    check("mirror: config: protocol A, pull-ahead, both mesh addresses, the volume as disk, meta on a loop file",
+          "protocol A;" in conf and "on-congestion pull-ahead" in conf and "[%s]:%d" % (sa["address"], om["port"]) in conf
+          and "[%s]:%d" % (sb["address"], om["peer_port"]) in conf and "disk /dev/vg/lv_v1;" in conf and "meta-disk /dev/loop-fake" in conf)
+    check("mirror: DRBD metadata in a file outside the volume", os.path.exists(NODES["a"]["dir"] + "/state/mirror/%s.meta" % mid))
+    # next boot: no new metadata, no --force
+    d = drbdf("a"); d["res"]["ut-" + mid].update(cs="Unconfigured", log=[]); json.dump(d, open(NODES["a"]["dir"] + "/drbd.json", "w"))
+    cli("a", "mirror-up", "/dev/vg/lv_v1", VOL)
+    check("mirror: later starts: up and primary only", drbdf("a")["res"]["ut-" + mid]["log"] == ["up", "primary"])
+    # a boot where DRBD fails: mounted directly, copy marked for a full resync
+    d = drbdf("a"); d["res"]["ut-" + mid].update(cs="Unconfigured", md=False, log=[]); json.dump(d, open(NODES["a"]["dir"] + "/drbd.json", "w"))
+    r = cli("a", "mirror-up", "/dev/vg/lv_v1", VOL)
+    check("mirror: DRBD fails at boot: error, so the volume is mounted directly", "error" in r)
+    check("mirror: and the copy is marked for a full resync", cli("a", "status")["mirrors"][0].get("bypassed") is True)
+    d = drbdf("a"); d["res"]["ut-" + mid].update(md=True, log=[]); json.dump(d, open(NODES["a"]["dir"] + "/drbd.json", "w"))
+    check("mirror: next boot works again", cli("a", "mirror-up", "/dev/vg/lv_v1", VOL).get("device", "").startswith("/dev/drbd"))
+    d = drbdf("a"); d["res"]["ut-" + mid]["cs"] = "Connected"; json.dump(d, open(NODES["a"]["dir"] + "/drbd.json", "w"))
+    check("mirror: once connected the daemon sends everything again (invalidate-remote)",
+          wait(lambda: "invalidate-remote" in drbdf("a")["res"]["ut-" + mid]["log"] and not cli("a", "status")["mirrors"][0].get("bypassed")))
+    check("mirror: status shows the live state", cli("a", "status")["mirrors"][0]["live"]["cs"] == "Connected")
+    try:
+        urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%d/v1/mirror" % (BASE + 2), data=json.dumps(
+            {"type": "stop", "id": mid, "from": "0" * 16}).encode()), timeout=5).read()
+        forged = False
+    except urllib.error.HTTPError as e:
+        forged = e.code == 403
+    check("mirror: a stop from a non-member is refused", forged and os.path.exists(img))
+    cli("a", "mirror-stop", mid)
+    check("mirror: stop: b deletes its copy", wait(lambda: not os.path.exists(img) and not cli("b", "status")["mirror_copies"]))
+    check("mirror: stop: a ends it at the next mount", wait(lambda: cli("a", "status")["mirrors"][0]["state"] == "stopped"))
+    check("mirror: after the stop the volume is mounted directly", cli("a", "mirror-up", "/dev/vg/lv_v1", VOL) == {"device": None}
+          and not cli("a", "status")["mirrors"])
+    r = cli("a", "mirror-start", VOL, "Data", nb)
+    mid2 = r["mirrors"][0]["id"]
+    wait(lambda: cli("b", "status")["mirror_copies"])
+    cli("b", "mirror-decline", mid2)
+    check("mirror: decline: a sees it, b keeps nothing", wait(lambda: cli("a", "status")["mirrors"][0]["state"] == "declined")
+          and not cli("b", "status")["mirror_copies"])
+    r = cli("a", "mirror-start", VOL, "Data", nc)
+    mid3 = next((o["id"] for o in r.get("mirrors") or [] if o["peer"] == nc), None)
+    check("mirror: a declined request does not block a new one", "error" not in r)
+    check("mirror: c gets the request", wait(lambda: cli("c", "status").get("mirror_copies")))
+    cvol = NODES["c"]["dir"] + "/vol"
+    os.makedirs(cvol)
+    cli("c", "mirror-accept", mid3, cvol)
+    check("mirror: c keeps a copy", wait(lambda: os.path.exists(cvol + "/.untrash-mirror/%s.img" % mid3)))
+
     # removal
 
     r = cli("a", "remove", nc)
@@ -186,6 +259,9 @@ try:
     check("b learns the removal", wait(lambda: len(cli("b", "status")["members"]) == 2))
     check("co-op: offers to a removed member go (account, Samba section)", wait(lambda: "mesh-%s" % nc[:8] not in jf("a", "accounts.json")
                                                                                and "ut-mesh-Photos" not in open(NODES["a"]["dir"] + "/smb-mesh.conf").read()))
+    check("mirror: c removed: a's mirror to c ends, c deletes its copy",
+          wait(lambda: any(o["id"] == mid3 and o["state"] == "partner-stopped" for o in cli("a", "status")["mirrors"])
+               and not os.path.exists(cvol + "/.untrash-mirror/%s.img" % mid3)))
     check("c notices and leaves (no mesh, no WireGuard, no hosts block)", wait(lambda: not cli("c", "status")["mesh"]
                                                                               and not os.path.exists(NODES["c"]["dir"] + "/wg.json")
                                                                               and "untrash-mesh" not in open(NODES["c"]["dir"] + "/hosts").read()))

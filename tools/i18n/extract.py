@@ -28,7 +28,8 @@ CODEY = re.compile(r"^[\w.#:/-]+$|^[a-z]+[A-Z]\w*$|^ut-|\[data-|[{}<>=;\\]|^\$|^
 CODE_NAMES = {"Promise", "Error", "Date", "Map", "Set", "Object", "Array", "Number", "String", "Math", "Blob", "Terminal",
               "Uint", "Content", "Accept", "Range", "Cookie", "Location", "Host", "Origin", "Upgrade", "Connection",
               "None", "True", "False", "Name", "Type", "Value", "Basic", "Bearer", "Authorization", "Escape",
-              "Enter", "Backspace", "Tab", "Delete", "Insert", "Home", "End", "Control", "Shift", "Alt", "Meta"}
+              "Enter", "Backspace", "Tab", "Delete", "Insert", "Home", "End", "Control", "Shift", "Alt", "Meta",
+              "Ahead", "Behind", "Connected", "Unconfigured"}     # DRBD connection states
 
 
 def js_strings(src):

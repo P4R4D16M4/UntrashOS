@@ -11,6 +11,13 @@
   untrash-mesh share NODE JSON        co-op: offer shares to member NODE,
                                       {"Photos": {"mode": "ro"|"rw", "path": "/i-data/..."}}
                                       ({} = offer nothing any more)
+  untrash-mesh mirror-start VOLPATH LABEL NODE
+                                      off-site mirror: ask member NODE to keep a
+                                      copy of the volume at VOLPATH (/i-data/<id>)
+  untrash-mesh mirror-accept ID VOLPATH  keep the copy in a file on VOLPATH
+  untrash-mesh mirror-decline ID | mirror-stop ID
+  untrash-mesh mirror-up DEV VOLPATH  at mount time (untrash-import-zyxel): the
+                                      mirrored device to mount, or {"error"}
   untrash-mesh run                    the daemon (untrash-mesh.service)
 
 Co-op mode: a node offers some of its shares to a member, read-only or
@@ -20,6 +27,17 @@ untrash-mesh.conf, included by smb.conf), and sends the offer with the
 account over the mesh.  The member mounts each offered share (CIFS, SMB3,
 inside WireGuard) at /p-data/<partner>-<share>: a partner volume, on which
 its admin can make shares for its own users like on any volume.
+
+Off-site mirror (extended RAID, RAID 1 over the mesh): DRBD, protocol A
+(asynchronous) with pull-ahead, so local writes never wait for the line;
+DRBD records what changed while the partner was away and sends only that.
+The volume stays byte for byte in its format (stock md/LVM/ext4): DRBD's
+metadata lives in a file on the state (/state/mirror/<id>.meta, a loop
+device).  The partner keeps the copy in a sparse file on a volume it chose
+(<volume>/.untrash-mirror/<id>.img) and is never primary.  The mirror starts
+with the next mount of the volume (untrash-import-zyxel calls mirror-up); if
+DRBD cannot start, the volume is mounted directly and the copy is marked for
+a full resync, so it never silently differs.
 
 Links: WireGuard, interface ut-mesh, UDP 51820.  Every node has an IPv6
 address in the mesh's ULA prefix (fd00::/8 + 40 bits of the mesh id), the
@@ -85,6 +103,9 @@ SMB_INCLUDE = E("ZT_MESH_SMB", os.path.join(_TESTDIR, "smb-mesh.conf") if _TESTD
 PDATA = E("ZT_MESH_PDATA", os.path.join(_TESTDIR, "p-data") if _TESTDIR else "/p-data")
 FAKE_MOUNT = E("ZT_MESH_FAKE_MOUNT")        # PC test: mounts recorded in a JSON file
 FAKE_ACCOUNTS = E("ZT_MESH_FAKE_ACCOUNTS")  # PC test: Samba/Unix accounts recorded
+FAKE_DRBD = E("ZT_MESH_FAKE_DRBD")          # PC test: DRBD, loop devices and sizes in a JSON file
+DRBDADM = "/usr/lib/drbd/drbdadm-84"        # the kernel has DRBD 8.4 (in-tree); drbd-utils 9 ships its tools there
+MIRROR_META = E("ZT_MESH_MIRROR_META", os.path.join(DIR, "mirror") if E("ZT_MESH_DIR") else "/state/mirror")
 HOSTS = E("ZT_MESH_HOSTS", os.path.join(DIR, "hosts") if E("ZT_MESH_DIR") else "/etc/hosts")
 PROTO = 1
 LOCK = threading.RLock()
@@ -512,6 +533,24 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def mirror(self, st):
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)))
+        except ValueError:
+            return self.send_error(400)
+        sender = None
+        for k, m in members(st).items():
+            if address(st["mesh"]["id"], m["pub"]) == self.client_address[0]:
+                sender = k
+        if E("ZT_MESH_ADDRMAP") and req.get("from") in members(st):
+            sender = req["from"]                 # PC test: no WireGuard addresses
+        if not sender or sender == identity()[0] or not mirror_message(sender, req):
+            return self.send_error(403)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
     def offer(self, st):
         """A member offers shares to this node (co-op mode).  The sender is
         the member whose WireGuard address the request came from."""
@@ -546,6 +585,8 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
         st = state()
         if self.path == "/v1/offer" and st.get("mesh"):
             return self.offer(st)
+        if self.path == "/v1/mirror" and st.get("mesh"):
+            return self.mirror(st)
         if self.path != "/v1/sync" or not st.get("mesh"):
             return self.send_error(404)
         src = self.client_address[0]
@@ -784,6 +825,14 @@ def cmd_leave():
         jsave("offers.json", {})
         jsave("partners.json", {})
         smb_render(st)
+        for mid in list(jload("mirrors_in.json", {})):
+            partner_mirror_drop(mid)            # copies for members: of no use outside the mesh
+        jsave("mirrors_in.json", {})
+        outs = jload("mirrors_out.json", {})
+        for o in outs.values():
+            if o["state"] not in ENDED:
+                o.update(state="stopped", sent=True)   # mounted directly from the next start on
+        jsave("mirrors_out.json", outs)
     for mp in sorted(h for h in mounted() if h.startswith(PDATA + "/")):
         unmount(mp)
     jsave("volumes.json", {})
@@ -814,6 +863,7 @@ def status():
            "admin": nid in admins(st.get("roster")), "invites": len(st.get("invites") or {}), "members": []}
     out["offers"] = {n: {k: sh["mode"] for k, sh in o.get("shares", {}).items()} for n, o in jload("offers.json", {}).items()}
     out["partner_volumes"] = [dict(v, path=k) for k, v in sorted(jload("volumes.json", {}).items())]
+    out["mirrors"], out["mirror_copies"] = mirrors_status()
     if st.get("mesh"):
         out["address"] = address(st["mesh"]["id"], pub)
         now = time.time()
@@ -1050,6 +1100,469 @@ def space(mp):
     return out
 
 
+# ------------------------------------------------------------ off-site mirror (DRBD)
+
+def fake_drbd():
+    try:
+        d = json.load(open(FAKE_DRBD))
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("res", {})
+    d.setdefault("loops", {})
+    return d
+
+
+def drbd(*args, res=None, conf=None, input=None):
+    """drbdadm with this resource's own config file; recorded in tests."""
+    if FAKE_DRBD:
+        d = fake_drbd()
+        r = d["res"].setdefault(res, {"role": "Secondary", "cs": "Unconfigured", "ds": "Diskless", "md": False, "log": []})
+        op = args[0]
+        r["log"].append(" ".join(args))
+        if op == "create-md":
+            r["md"] = True
+        elif op in ("attach", "up"):
+            if not r["md"]:
+                json.dump(d, open(FAKE_DRBD, "w"))
+                raise RuntimeError("no metadata")
+            r["ds"] = "UpToDate" if r.get("uptodate") else "Inconsistent"
+            r["cs"] = "StandAlone"
+            if op == "up":
+                r["cs"] = "WFConnection"
+        elif op == "primary":
+            if r["ds"] != "UpToDate" and "--force" not in args:
+                json.dump(d, open(FAKE_DRBD, "w"))
+                raise RuntimeError("cannot be primary without an up-to-date disk")
+            r.update(role="Primary", ds="UpToDate", uptodate=True)
+        elif op == "connect":
+            r["cs"] = "Connected"
+        elif op == "invalidate-remote":
+            r["invalidated"] = r.get("invalidated", 0) + 1
+        elif op == "down":
+            r.update(cs="Unconfigured", ds="Diskless", role="Secondary")
+        json.dump(d, open(FAKE_DRBD, "w"))
+        return ""
+    run(["modprobe", "drbd"], check=False)
+    cmd = [DRBDADM, "-c", conf] + list(args) + ([res] if res else [])
+    r = subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    if r.returncode:
+        raise RuntimeError("%s: %s" % (" ".join(cmd), (r.stderr or r.stdout).strip()[-300:]))
+    return r.stdout
+
+
+def loop_for(fpath):
+    """A loop device for a file (the same one again if it has one)."""
+    if FAKE_DRBD:
+        d = fake_drbd()
+        if fpath not in d["loops"]:
+            d["loops"][fpath] = "/dev/loop-fake%d" % len(d["loops"])
+            json.dump(d, open(FAKE_DRBD, "w"))
+        return d["loops"][fpath]
+    for line in run(["losetup", "-j", fpath], check=False).splitlines():
+        return line.split(":", 1)[0]
+    return run(["losetup", "--find", "--show", fpath]).strip()
+
+
+def blocksize(dev):
+    if FAKE_DRBD:
+        return int(fake_drbd().get("sizes", {}).get(dev, 0))
+    return int(run(["blockdev", "--getsize64", dev]).strip())
+
+
+def drbd_state(res):
+    """{"cs", "role", "ds", "sync"} of a resource (/proc/drbd of DRBD 8.4)."""
+    if FAKE_DRBD:
+        r = fake_drbd()["res"].get(res) or {}
+        return {"cs": r.get("cs", "Unconfigured"), "role": r.get("role"), "ds": r.get("ds"), "sync": r.get("sync")}
+    minor = jload("mirrors_out.json", {}).get(res[3:], {}).get("minor")
+    if minor is None:
+        minor = jload("mirrors_in.json", {}).get(res[3:], {}).get("minor")
+    out = {"cs": "Unconfigured", "role": None, "ds": None, "sync": None}
+    try:
+        lines = open("/proc/drbd").read().splitlines()
+    except OSError:
+        return out
+    for i, l in enumerate(lines):
+        m = re.match(r"\s*(\d+): cs:(\S+) ro:(\S+) ds:(\S+)", l)
+        if m and int(m.group(1)) == minor:
+            out.update(cs=m.group(2), role=m.group(3).split("/")[0], ds=m.group(4))
+            for nxt in lines[i + 1:i + 4]:
+                p = re.search(r"sync'ed:\s*([\d.]+)%", nxt)
+                if p:
+                    out["sync"] = float(p.group(1))
+    return out
+
+
+def free_minor():
+    used = {m.get("minor") for f in ("mirrors_out.json", "mirrors_in.json") for m in jload(f, {}).values()}
+    return next(i for i in range(64) if i not in used)
+
+
+def drbd_conf(mid, me, peer):
+    """Resource config: floating sections keyed by the mesh addresses (they
+    do not change when a host name does)."""
+    os.makedirs(path("drbd"), mode=0o700, exist_ok=True)
+    conf = path("drbd/%s.conf" % mid)
+    def section(x):
+        return ("  floating ipv6 [%s]:%d {\n    device minor %d;\n    disk %s;\n    meta-disk %s;\n  }\n"
+                % (x["addr"], x["port"], x["minor"], x["disk"], x["meta"]))
+    body = ("# Generated by untrash-mesh (off-site mirror); regenerated on every start\n"
+            "resource ut-%s {\n  protocol A;\n"
+            "  disk { on-io-error detach; c-plan-ahead 20; c-max-rate 200M; c-min-rate 2M; }\n"
+            "  net { after-sb-0pri disconnect; after-sb-1pri discard-secondary; after-sb-2pri disconnect;\n"
+            "        on-congestion pull-ahead; congestion-fill 6M; sndbuf-size 8M; ping-timeout 30; }\n"
+            "%s%s}\n") % (mid, section(me), section(peer))
+    with open(os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(body)
+    return conf
+
+
+def meta_file(mid, size):
+    """External DRBD metadata as a file: bitmap (1 bit per 4 KiB) + activity
+    log, rounded up; 4 TB need about 33 MB."""
+    os.makedirs(MIRROR_META, mode=0o700, exist_ok=True)
+    f = os.path.join(MIRROR_META, "%s.meta" % mid)
+    want = (size // 4096 // 8 // (1 << 20) + 2) * (1 << 20)
+    if not os.path.exists(f) or os.path.getsize(f) < want:
+        with open(f, "ab") as fh:
+            fh.truncate(want)
+    return f
+
+
+def mirror_send(kind, node, body):
+    st = state()
+    m = members(st).get(node)
+    if not m:
+        return False
+    url = sync_url(address(st["mesh"]["id"], m["pub"])).replace("/v1/sync", "/v1/mirror")
+    body = dict(body, type=kind, **{"from": identity()[0]})
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode(),
+                                                      headers={"Content-Type": "application/json"}), timeout=8).read()
+        return True
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+ENDED = ("stopped", "partner-stopped", "declined")
+
+
+def vol_device(volpath):
+    """Block device a data volume is mounted from (the one DRBD will sit on)."""
+    if FAKE_DRBD:
+        return fake_drbd().get("mounts", {}).get(volpath)
+    dev = run(["findmnt", "-nro", "SOURCE", "--mountpoint", volpath], check=False).strip()
+    return dev.split("[", 1)[0] or None
+
+
+def is_host_volume(volpath):
+    """The volume holding the running system's slot file (ways B/C): never
+    mirrored, its device is in use before any mirror could sit under it."""
+    host = E("ZT_MESH_HOST_MNT", "/run/untrash/host")
+    try:
+        return os.path.ismount(host) and os.stat(host).st_dev == os.stat(volpath).st_dev
+    except OSError:
+        return False
+
+
+def cmd_mirror_start(volpath, label, node):
+    """Owner: ask NODE to keep a copy of the volume at VOLPATH."""
+    if is_host_volume(volpath):
+        raise SystemExit("the volume of the running system cannot be mirrored")
+    dev = vol_device(volpath)
+    if not dev or dev.startswith("/dev/drbd"):
+        raise SystemExit("this volume is not mounted from a disk")
+    try:
+        size = blocksize(dev)
+    except (RuntimeError, ValueError) as e:
+        raise SystemExit(str(e))
+    if size <= 0:
+        raise SystemExit("this volume is not mounted from a disk")
+    with LOCK:
+        st = state()
+        if not st.get("mesh") or node not in members(st) or node == identity()[0]:
+            raise SystemExit("unknown member")
+        if not re.fullmatch(r"/i-data/[A-Za-z0-9._-]{1,64}", volpath):
+            raise SystemExit("not a data volume")
+        outs = jload("mirrors_out.json", {})
+        if any(o["vol"] == volpath and o["state"] not in ENDED for o in outs.values()):
+            raise SystemExit("this volume is mirrored already")
+        mid = secrets.token_hex(4)
+        minor = free_minor()
+        outs[mid] = {"vol": volpath, "size": int(size), "label": str(label)[:64], "peer": node, "state": "requested",
+                     "minor": minor, "port": 7800 + minor, "sent": False, "created": int(time.time())}
+        jsave("mirrors_out.json", outs)
+    mirror_resend(wait=True)
+    return status()
+
+
+def cmd_mirror_accept(mid, volpath):
+    """Partner: keep the copy in a sparse file on the volume at VOLPATH."""
+    with LOCK:
+        ins = jload("mirrors_in.json", {})
+        m = ins.get(mid)
+        if not m or m["state"] != "pending":
+            raise SystemExit("no such mirror request")
+        if not os.path.isdir(volpath):
+            raise SystemExit("not a volume")
+        try:
+            v = os.statvfs(volpath)
+            if v.f_bavail * v.f_frsize < m["size"]:
+                raise SystemExit("not enough free space on that volume (%d GB needed)" % (m["size"] // 10 ** 9 + 1))
+        except OSError as e:
+            raise SystemExit(str(e))
+        d = os.path.join(volpath, ".untrash-mirror")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        img = os.path.join(d, "%s.img" % mid)
+        with open(img, "ab") as f:
+            f.truncate(m["size"])                 # sparse: takes space only as the copy fills
+        minor = free_minor()
+        m.update(state="active", vol=volpath, file=img, meta=os.path.join(d, "%s.meta" % mid), minor=minor,
+                 port=7800 + minor, sent=False)
+        with open(m["meta"], "ab") as f:
+            f.truncate((m["size"] // 4096 // 8 // (1 << 20) + 2) * (1 << 20))
+        ins[mid] = m
+        jsave("mirrors_in.json", ins)
+    partner_mirror_up(mid)
+    mirror_resend(wait=True)
+    return status()
+
+
+def cmd_mirror_decline(mid):
+    with LOCK:
+        ins = jload("mirrors_in.json", {})
+        if mid not in ins:
+            raise SystemExit("no such mirror request")
+        ins[mid].update(state="declined", sent=False)
+        jsave("mirrors_in.json", ins)
+    mirror_resend(wait=True)
+    return status()
+
+
+def cmd_mirror_stop(mid):
+    """Either side ends a mirror: the owner's volume stays as it is (it is
+    mounted directly from the next start on), the partner drops the copy."""
+    with LOCK:
+        outs, ins = jload("mirrors_out.json", {}), jload("mirrors_in.json", {})
+        if mid in outs:
+            outs[mid].update(state="stopping", sent=False)
+            jsave("mirrors_out.json", outs)
+        elif mid in ins:
+            ins[mid].update(state="stopped", sent=False)
+            jsave("mirrors_in.json", ins)
+            partner_mirror_drop(mid)
+        else:
+            raise SystemExit("no such mirror")
+    mirror_resend(wait=True)
+    return status()
+
+
+def partner_mirror_up(mid):
+    """Partner side: loop devices, config, metadata once, resource up (secondary)."""
+    ins = jload("mirrors_in.json", {})
+    m = ins.get(mid)
+    st = state()
+    if not m or m["state"] != "active" or m.get("from") not in members(st):
+        return
+    peer_m = members(st)[m["from"]]
+    me = {"addr": address(st["mesh"]["id"], identity()[1]), "port": m["port"], "minor": m["minor"],
+          "disk": loop_for(m["file"]), "meta": loop_for(m["meta"])}
+    peer = {"addr": address(st["mesh"]["id"], peer_m["pub"]), "port": m["peer_port"], "minor": m["peer_minor"],
+            "disk": "/dev/untrash-owner", "meta": "/dev/untrash-owner-meta"}
+    conf = drbd_conf(mid, me, peer)
+    res = "ut-" + mid
+    if drbd_state(res)["cs"] != "Unconfigured":
+        return
+    if not m.get("md"):
+        drbd("create-md", "--force", res=res, conf=conf, input="yes\nyes\n")
+        m["md"] = True
+        ins[mid] = m
+        jsave("mirrors_in.json", ins)
+    drbd("up", res=res, conf=conf)
+
+
+def partner_mirror_drop(mid):
+    ins = jload("mirrors_in.json", {})
+    m = ins.get(mid) or {}
+    conf = path("drbd/%s.conf" % mid)
+    try:
+        drbd("down", res="ut-" + mid, conf=conf)
+    except RuntimeError:
+        pass
+    for f in (m.get("file"), m.get("meta")):
+        if f and not FAKE_DRBD:
+            for line in run(["losetup", "-j", f], check=False).splitlines():
+                run(["losetup", "-d", line.split(":", 1)[0]], check=False)
+        if f and os.path.exists(f):
+            os.remove(f)
+
+
+def cmd_mirror_up(dev, volpath):
+    """At mount time: bring the mirror of the volume at VOLPATH up on DEV and
+    return the DRBD device to mount.  Any failure: {"error"} (the caller
+    mounts DEV directly) and the copy is marked for a full resync."""
+    with LOCK:
+        outs = jload("mirrors_out.json", {})
+        for k in [k for k, o in outs.items() if o["vol"] == volpath and o["state"] in ENDED]:
+            del outs[k]                       # ended: from now on the volume is mounted directly
+            for f in (os.path.join(MIRROR_META, "%s.meta" % k), path("drbd/%s.conf" % k)):
+                if os.path.exists(f):
+                    os.remove(f)
+        jsave("mirrors_out.json", outs)
+    hit = [(k, o) for k, o in outs.items() if o["vol"] == volpath and o["state"] == "accepted"]
+    if not hit:
+        return {"device": None}
+    mid, o = hit[0]
+    try:
+        st = state()
+        peer_m = members(st)[o["peer"]]
+        size = blocksize(dev)
+        if size != o["size"]:
+            raise RuntimeError("volume size changed (%d -> %d): stop and start the mirror again" % (o["size"], size))
+        me = {"addr": address(st["mesh"]["id"], identity()[1]), "port": o["port"], "minor": o["minor"], "disk": dev,
+              "meta": loop_for(meta_file(mid, size))}
+        peer = {"addr": address(st["mesh"]["id"], peer_m["pub"]), "port": o["peer_port"], "minor": o["peer_minor"],
+                "disk": "/dev/untrash-copy", "meta": "/dev/untrash-copy-meta"}
+        conf = drbd_conf(mid, me, peer)
+        res = "ut-" + mid
+        first = not o.get("md")
+        if first:
+            drbd("create-md", "--force", res=res, conf=conf, input="yes\nyes\n")
+        if drbd_state(res)["cs"] == "Unconfigured":
+            drbd("up", res=res, conf=conf)     # waits for the partner by itself
+        drbd("primary", *(["--force"] if first else []), res=res, conf=conf)
+    except (RuntimeError, KeyError, OSError, subprocess.TimeoutExpired) as e:
+        with LOCK:
+            outs = jload("mirrors_out.json", {})
+            if mid in outs:
+                outs[mid].update(bypassed=True, error=str(e)[:300])
+                jsave("mirrors_out.json", outs)
+        return {"error": "mirror not started: %s" % e}
+    with LOCK:
+        outs = jload("mirrors_out.json", {})
+        outs[mid].update(md=True, error=None, attached=int(time.time()))
+        jsave("mirrors_out.json", outs)
+    return {"device": "/dev/drbd%d" % o["minor"]}
+
+
+def mirror_resend(wait=False):
+    """Requests, answers and stops not yet acknowledged go to the other side."""
+    jobs = []
+    for mid, o in jload("mirrors_out.json", {}).items():
+        if not o.get("sent"):
+            kind = "stop" if o["state"] == "stopping" else "request" if o["state"] == "requested" else None
+            if kind:
+                jobs.append(("out", mid, o["peer"], kind, {"id": mid, "size": o["size"], "label": o["label"],
+                                                          "port": o["port"], "minor": o["minor"]}))
+    for mid, m in jload("mirrors_in.json", {}).items():
+        if not m.get("sent"):
+            kind = {"active": "accept", "declined": "decline", "stopped": "stop"}.get(m["state"])
+            if kind:
+                jobs.append(("in", mid, m["from"], kind, {"id": mid, "port": m.get("port"), "minor": m.get("minor")}))
+    def go(side, mid, node, kind, body):
+        if mirror_send(kind, node, body):
+            with LOCK:
+                f = "mirrors_out.json" if side == "out" else "mirrors_in.json"
+                d = jload(f, {})
+                if mid in d:
+                    if side == "in" and kind in ("stop", "decline"):
+                        del d[mid]           # the owner has it; nothing left to keep here
+                    elif kind == "stop":
+                        d[mid].update(state="stopped", sent=True)   # removed at the next mount
+                    else:
+                        d[mid]["sent"] = True
+                    jsave(f, d)
+    threads = [threading.Thread(target=go, args=j, daemon=True) for j in jobs]
+    for t in threads:
+        t.start()
+    if wait:
+        for t in threads:
+            t.join(15)
+
+
+def mirror_message(sender, req):
+    """A mirror message from member SENDER (over its WireGuard address)."""
+    kind, mid = req.get("type"), str(req.get("id", ""))
+    if not re.fullmatch(r"[0-9a-f]{8}", mid):
+        return False
+    with LOCK:
+        if kind == "request":
+            ins = jload("mirrors_in.json", {})
+            if mid not in ins:
+                ins[mid] = {"from": sender, "size": int(req.get("size", 0)), "label": str(req.get("label", ""))[:64],
+                            "peer_port": int(req.get("port", 0)), "peer_minor": int(req.get("minor", 0)),
+                            "state": "pending", "sent": True, "t": int(time.time())}
+                jsave("mirrors_in.json", ins)
+        elif kind in ("accept", "decline"):
+            outs = jload("mirrors_out.json", {})
+            o = outs.get(mid)
+            if o and o["peer"] == sender and o["state"] == "requested":
+                if kind == "accept":
+                    o.update(state="accepted", peer_port=int(req.get("port", 0)), peer_minor=int(req.get("minor", 0)))
+                else:
+                    o["state"] = "declined"
+                jsave("mirrors_out.json", outs)
+        elif kind == "stop":
+            outs, ins = jload("mirrors_out.json", {}), jload("mirrors_in.json", {})
+            if mid in outs and outs[mid]["peer"] == sender:
+                outs[mid].update(state="partner-stopped")
+                jsave("mirrors_out.json", outs)
+            if mid in ins and ins[mid]["from"] == sender:
+                partner_mirror_drop(mid)
+                del ins[mid]
+                jsave("mirrors_in.json", ins)
+        else:
+            return False
+    return True
+
+
+def mirrors_tick(st):
+    """Daemon: partner copies up; the owner's attached mirrors connected once
+    the mesh is up; a bypassed copy gets a full resync; members that left take
+    their mirrors with them."""
+    for mid, m in list(jload("mirrors_in.json", {}).items()):
+        if m.get("from") not in members(st):
+            partner_mirror_drop(mid)
+            ins = jload("mirrors_in.json", {})
+            ins.pop(mid, None)
+            jsave("mirrors_in.json", ins)
+        elif m["state"] == "active":
+            try:
+                partner_mirror_up(mid)
+            except RuntimeError as e:
+                log("mirror copy %s: %s" % (mid, e))
+    with LOCK:
+        outs = jload("mirrors_out.json", {})
+        gone = [k for k, o in outs.items() if o["peer"] not in members(st) and o["state"] not in ENDED]
+        for k in gone:
+            outs[k].update(state="partner-stopped", sent=True)   # the partner left the mesh
+        if gone:
+            jsave("mirrors_out.json", outs)
+    for mid, o in outs.items():
+        res, conf = "ut-" + mid, path("drbd/%s.conf" % mid)
+        if o["state"] == "accepted" and o.get("attached"):
+            stt = drbd_state(res)
+            try:
+                if stt["cs"] == "StandAlone":
+                    drbd("connect", res=res, conf=conf)
+                if o.get("bypassed") and drbd_state(res)["cs"] == "Connected":
+                    drbd("invalidate-remote", res=res, conf=conf)      # full resync: writes went past DRBD
+                    with LOCK:
+                        d = jload("mirrors_out.json", {})
+                        d[mid]["bypassed"] = False
+                        jsave("mirrors_out.json", d)
+            except RuntimeError as e:
+                log("mirror %s: %s" % (mid, e))
+    mirror_resend()
+
+
+def mirrors_status():
+    outs = [dict(o, id=k, live=drbd_state("ut-" + k)) for k, o in jload("mirrors_out.json", {}).items()]
+    ins = [dict({x: m.get(x) for x in ("from", "size", "label", "state", "vol", "t")}, id=k, live=drbd_state("ut-" + k))
+           for k, m in jload("mirrors_in.json", {}).items()]
+    return outs, ins
+
+
 # ------------------------------------------------------------ daemon
 
 def serve(handler, host, port):
@@ -1087,6 +1600,7 @@ def cmd_run():
             smb_render(st)
             send_offers()
             partner_volumes(st)
+            mirrors_tick(st)
             if not sync_srv:
                 host = "127.0.0.1" if E("ZT_MESH_ADDRMAP") else address(st["mesh"]["id"], pub)
                 try:
@@ -1157,6 +1671,16 @@ def main():
             out = cmd_rename(a[1])
         elif a[:1] == ["share"] and len(a) == 3:
             out = cmd_share(a[1], a[2])
+        elif a[:1] == ["mirror-start"] and len(a) == 4:
+            out = cmd_mirror_start(a[1], a[2], a[3])
+        elif a[:1] == ["mirror-accept"] and len(a) == 3:
+            out = cmd_mirror_accept(a[1], a[2])
+        elif a[:1] == ["mirror-decline"] and len(a) == 2:
+            out = cmd_mirror_decline(a[1])
+        elif a[:1] == ["mirror-stop"] and len(a) == 2:
+            out = cmd_mirror_stop(a[1])
+        elif a[:1] == ["mirror-up"] and len(a) == 3:
+            out = cmd_mirror_up(a[1], a[2])
         elif a == ["run"]:
             return cmd_run()
         else:

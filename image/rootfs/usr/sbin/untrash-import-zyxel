@@ -311,6 +311,27 @@ def ensure_idata():
             run(["mount", "-t", "tmpfs", "-o", "mode=0755,size=1m", "tmpfs", root])
 
 
+MESH_TOOL = os.environ.get("ZT_MESH_TOOL", "/usr/lib/untrash/untrash-mesh")
+
+
+def mirror_device(dev, mnt):
+    """UntrashMesh off-site mirror: the DRBD device to mount instead of DEV,
+    or DEV itself (no mirror, or the mirror did not start: then untrash-mesh
+    has marked the copy for a full resync)."""
+    if os.path.dirname(mnt) != INTERN_ROOT or not os.access(MESH_TOOL, os.X_OK):
+        return dev
+    try:
+        r = run([MESH_TOOL, "mirror-up", dev, "/i-data/" + os.path.basename(mnt)], check=False, timeout=180)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except subprocess.TimeoutExpired:
+        out = {"error": "untrash-mesh mirror-up timed out"}
+    except (ValueError, IndexError):
+        out = {"error": r.stdout.strip()[-200:]}
+    if out.get("error"):
+        log("WARN %s: %s; mounted directly" % (mnt, out["error"]))
+    return out.get("device") or dev
+
+
 def mount_volume(dev, mnt, rw):
     if is_mountpoint(mnt):
         return "already"
@@ -325,6 +346,7 @@ def mount_volume(dev, mnt, rw):
         run(["mount", "-o", "remount,bind,ro", mnt])
         return "host-ro"
     if rw:
+        dev = mirror_device(dev, mnt)
         r = run(["e2fsck", "-p", dev], check=False)
         if r.returncode >= 4:
             log("WARN %s needs a manual e2fsck (rc %d), mounting read-only" % (dev, r.returncode))

@@ -1166,6 +1166,44 @@ VIEWS.manual = async b => {
     <a class="ut-btn ut-btn--sm ut-btn--primary" href="/manual/UntrashOS-User-Guide.pdf" download>Download PDF</a></div>
     <iframe src="/manual/" title="User guide"></iframe></div>`;
 };
+const MIRROR_ENDED = ['stopped', 'partner-stopped', 'declined'];
+const memberName = (m, node) => (m.members.find(x => x.node === node) || {}).name || node.slice(0, 8);
+/* DRBD state as words: live = {cs, role, ds, sync} from untrash-mesh */
+function mirrorState(o) {
+  const l = o.live || {}, ds = String(l.ds || ''), t = s => esc(UTI18N.tr(s));
+  if (o.state === 'requested') return ['', t("waiting for the partner's consent")];
+  if (o.state === 'declined') return ['ut-pill--danger', t('declined by the partner')];
+  if (o.state === 'partner-stopped') return ['ut-pill--danger', t('ended by the partner')];
+  if (o.state === 'stopping' || o.state === 'stopped') return ['', t('ends at the next restart')];
+  if (o.bypassed) return ['ut-pill--warn', t('needs a full resync')];
+  if (!l.cs || l.cs === 'Unconfigured') return ['', t('starts at the next restart')];
+  if (/^Sync|^PausedSync/.test(l.cs)) return ['ut-pill--warn', t('copying') + (l.sync != null ? ' ' + l.sync.toFixed(1) + ' %' : '')];
+  if (l.cs === 'Ahead' || l.cs === 'Behind') return ['ut-pill--warn', t('catching up')];
+  if (l.cs === 'Connected' && /^UpToDate\/UpToDate$|^UpToDate$/.test(ds)) return ['ut-pill--ok', t('in sync')];
+  if (l.cs === 'Connected') return ['ut-pill--warn', esc(ds)];
+  return ['ut-pill--warn', t('partner not reachable, changes are kept')];
+}
+function copyState(c) {
+  const l = c.live || {}, t = s => esc(UTI18N.tr(s));
+  if (c.state === 'pending') return ['ut-pill--warn', t('asks for your consent')];
+  if (/^Sync/.test(l.cs || '')) return ['ut-pill--warn', t('receiving') + (l.sync != null ? ' ' + l.sync.toFixed(1) + ' %' : '')];
+  if (l.cs === 'Connected') return ['ut-pill--ok', t('in sync')];
+  return ['', t('waiting for the owner')];
+}
+function mirrorRows(m) {
+  const outs = (m.mirrors || []).map(o => { const [cls, txt] = mirrorState(o);
+    return `<tr><td><b translate="no">${esc(o.label)}</b> → <span translate="no">${esc(memberName(m, o.peer))}</span><div class="ut-faint mono" translate="no">${esc(o.vol)} · ${gb(o.size)}</div>${o.error ? `<div class="ut-faint">${esc(o.error)}</div>` : ''}</td>
+      <td><span class="ut-pill ${cls}">${txt}</span></td>
+      <td class="ut-rowbtns">${MIRROR_ENDED.includes(o.state) || o.state === 'stopping' ? '' : `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-mmstop="${esc(o.id)}" data-side="out">End</button>`}</td></tr>`; });
+  const ins = (m.mirror_copies || []).map(c => { const [cls, txt] = copyState(c);
+    return `<tr><td><span class="ut-faint">${esc(UTI18N.tr('Copy for'))}</span> <b translate="no">${esc(memberName(m, c.from))}</b>: <span translate="no">${esc(c.label)}</span><div class="ut-faint mono" translate="no">${c.vol ? esc(c.vol) + ' · ' : ''}${gb(c.size)}</div></td>
+      <td><span class="ut-pill ${cls}">${txt}</span></td>
+      <td class="ut-rowbtns">${c.state === 'pending' ? `<button class="ut-btn ut-btn--sm ut-btn--primary" data-mmacc="${esc(c.id)}">Agree…</button> <button class="ut-btn ut-btn--sm ut-btn--ghost" data-mmdec="${esc(c.id)}">Decline</button>`
+        : `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-mmstop="${esc(c.id)}" data-side="in">End</button>`}</td></tr>`; });
+  return outs.length || ins.length ? `<div class="ut-table-wrap"><table class="ut-table"><tbody>${outs.join('')}${ins.join('')}</tbody></table></div>`
+    : '<p class="ut-faint">A member can keep a complete copy of a volume of this NAS, so its data survives a fire or a theft here.</p>';
+}
+
 VIEWS.mesh = async b => {
   const m = await api('mesh'), ago = t => t ? esc(new Date(t * 1000).toLocaleString(UTI18N.locale)) : '–';
   const me = `<div class="ut-card"><div class="ut-card__head"><h3>This NAS</h3><span class="ut-spacer"></span>
@@ -1200,6 +1238,8 @@ VIEWS.mesh = async b => {
       ${me}
       <div class="ut-section-title">Members</div>
       <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Role</th><th>State</th><th>Last contact</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="row ut-section-title"><span>Off-site mirrors</span><span class="ut-spacer"></span>${m.members.length > 1 ? '<button class="ut-btn ut-btn--sm" id="mmirror">Mirror a volume…</button>' : ''}</div>
+      ${mirrorRows(m)}
       <div class="ut-section-title">Partner volumes</div>
       ${pvs ? `<div class="ut-table-wrap"><table class="ut-table"><tbody>${pvs}</tbody></table></div><p class="ut-faint">Partner volumes appear under Storage; under Shares you can make shares on them for your own users.</p>`
         : '<p class="ut-faint">No member shares anything with this NAS yet. A member offers shares with Share… in its own Desk.</p>'}
@@ -1225,6 +1265,31 @@ VIEWS.mesh = async b => {
         onOk: async dd => { const shares = {}; $$('[data-msh]', dd).forEach(e => { if (e.value) shares[e.dataset.msh] = e.value; });
           await api('mesh/share', { node: x.dataset.mshare, shares }); render('mesh'); } });
     });
+    const mm = $('#mmirror', b);
+    if (mm) mm.onclick = async () => {
+      const vols = (await api('storage')).volumes.filter(v => v.kind === 'intern' && !v.host && !(m.mirrors || []).some(o => o.vol === v.path && !MIRROR_ENDED.includes(o.state)));
+      if (!vols.length) return toast('No volume to mirror', 'Every data volume is mirrored already, or only the volume of the running system is left.');
+      dialog({ title: 'Mirror a volume', ok: 'Ask the partner',
+        body: `<p>A member keeps a complete copy of the volume (RAID 1 over UntrashMesh). Its admin must agree and choose where the copy goes; it needs as much free space as the volume is large.</p>
+          <label class="ut-field"><span class="ut-label">Volume</span><select class="ut-select" id="mmv">${vols.map(v => `<option value="${esc(v.id)}" translate="no">${esc(v.label)} (${gb(v.size)})</option>`).join('')}</select></label>
+          <label class="ut-field"><span class="ut-label">Partner</span><select class="ut-select" id="mmn">${m.members.filter(x => !x.self && x.kind !== 'app').map(x => `<option value="${esc(x.node)}" translate="no">${esc(x.name)}</option>`).join('')}</select></label>
+          <p class="ut-faint">The mirror starts with the next restart of this NAS. Writes go to the volume first and to the partner as fast as the line allows; while the partner is not reachable, the changes are kept and sent later. The volume of the running system cannot be mirrored.</p>`,
+        onOk: d => save('mesh/mirror-start', { volume: $('#mmv', d).value, node: $('#mmn', d).value }, 'mesh') });
+    };
+    $$('[data-mmacc]', b).forEach(x => x.onclick = async () => {
+      const c = (m.mirror_copies || []).find(c => c.id === x.dataset.mmacc);
+      const vols = (await api('storage')).volumes.filter(v => v.kind === 'intern' && v.free > c.size);
+      if (!vols.length) return toast('Not enough space', UTI18N.tr('No volume has %s free.').replace('%s', gb(c.size)));
+      dialog({ title: 'Keep a mirror copy', ok: 'Agree',
+        body: `<p><b translate="no">${esc(memberName(m, c.from))}</b> asks this NAS to keep a copy of its volume <b translate="no">${esc(c.label)}</b> (${gb(c.size)}). The copy is a file that grows as it fills; it does not appear here as a volume or share. It is not encrypted: anyone with administrator access to this NAS could read it.</p>
+          <label class="ut-field"><span class="ut-label">Keep it on</span><select class="ut-select" id="mmt">${vols.map(v => `<option value="${esc(v.id)}" translate="no">${esc(v.label)} (${gb(v.free)} ${esc(UTI18N.tr('free'))})</option>`).join('')}</select></label>`,
+        onOk: d => save('mesh/mirror-accept', { id: c.id, volume: $('#mmt', d).value }, 'mesh') });
+    });
+    $$('[data-mmdec]', b).forEach(x => x.onclick = () => save('mesh/mirror-decline', { id: x.dataset.mmdec }, 'mesh'));
+    $$('[data-mmstop]', b).forEach(x => x.onclick = () => dialog({ kind: 'danger', title: 'End the mirror?', ok: 'End the mirror', okCls: 'ut-btn--danger',
+      body: x.dataset.side === 'out' ? '<p>The volume stays as it is; from the next restart on it is mounted without the mirror. The partner deletes its copy.</p>'
+        : '<p>The copy on this NAS is deleted. The owner keeps its volume and is told that the mirror ended.</p>',
+      onOk: () => save('mesh/mirror-stop', { id: x.dataset.mmstop }, 'mesh') }));
     $$('[data-mrm]', b).forEach(x => x.onclick = () => dialog({ kind: 'danger', title: UTI18N.tr('Remove %s from the mesh?').replace('%s', x.dataset.mname), ok: 'Remove', okCls: 'ut-btn--danger',
       body: '<p>It loses its connection to every member. To come back it needs a new invitation.</p>', onOk: () => save('mesh/remove', { node: x.dataset.mrm }, 'mesh') }));
     $('#mleave', b).onclick = () => dialog({ kind: 'danger', title: 'Leave the mesh?', ok: 'Leave', okCls: 'ut-btn--danger',

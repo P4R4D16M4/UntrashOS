@@ -175,7 +175,7 @@ printf '\nactivation {\n\tauto_activation_volume_list = []\n}\n' >>"$W/root/etc/
 rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{smbd,nmbd,samba-ad-dc}.service
 # stock services start only as the settings say (untrash-config enables them;
 # the installer stick runs none of them)
-rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{vsftpd,minidlna,nfs-server,hd-idle,quotarpc,rpcbind,nbd-server}.service
+rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{vsftpd,minidlna,nfs-server,hd-idle,quotarpc,rpcbind,nbd-server,drbd}.service
 rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/nfs-client.target "$W"/root/etc/systemd/system/remote-fs.target.wants/nfs-client.target
 rm -f "$W"/root/etc/systemd/system/sockets.target.wants/rpcbind.socket
 [[ $PROFILE == dev ]] || rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/ssh.service "$W"/root/etc/systemd/system/sockets.target.wants/ssh.socket
