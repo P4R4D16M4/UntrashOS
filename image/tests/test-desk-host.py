@@ -89,7 +89,15 @@ def build_root(w, fresh=False):
 
 
 def env_for(r, stick, port):
+    sig = os.path.join(r, "zt-sig")           # untrash-mesh signs with the PC build of slot/zt-sig.c
+    if not os.path.exists(sig):
+        osr = os.path.abspath(os.path.join(HERE, "..", ".."))
+        subprocess.run(["gcc", "-O2", "-I" + osr + "/third_party/tweetnacl", "-o", sig, osr + "/slot/zt-sig.c",
+                        osr + "/third_party/tweetnacl/tweetnacl.c"], check=True)
     return dict(os.environ, ZT_DESK_TEST="1", ZT_DESK_ROOT=r, ZT_DESK_PORT=str(port), ZT_DESK_BIND="127.0.0.1",
+                ZT_MESH_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-mesh"), ZT_MESH_DIR=r + "/etc/untrash/mesh", ZT_SIG=sig,
+                ZT_MESH_FAKE_WG=r + "/mesh-wg.json", ZT_MESH_HOSTS=r + "/hosts",
+                ZT_MESH_ENDPOINTS="192.168.1.20:51820", ZT_MESH_JOIN_HOST="127.0.0.1",
                 ZT_DESK_TESTPW=PW, ZT_DESK_STICK=stick,
                 ZT_IMPORT_TOOL=os.path.join(FILES, "usr/sbin/untrash-import-zyxel"),
                 ZT_CONFIG_TOOL=os.path.join(FILES, "usr/sbin/untrash-config"),
@@ -479,6 +487,22 @@ def main():
             check("prefs of admin untouched", a.req("/api/me")[1]["prefs"]["theme"] == "dark")
             check("prefs: unknown value refused", u.req("/api/prefs", {"theme": "neon"})[0] == 400 and u.req("/api/prefs", {"font": "x"})[0] == 400)
             check("prefs: anonymous refused", Client(port).req("/api/prefs", {"theme": "light"})[0] == 401)
+            # UntrashMesh (untrash-mesh: test-mesh-host.py has the network part)
+            st, mj = a.req("/api/mesh")
+            check("mesh: status without a mesh", st == 200 and mj["mesh"] is None and len(mj["node"]) == 16)
+            check("mesh: users get 403", u.req("/api/mesh")[0] == 403 and u.req("/api/mesh/create", {"name": "x"})[0] == 403)
+            check("mesh: bad name refused", a.req("/api/mesh/create", {"name": "<script>"})[0] == 400)
+            st, mj = a.req("/api/mesh/create", {"name": "home"})
+            check("mesh: created, this NAS is admin with a mesh address", st == 200 and mj["mesh"]["name"] == "home" and mj["admin"] and mj["address"].startswith("fd"))
+            st, ij = a.req("/api/mesh/invite", {"hours": 24})
+            check("mesh: invitation text", st == 200 and len(ij["invitation"]) > 40)
+            check("mesh: bad invitation hours refused", a.req("/api/mesh/invite", {"hours": 999})[0] == 400)
+            check("mesh: join while in a mesh refused", a.req("/api/mesh/join", {"invitation": ij["invitation"]})[0] == 400)
+            check("mesh: not an invitation refused", a.req("/api/mesh/join", {"invitation": "x y z"})[0] == 400)
+            st, mj = a.req("/api/mesh/rename", {"name": "keller"})
+            check("mesh: renamed", st == 200 and mj["name"] == "keller")
+            st, mj = a.req("/api/mesh/leave", {})
+            check("mesh: left", st == 200 and mj["mesh"] is None)
             # updates: settings, check, the downloaded release, downgrade guard (untrash-update: test-update-host.py)
             def utslot(ver):
                 head = os.urandom(4096)

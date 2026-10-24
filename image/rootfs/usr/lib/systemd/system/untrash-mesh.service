@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashMesh: WireGuard links, roster and address book of the mesh
+ConditionKernelCommandLine=!untrash.installer=1
+After=network-online.target untrash-settings.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-mesh run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

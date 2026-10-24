@@ -134,7 +134,7 @@ mkdir -p "$W/root/etc/systemd/system/multi-user.target.wants"
 ln -sf /usr/lib/systemd/system/untrash-takeover-firstboot.service "$W/root/etc/systemd/system/multi-user.target.wants/"
 # Untrash Desk (port 80, not on the installer stick), way A data partition, SSH host keys,
 # service SSH key from the stick
-for u in untrash-desk untrash-data untrash-ssh-hostkeys untrash-copybtn untrash-servicekey untrash-adblock untrash-netname; do
+for u in untrash-desk untrash-data untrash-ssh-hostkeys untrash-copybtn untrash-servicekey untrash-adblock untrash-netname untrash-mesh; do
 	ln -sf /usr/lib/systemd/system/$u.service "$W/root/etc/systemd/system/multi-user.target.wants/"
 done
 # services of the stock features run only when untrash-config switches them on (settings),
@@ -175,7 +175,7 @@ printf '\nactivation {\n\tauto_activation_volume_list = []\n}\n' >>"$W/root/etc/
 rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{smbd,nmbd,samba-ad-dc}.service
 # stock services start only as the settings say (untrash-config enables them;
 # the installer stick runs none of them)
-rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{vsftpd,minidlna,nfs-server,hd-idle,quotarpc,rpcbind}.service
+rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{vsftpd,minidlna,nfs-server,hd-idle,quotarpc,rpcbind,nbd-server}.service
 rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/nfs-client.target "$W"/root/etc/systemd/system/remote-fs.target.wants/nfs-client.target
 rm -f "$W"/root/etc/systemd/system/sockets.target.wants/rpcbind.socket
 [[ $PROFILE == dev ]] || rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/ssh.service "$W"/root/etc/systemd/system/sockets.target.wants/ssh.socket

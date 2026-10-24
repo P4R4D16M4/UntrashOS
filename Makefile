@@ -37,3 +37,4 @@ test-run:
 	python3 image/tests/test-sound-host.py
 	@if command -v node >/dev/null; then node image/tests/test_sound_render.js; else echo "skip sound editor renderer (needs node)"; fi
 	python3 image/tests/test-update-host.py
+	python3 image/tests/test-mesh-host.py

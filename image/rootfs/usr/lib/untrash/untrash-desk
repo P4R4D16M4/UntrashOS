@@ -285,6 +285,54 @@ def user_delete(req):
     return {}
 
 
+# ------------------------------------------------------------ UntrashMesh
+
+MESH_TOOL = os.environ.get("ZT_MESH_TOOL", "/usr/lib/untrash/untrash-mesh")
+
+
+def mesh_run(*args):
+    """untrash-mesh prints one JSON object; {"error": ...} becomes a Fail."""
+    r = subprocess.run([MESH_TOOL] + [str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+    try:
+        out = json.loads((r.stdout.strip().splitlines() or ["{}"])[-1])
+    except ValueError:
+        raise Fail("UntrashMesh: %s" % (r.stderr.strip()[-200:] or "no answer"))
+    if out.get("error"):
+        raise Fail(out["error"])
+    return out
+
+
+def mesh_name(v, what="Name"):
+    v = str(v or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", v):
+        raise Fail("%s: letters, digits, space . _ - (up to 40 characters)." % what)
+    return v
+
+
+def mesh_post(op, req):
+    if op == "create":
+        return mesh_run("create", mesh_name(req.get("name")))
+    if op == "invite":
+        h = int(req.get("hours") or 24)
+        if not 1 <= h <= 168:
+            raise Fail("Valid for 1 to 168 hours.")
+        return mesh_run("invite", h)
+    if op == "join":
+        inv = re.sub(r"\s+", "", str(req.get("invitation") or ""))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,4000}", inv):
+            raise Fail("This is not an UntrashMesh invitation.")
+        return mesh_run("join", inv)
+    if op == "remove":
+        if not re.fullmatch(r"[0-9a-f]{16}", str(req.get("node") or "")):
+            raise Fail("Unknown member.")
+        return mesh_run("remove", req["node"])
+    if op == "leave":
+        return mesh_run("leave")
+    if op == "rename":
+        return mesh_run("rename", mesh_name(req.get("name"), "Name in the mesh"))
+    raise Fail("Unknown.", 404)
+
+
 # ------------------------------------------------------------ appearance per user
 
 PREFS_DIR = R + "/etc/untrash/prefs"
@@ -2579,7 +2627,7 @@ def static(base, rel):
     return (open(full, "rb").read(), t) if t else None
 
 
-ADMIN_GET = {"/api/adblock", "/api/adblock/log", "/api/overview", "/api/live", "/api/activity", "/api/sound", "/api/volumes/dirs", "/api/feedback/info", "/api/storage", "/api/users", "/api/settings", "/api/logs", "/api/update", "/api/stock",
+ADMIN_GET = {"/api/mesh", "/api/adblock", "/api/adblock/log", "/api/overview", "/api/live", "/api/activity", "/api/sound", "/api/volumes/dirs", "/api/feedback/info", "/api/storage", "/api/users", "/api/settings", "/api/logs", "/api/update", "/api/stock",
              "/api/timezones", "/api/raid", "/api/printers", "/api/cloud", "/api/downloads", "/api/copybtn", "/api/backup", "/api/users/quota", "/api/cert", "/api/upnp", "/api/iscsi", "/api/power/next",
              "/api/backup/versions"}
 ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete,
@@ -2587,6 +2635,9 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/groups/members": group_set_members, "/api/shares/save": share_save,
               "/api/shares/delete": share_delete, "/api/settings": settings_update, "/api/power": power,
               "/api/update/install": update_install,
+              "/api/mesh/create": lambda req: mesh_post("create", req), "/api/mesh/invite": lambda req: mesh_post("invite", req),
+              "/api/mesh/join": lambda req: mesh_post("join", req), "/api/mesh/remove": lambda req: mesh_post("remove", req),
+              "/api/mesh/leave": lambda req: mesh_post("leave", req), "/api/mesh/rename": lambda req: mesh_post("rename", req),
               "/api/update/check": lambda req: update_run(["check", "--manual"]),
               "/api/update/download": lambda req: update_run(["download"]),
               "/api/update/settings": update_settings, "/api/stock/rollback": stock_rollback, "/api/raid/job": raid_job,
@@ -2834,6 +2885,8 @@ class Handler(BaseHTTPRequestHandler):
                 st = stock_backup()
                 return self.reply(200, {"stick": bool(st), "run": st and {k: st["run"][k] for k in ("name", "verified")},
                                         "markers": st and st["markers"]})
+            if p == "/api/mesh":
+                return self.reply(200, mesh_run("status"))
             if p == "/api/timezones":
                 zi = (R + "/usr/share/zoneinfo") if TEST else "/usr/share/zoneinfo"
                 tz = sorted(os.path.relpath(f, zi) for f in glob.glob(zi + "/*/*")

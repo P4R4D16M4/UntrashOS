@@ -1,0 +1,884 @@
+#!/usr/bin/python3
+"""untrash-mesh - UntrashMesh: UntrashOS devices in one encrypted network.
+
+  untrash-mesh status                 JSON: this node, mesh, members, address book
+  untrash-mesh create NAME            start a mesh with this node as its admin
+  untrash-mesh invite [HOURS]         one-time invitation (text for the other device)
+  untrash-mesh join INVITATION        join the mesh of an invitation
+  untrash-mesh remove NODE            take a member out (admins)
+  untrash-mesh leave                  leave the mesh (keys stay, peers are dropped)
+  untrash-mesh rename NAME            name of this node in the mesh
+  untrash-mesh run                    the daemon (untrash-mesh.service)
+
+Links: WireGuard, interface ut-mesh, UDP 51820.  Every node has an IPv6
+address in the mesh's ULA prefix (fd00::/8 + 40 bits of the mesh id), the
+host part from its signing key; <name>.mesh resolves on every member
+(/etc/hosts block).
+
+Trust: a node is its Ed25519 key (slot/zt-sig.c, the same signatures as the
+slot images).  The roster (who is in the mesh, with which WireGuard key) is
+signed by an admin; the highest roster seq signed by an admin of the current
+roster wins.
+
+Address book (no static IP, no DNS needed): every node signs its own
+record {endpoints, seq, time}.  When an endpoint changes it raises seq and
+pushes the record to every member; every node keeps the newest valid record
+per member and forwards records it had not seen, so a change also reaches
+nodes the changed node could not reach itself.  A node learns its public
+endpoint from its peers: each sync answer says from where the peer saw the
+request arrive (WireGuard's endpoint of that peer).  WireGuard roaming does
+the rest: a packet from a new address updates the endpoint at once.
+
+Sync: HTTP JSON on the mesh address, port 7340, only from mesh addresses of
+members (WireGuard guarantees the source address of a peer).  Join: HTTP on
+port 7341, open only while an invitation is pending, every message bound to
+the invitation's one-time secret (HMAC-SHA256).
+
+State: /etc/untrash/mesh/ (node.sec/.pub, wg.key, mesh.json, book.json).
+Test hooks: ZT_MESH_DIR, ZT_MESH_FAKE_WG (no ip/wg; peers in a JSON file),
+ZT_MESH_ADDRMAP (JSON mesh address -> host:port for sync), ZT_MESH_JOIN_HOST,
+ZT_MESH_SYNC_PORT, ZT_MESH_JOIN_PORT, ZT_MESH_ENDPOINTS (own endpoints),
+ZT_SIG.
+"""
+import base64
+import hashlib
+import hmac
+import http.server
+import ipaddress
+import json
+import os
+import random
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+E = os.environ.get
+DIR = E("ZT_MESH_DIR", "/etc/untrash/mesh")
+ZT_SIG = E("ZT_SIG", "/usr/lib/untrash/zt-sig")
+FAKE_WG = E("ZT_MESH_FAKE_WG")
+WG_PORT = 51820
+SYNC_PORT = int(E("ZT_MESH_SYNC_PORT", "7340"))
+JOIN_PORT = int(E("ZT_MESH_JOIN_PORT", "7341"))
+IFACE = "ut-mesh"
+HOSTS = E("ZT_MESH_HOSTS", "/etc/hosts")
+PROTO = 1
+LOCK = threading.RLock()
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+
+
+def log(msg):
+    print("untrash-mesh: " + msg, flush=True)
+
+
+def path(name):
+    return os.path.join(DIR, name)
+
+
+def jload(name, default):
+    try:
+        with open(path(name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def jsave(name, data):
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    tmp = path(name) + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, path(name))
+
+
+def canon(obj):
+    return json.dumps({k: v for k, v in obj.items() if k != "sig"}, sort_keys=True, separators=(",", ":")).encode()
+
+
+def run(cmd, check=True):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if check and r.returncode:
+        raise RuntimeError("%s: %s" % (" ".join(cmd), r.stderr.strip() or r.returncode))
+    return r.stdout
+
+
+# ------------------------------------------------------------ identity
+
+def identity():
+    """(node id, signing public key hex, WireGuard public key); made once."""
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    if not os.path.exists(path("node.sec")):
+        run([ZT_SIG, "keygen", path("node.sec"), path("node.pub")])
+        os.chmod(path("node.sec"), 0o600)
+    if not os.path.exists(path("wg.key")):
+        key = base64.b64encode(os.urandom(32)) if FAKE_WG else run(["wg", "genkey"]).strip().encode()
+        with open(os.open(path("wg.key"), os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
+            f.write(key.strip() + b"\n")
+    pub = open(path("node.pub"), "rb").read().hex()
+    key = open(path("wg.key")).read().strip()
+    wg = (base64.b64encode(hashlib.sha256(key.encode()).digest()).decode() if FAKE_WG
+          else subprocess.run(["wg", "pubkey"], input=key + "\n", stdout=subprocess.PIPE, text=True, check=True).stdout.strip())
+    return node_id(pub), pub, wg
+
+
+def node_id(pub):
+    return hashlib.sha256(bytes.fromhex(pub)).hexdigest()[:16]
+
+
+def sign(obj):
+    with tempfile.TemporaryDirectory() as d:
+        m, s = os.path.join(d, "m"), os.path.join(d, "s")
+        open(m, "wb").write(canon(obj))
+        run([ZT_SIG, "sign", path("node.sec"), m, s])
+        obj["sig"] = open(s, "rb").read().hex()
+    return obj
+
+
+def verify(obj, pub):
+    try:
+        sig = bytes.fromhex(obj.get("sig", ""))
+        key = bytes.fromhex(pub)
+    except ValueError:
+        return False
+    if len(sig) != 64 or len(key) != 32:
+        return False
+    with tempfile.TemporaryDirectory() as d:
+        m, s, k = os.path.join(d, "m"), os.path.join(d, "s"), os.path.join(d, "k")
+        open(m, "wb").write(canon(obj))
+        open(s, "wb").write(sig)
+        open(k, "wb").write(key)
+        return subprocess.run([ZT_SIG, "verify", k, m, s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+# ------------------------------------------------------------ addresses
+
+def prefix(mesh_id):
+    h = hashlib.sha256(("untrash-mesh:" + mesh_id).encode()).digest()
+    return ipaddress.IPv6Network((b"\xfd" + h[:5] + b"\0" * 10, 48))
+
+
+def address(mesh_id, pub):
+    iid = hashlib.sha256(bytes.fromhex(pub)).digest()[:8]
+    return str(ipaddress.IPv6Address(prefix(mesh_id).network_address.packed[:8] + iid))
+
+
+# ------------------------------------------------------------ state
+
+def state():
+    """mesh.json: {"mesh": {id, name, created}, "name", "roster": signed roster}."""
+    return jload("mesh.json", {})
+
+
+def book():
+    return jload("book.json", {})
+
+
+def members(st=None):
+    st = st or state()
+    return (st.get("roster") or {}).get("members", {})
+
+
+def admins(roster):
+    return {k for k, m in (roster or {}).get("members", {}).items() if m.get("role") == "admin"}
+
+
+def roster_ok(new, old):
+    """A roster is taken when it is newer, of the same mesh and signed by an
+    admin of the roster this node has.  The first roster only ever comes from
+    create or from a join (bound to the invitation's secret), never by sync."""
+    if not isinstance(new, dict) or new.get("type") != "roster" or not old:
+        return False
+    by = new.get("by")
+    if by not in admins(old) or new.get("mesh") != old.get("mesh") or new.get("seq", 0) <= old.get("seq", 0):
+        return False
+    return isinstance(new.get("members"), dict) and verify(new, old["members"][by]["pub"])
+
+
+def record_ok(rec, st):
+    m = members(st).get(rec.get("node")) if isinstance(rec, dict) else None
+    return bool(m) and rec.get("type") == "node" and rec.get("pub") == m["pub"] and verify(rec, m["pub"])
+
+
+def merge(items, st=None):
+    """New rosters and records in; returns the ones that were new to us."""
+    with LOCK:
+        st = st or state()
+        bk, fresh = book(), []
+        for x in items or []:
+            if isinstance(x, dict) and x.get("type") == "roster":
+                if roster_ok(x, st.get("roster")):
+                    st["roster"] = x
+                    fresh.append(x)
+                    jsave("mesh.json", st)
+        for x in items or []:
+            if isinstance(x, dict) and x.get("type") == "node" and record_ok(x, st):
+                cur = bk.get(x["node"])
+                if not cur or x.get("seq", 0) > cur.get("seq", 0):
+                    bk[x["node"]] = x
+                    fresh.append(x)
+        for k in list(bk):                       # records of members that left
+            if k not in members(st):
+                del bk[k]
+        jsave("book.json", bk)
+        return fresh
+
+
+# ------------------------------------------------------------ own endpoints
+
+def testfile(var, default):
+    """Test hook values: a literal, or (starting with /) a file read each time."""
+    v = E(var)
+    if v and v.startswith("/"):
+        try:
+            return open(v).read().strip()
+        except OSError:
+            return default
+    return v if v is not None else default
+
+
+def local_endpoints():
+    if E("ZT_MESH_ENDPOINTS") is not None:
+        return [x for x in testfile("ZT_MESH_ENDPOINTS", "").split(",") if x]
+    out = []
+    try:
+        for i in json.loads(run(["ip", "-j", "addr", "show", "up"])):
+            if i.get("ifname") in ("lo", IFACE):
+                continue
+            for a in i.get("addr_info", []):
+                ip = ipaddress.ip_address(a["local"])
+                if ip.is_loopback or ip.is_link_local or (ip.version == 6 and ip in ipaddress.ip_network("fd00::/8")):
+                    continue
+                out.append(("[%s]:%d" if ip.version == 6 else "%s:%d") % (ip, WG_PORT))
+    except (RuntimeError, ValueError, KeyError):
+        pass
+    return out
+
+
+def own_record(st, extra=()):
+    """This node's signed record; a new seq only when the endpoints changed."""
+    nid, pub, wg = identity()
+    seen = st.get("observed", {})
+    now = time.time()
+    public = sorted({v["ep"] for v in seen.values() if now - v.get("t", 0) < 86400})
+    up = st.get("upnp") or {}
+    if up.get("ok") and now - up.get("t", 0) < 7200:
+        public = ["%s:%d" % (up["ext"], WG_PORT)] + [p for p in public if p != "%s:%d" % (up["ext"], WG_PORT)]
+    eps = list(dict.fromkeys(local_endpoints() + public + list(extra)))
+    cur = book().get(nid)
+    if cur and cur.get("ep") == eps and cur.get("name") == st.get("name") and now - cur.get("time", 0) < 6 * 3600:
+        return cur, False
+    rec = sign({"type": "node", "proto": PROTO, "node": nid, "pub": pub, "wg": wg, "name": st.get("name", ""),
+                "ep": eps, "seq": (cur or {}).get("seq", 0) + 1, "time": int(now)})
+    return rec, True
+
+
+# ------------------------------------------------------------ router (UPnP)
+
+UPNPC = E("ZT_UPNPC", "upnpc")
+UPNP_TAG = "UntrashMesh "          # not "UntrashOS ": untrash-upnp leaves these alone
+
+
+def upnp_refresh(join_open):
+    """Ask the router (UPnP IGD) to forward UDP 51820 for WireGuard, and TCP
+    7341 while an invitation is pending; the external address it reports
+    becomes a public endpoint of this node.  No router, no UPnP: nothing
+    happens (the peers' observations still find the address)."""
+    def upnpc(*a):
+        try:
+            return subprocess.run([UPNPC] + list(a), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    out = upnpc("-l")
+    lan = re.search(r"Local LAN ip address : (\S+)", out)
+    ext = re.search(r"ExternalIPAddress = (\S+)", out)
+    info = {"t": int(time.time()), "ok": False}
+    if lan and ext:
+        r = upnpc("-e", UPNP_TAG + "WireGuard", "-a", lan.group(1), str(WG_PORT), str(WG_PORT), "UDP", "7200")
+        info.update(ok="redirected" in r or "is redirected" in r, ext=ext.group(1), lan=lan.group(1))
+        if join_open:
+            upnpc("-e", UPNP_TAG + "Join", "-a", lan.group(1), str(JOIN_PORT), str(JOIN_PORT), "TCP", "7200")
+        else:
+            upnpc("-d", str(JOIN_PORT), "TCP")
+    with LOCK:
+        st = state()
+        st["upnp"] = info
+        jsave("mesh.json", st)
+    return info
+
+
+# ------------------------------------------------------------ WireGuard
+
+def wg_peers():
+    """{wg public key: {"endpoint", "handshake"}} of the interface."""
+    if FAKE_WG:
+        return json.load(open(FAKE_WG)).get("peers", {}) if os.path.exists(FAKE_WG) else {}
+    out = {}
+    for line in run(["wg", "show", IFACE, "dump"], check=False).splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) >= 5:
+            out[f[0]] = {"endpoint": None if f[2] == "(none)" else f[2], "handshake": int(f[4])}
+    return out
+
+
+def wg_apply(st):
+    """Interface up with this node's mesh address; peers = the roster's other
+    members, each with its address and an endpoint from the address book.
+    An endpoint is only set when there was no handshake for 3 minutes, so it
+    never overrides a working (roamed) one."""
+    nid, pub, wg = identity()
+    mesh = st.get("mesh")
+    peers_now = wg_peers()
+    want = {}
+    bk = book()
+    for k, m in members(st).items():
+        if k == nid:
+            continue
+        rec = bk.get(k) or {}
+        want[m["wg"]] = {"addr": address(mesh["id"], m["pub"]), "eps": rec.get("ep") or m.get("ep") or []}
+    if FAKE_WG:
+        data = json.load(open(FAKE_WG)) if os.path.exists(FAKE_WG) else {"peers": {}}
+        data["iface"] = {"address": address(mesh["id"], pub), "port": WG_PORT}
+        for w, p in want.items():
+            old = data["peers"].get(w, {})
+            data["peers"][w] = {"allowed": p["addr"] + "/128", "endpoint": old.get("endpoint") or (p["eps"] or [None])[0],
+                                "handshake": old.get("handshake", 0), "eps": p["eps"]}
+        for w in list(data["peers"]):
+            if w not in want:
+                del data["peers"][w]
+        json.dump(data, open(FAKE_WG, "w"), indent=1)
+        return
+    if subprocess.run(["ip", "link", "show", IFACE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        run(["ip", "link", "add", IFACE, "type", "wireguard"])
+    run(["wg", "set", IFACE, "private-key", path("wg.key"), "listen-port", str(WG_PORT)])
+    addr = address(mesh["id"], pub)
+    if addr not in run(["ip", "-6", "addr", "show", "dev", IFACE]):
+        run(["ip", "-6", "addr", "add", "%s/48" % addr, "dev", IFACE])
+    run(["ip", "link", "set", IFACE, "mtu", "1380", "up"])
+    now = time.time()
+    for w, p in want.items():
+        cmd = ["wg", "set", IFACE, "peer", w, "allowed-ips", p["addr"] + "/128", "persistent-keepalive", "25"]
+        cur = peers_now.get(w, {})
+        if p["eps"] and now - cur.get("handshake", 0) > 180:
+            ep = pick_endpoint(p["eps"], cur.get("endpoint"))
+            if ep:
+                cmd += ["endpoint", ep]
+        run(cmd, check=False)
+    for w in peers_now:
+        if w not in want:
+            run(["wg", "set", IFACE, "peer", w, "remove"], check=False)
+
+
+def pick_endpoint(eps, current):
+    """Rotate through a peer's endpoints while there is no handshake: LAN ones
+    of a subnet this node is in first, then the rest."""
+    if not eps:
+        return None
+    mine = []
+    for e in local_endpoints():
+        try:
+            mine.append(ipaddress.ip_interface(e.rsplit(":", 1)[0].strip("[]") + ("/24" if "." in e else "/64")).network)
+        except ValueError:
+            pass
+    def lan(e):
+        try:
+            ip = ipaddress.ip_address(e.rsplit(":", 1)[0].strip("[]"))
+            return any(ip in n for n in mine)
+        except ValueError:
+            return False
+    order = sorted(eps, key=lambda e: not lan(e))
+    if current in order:
+        return order[(order.index(current) + 1) % len(order)]
+    return order[0]
+
+
+def wg_down():
+    if FAKE_WG:
+        if os.path.exists(FAKE_WG):
+            os.remove(FAKE_WG)
+        return
+    run(["ip", "link", "del", IFACE], check=False)
+
+
+# ------------------------------------------------------------ names
+
+def hosts_apply(st):
+    """<name>.mesh for every member, in a marked block of /etc/hosts."""
+    lines = []
+    mesh = st.get("mesh")
+    if mesh:
+        bk, used = book(), set()
+        for k, m in sorted(members(st).items(), key=lambda x: x[1].get("added", 0)):
+            name = (bk.get(k) or {}).get("name") or m.get("name") or k[:8]
+            base, i = name, 2
+            while name in used:
+                name, i = "%s-%d" % (base, i), i + 1
+            used.add(name)
+            lines.append("%s\t%s.mesh %s.mesh" % (address(mesh["id"], m["pub"]), name, k[:8]))
+    try:
+        old = open(HOSTS).read()
+    except OSError:
+        old = ""
+    body = re.sub(r"\n?# untrash-mesh begin\n.*?# untrash-mesh end\n", "\n", old, flags=re.S).rstrip("\n") + "\n"
+    if lines:
+        body += "# untrash-mesh begin\n" + "\n".join(lines) + "\n# untrash-mesh end\n"
+    if body != old:
+        tmp = HOSTS + ".tmp"
+        open(tmp, "w").write(body)
+        os.replace(tmp, HOSTS)
+
+
+# ------------------------------------------------------------ sync between members
+
+def sync_url(addr, port=SYNC_PORT):
+    amap = json.loads(testfile("ZT_MESH_ADDRMAP", "") or "{}")
+    return "http://%s/v1/sync" % amap.get(addr, "[%s]:%d" % (addr, port))
+
+
+def sync_with(k, items, st):
+    """Send items to member k; merge what it sends back; remember the endpoint
+    it saw us at.  False when it was not reachable."""
+    m = members(st).get(k)
+    if not m:
+        return False
+    have = {n: r.get("seq", 0) for n, r in book().items()}
+    if st.get("roster") and st["roster"] not in items:
+        items = [st["roster"]] + list(items)          # a roster change a member missed comes along
+    body = json.dumps({"items": items, "have": have, "roster": (st.get("roster") or {}).get("seq", 0)}).encode()
+    try:
+        hdr = {"Content-Type": "application/json"}
+        if E("ZT_MESH_TEST_SELF"):
+            hdr["X-Test-Endpoint"] = E("ZT_MESH_TEST_SELF")    # PC test: the endpoint a peer "sees"
+        with urllib.request.urlopen(urllib.request.Request(sync_url(address(st["mesh"]["id"], m["pub"])), data=body,
+                                                           headers=hdr), timeout=8) as r:
+            ans = json.load(r)
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+    fresh = merge(ans.get("items"))
+    if ans.get("you"):
+        with LOCK:
+            s2 = state()
+            s2.setdefault("observed", {})[k] = {"ep": str(ans["you"])[:80], "t": int(time.time())}
+            jsave("mesh.json", s2)
+    if fresh:
+        forward(fresh, skip=k)
+    return True
+
+
+def forward(items, skip=None, extra=None, wait=False):
+    """Pass records that were new to us on to every other member (gossip).
+    extra: members of an older roster that must hear of their removal.
+    wait: for the CLI, which ends right after."""
+    st = state()
+    nid = identity()[0]
+    targets = dict(extra or {})
+    targets.update(members(st))
+    threads = []
+    for k, m in targets.items():
+        if k not in (nid, skip):
+            tst = st if k in members(st) else dict(st, roster=dict(st["roster"], members=dict(members(st), **{k: m})))
+            t = threading.Thread(target=sync_with, args=(k, items, tst), daemon=True)
+            t.start()
+            threads.append(t)
+    if wait:
+        for t in threads:
+            t.join(15)
+
+
+class SyncHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        st = state()
+        if self.path != "/v1/sync" or not st.get("mesh"):
+            return self.send_error(404)
+        src = self.client_address[0]
+        sender = None
+        for k, m in members(st).items():
+            if address(st["mesh"]["id"], m["pub"]) == src:
+                sender = m
+        if not sender and not E("ZT_MESH_ADDRMAP"):
+            return self.send_error(403)        # only members, over their WireGuard address
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 1 << 20)))
+        except ValueError:
+            return self.send_error(400)
+        fresh = merge(req.get("items"))
+        if fresh:
+            threading.Thread(target=forward, args=(fresh,), kwargs={"skip": None}, daemon=True).start()
+        st, bk = state(), book()
+        out = [r for n, r in bk.items() if r.get("seq", 0) > (req.get("have") or {}).get(n, 0)]
+        if (st.get("roster") or {}).get("seq", 0) > req.get("roster", 0):
+            out.insert(0, st["roster"])
+        you = None
+        if sender:
+            you = (wg_peers().get(sender["wg"]) or {}).get("endpoint")
+        elif E("ZT_MESH_ADDRMAP"):
+            you = self.headers.get("X-Test-Endpoint")
+        body = json.dumps({"items": out, "you": you}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+# ------------------------------------------------------------ invitations and joining
+
+def b64(data):
+    return base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def unb64(text):
+    text = re.sub(r"\s+", "", text)
+    return json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)))
+
+
+def mac(secret, obj):
+    return hmac.new(bytes.fromhex(secret), canon(obj), hashlib.sha256).hexdigest()
+
+
+def cmd_create(name):
+    with LOCK:
+        st = state()
+        if st.get("mesh"):
+            raise SystemExit("already in a mesh")
+        nid, pub, wg = identity()
+        mesh = {"id": secrets.token_hex(8), "name": name[:40], "created": int(time.time())}
+        me = st.get("name") or default_name()
+        roster = sign({"type": "roster", "mesh": mesh["id"], "seq": 1, "by": nid,
+                       "members": {nid: {"pub": pub, "wg": wg, "name": me, "role": "admin", "kind": "nas", "added": int(time.time())}}})
+        st.update(mesh=mesh, name=me, roster=roster, invites={})
+        jsave("mesh.json", st)
+        jsave("book.json", {})
+        merge([own_record(st)[0]])
+    log("mesh %s (%s) created" % (mesh["name"], mesh["id"]))
+    return status()
+
+
+def default_name():
+    n = socket.gethostname().split(".")[0].lower()
+    n = re.sub(r"[^a-z0-9-]", "-", n).strip("-")[:32]
+    return n if NAME_RE.match(n) else "untrash"
+
+
+def cmd_invite(hours=24):
+    with LOCK:
+        st = state()
+        nid = identity()[0]
+        if not st.get("mesh") or nid not in admins(st.get("roster")):
+            raise SystemExit("only an admin of a mesh can invite")
+        sec, iid = secrets.token_hex(16), secrets.token_hex(4)
+        exp = int(time.time() + 3600 * float(hours))
+        st.setdefault("invites", {})[iid] = {"secret": sec, "exp": exp}
+        jsave("mesh.json", st)
+        if not E("ZT_MESH_JOIN_HOST"):
+            upnp_refresh(True)                  # open the join port before the text leaves this NAS
+            st = state()
+        rec = own_record(st)[0]
+        hostlist = [e.rsplit(":", 1)[0].strip("[]") for e in rec.get("ep", [])]
+        if E("ZT_MESH_JOIN_HOST"):
+            hostlist = [E("ZT_MESH_JOIN_HOST")]
+    return {"invitation": b64({"v": PROTO, "i": iid, "s": sec, "m": st["mesh"]["id"], "n": st["mesh"]["name"],
+                               "h": hostlist, "p": JOIN_PORT, "e": exp}), "expires": exp}
+
+
+def cmd_join(text):
+    try:
+        inv = unb64(text)
+        assert inv.get("v") == PROTO and inv["h"]
+    except (ValueError, KeyError, AssertionError, TypeError):
+        raise SystemExit("not an UntrashMesh invitation")
+    if time.time() > inv["e"]:
+        raise SystemExit("the invitation has expired")
+    with LOCK:
+        st = state()
+        if st.get("mesh"):
+            raise SystemExit("already in a mesh: leave it first")
+        nid, pub, wg = identity()
+        st["name"] = st.get("name") or default_name()
+        req = {"i": inv["i"], "node": nid, "pub": pub, "wg": wg, "name": st["name"], "kind": "nas", "ep": local_endpoints()}
+        req["mac"] = mac(inv["s"], req)
+    last, ans, until = None, None, time.time() + float(E("ZT_MESH_JOIN_WAIT", "30"))
+    while ans is None:                     # its join port may open a moment after the invitation
+        for h in inv["h"]:
+            host = "[%s]" % h if ":" in h else h
+            try:
+                with urllib.request.urlopen(urllib.request.Request("http://%s:%d/v1/join" % (host, inv["p"]),
+                                                                   data=json.dumps(req).encode(),
+                                                                   headers={"Content-Type": "application/json"}), timeout=10) as r:
+                    ans = json.load(r)
+                break
+            except urllib.error.HTTPError as e:      # refused (wrong or used invitation): no retry
+                raise SystemExit("the inviting device refused the invitation (%s)" % e.code)
+            except (OSError, ValueError, urllib.error.URLError) as e:
+                last = e
+        if ans is None:
+            if time.time() > until:
+                raise SystemExit("the inviting device is not reachable (%s)" % last)
+            time.sleep(1)
+    if not hmac.compare_digest(ans.get("mac", ""), mac(inv["s"], {k: v for k, v in ans.items() if k != "mac"})):
+        raise SystemExit("the answer is not from the inviting device")
+    roster = ans["roster"]
+    if roster.get("mesh") != inv["m"] or nid not in roster.get("members", {}):
+        raise SystemExit("the inviting device did not take this node in")
+    with LOCK:
+        st = state()
+        st.update(mesh={"id": inv["m"], "name": inv["n"], "joined": int(time.time())}, roster=None)
+        jsave("mesh.json", st)
+        jsave("book.json", {})
+        # the first roster is trusted through the invitation's secret (the answer's MAC)
+        st["roster"] = roster if verify(roster, roster["members"][roster["by"]]["pub"]) else None
+        if not st["roster"]:
+            raise SystemExit("the roster's signature is wrong")
+        jsave("mesh.json", st)
+        merge(ans.get("items", []))
+        merge([own_record(st)[0]])
+    log("joined mesh %s" % inv["n"])
+    return status()
+
+
+class JoinHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        if self.path != "/v1/join":
+            return self.send_error(404)
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)))
+        except ValueError:
+            return self.send_error(400)
+        with LOCK:
+            st = state()
+            inv = (st.get("invites") or {}).get(req.get("i"))
+            if not inv or time.time() > inv["exp"] or not hmac.compare_digest(
+                    str(req.get("mac", "")), mac(inv["secret"], {k: v for k, v in req.items() if k != "mac"})):
+                return self.send_error(403)
+            if not (isinstance(req.get("pub"), str) and len(req["pub"]) == 64 and node_id(req["pub"]) == req.get("node")):
+                return self.send_error(400)
+            del st["invites"][req["i"]]           # one use only
+            nid = identity()[0]
+            ros = dict(st["roster"])
+            ms = dict(ros["members"])
+            ms[req["node"]] = {"pub": req["pub"], "wg": str(req.get("wg", ""))[:64], "name": safe_name(req.get("name")),
+                               "role": "member", "kind": "app" if req.get("kind") == "app" else "nas",
+                               "added": int(time.time()), "ep": [str(e)[:80] for e in (req.get("ep") or [])][:8]}
+            ros.update(members=ms, seq=ros["seq"] + 1, by=nid)
+            ros.pop("sig", None)
+            st["roster"] = sign(ros)
+            jsave("mesh.json", st)
+            items = list(book().values())
+        ans = {"roster": st["roster"], "items": items}
+        ans["mac"] = mac(inv["secret"], ans)
+        body = json.dumps(ans).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        log("%s joined" % ms[req["node"]]["name"])
+        threading.Thread(target=forward, args=([st["roster"]],), daemon=True).start()
+
+
+def safe_name(n):
+    n = re.sub(r"[^a-z0-9-]", "-", str(n or "").lower()).strip("-")[:32]
+    return n if NAME_RE.match(n) else "node"
+
+
+def roster_change(fn):
+    with LOCK:
+        st = state()
+        nid = identity()[0]
+        if not st.get("mesh"):
+            raise SystemExit("not in a mesh")
+        old = dict(st["roster"]["members"])
+        ros = dict(st["roster"])
+        ms = dict(ros["members"])
+        fn(ms, nid)
+        ros.update(members=ms, seq=ros["seq"] + 1, by=nid)
+        ros.pop("sig", None)
+        if nid not in admins(st["roster"]):
+            raise SystemExit("only an admin can change the members")
+        st["roster"] = sign(ros)
+        jsave("mesh.json", st)
+    forward([st["roster"]], extra=old, wait=True)
+    return status()
+
+
+def cmd_remove(node):
+    def fn(ms, nid):
+        if node == nid or node not in ms:
+            raise SystemExit("unknown member (or this node: use leave)")
+        del ms[node]
+    return roster_change(fn)
+
+
+def cmd_leave():
+    with LOCK:
+        st = state()
+        st.pop("mesh", None)
+        st.pop("roster", None)
+        st.pop("invites", None)
+        st.pop("observed", None)
+        jsave("mesh.json", st)
+        jsave("book.json", {})
+    wg_down()
+    hosts_apply({})
+    return status()
+
+
+def cmd_rename(name):
+    name = safe_name(name)
+    with LOCK:
+        st = state()
+        st["name"] = name
+        jsave("mesh.json", st)
+    if st.get("mesh"):
+        rec, changed = own_record(st)
+        if changed:
+            merge([rec])
+            forward([rec], wait=True)
+    return status()
+
+
+def status():
+    st, bk = state(), book()
+    nid, pub, wg = identity()
+    peers = wg_peers() if st.get("mesh") else {}
+    out = {"node": nid, "name": st.get("name") or default_name(), "pub": pub, "wg": wg, "mesh": st.get("mesh"),
+           "admin": nid in admins(st.get("roster")), "invites": len(st.get("invites") or {}), "members": []}
+    if st.get("mesh"):
+        out["address"] = address(st["mesh"]["id"], pub)
+        now = time.time()
+        for k, m in members(st).items():
+            rec, p = bk.get(k) or {}, peers.get(m["wg"]) or {}
+            out["members"].append({"node": k, "name": rec.get("name") or m.get("name"), "role": m.get("role"), "kind": m.get("kind"),
+                                   "address": address(st["mesh"]["id"], m["pub"]), "self": k == nid,
+                                   "endpoints": rec.get("ep", []), "seq": rec.get("seq"), "seen": rec.get("time"),
+                                   "handshake": p.get("handshake") or None, "endpoint": p.get("endpoint"),
+                                   "online": k == nid or bool(p.get("handshake") and now - p["handshake"] < 180)})
+    return out
+
+
+# ------------------------------------------------------------ daemon
+
+def serve(handler, host, port):
+    class S(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        allow_reuse_address = True
+    srv = S((host, port), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def cmd_run():
+    log("running")
+    sync_srv = join_srv = None
+    last_full = last_upnp = 0
+    upnp_join = False
+    while True:
+        try:
+            st = state()
+            if not st.get("mesh"):
+                for s in (sync_srv, join_srv):
+                    if s:
+                        s.shutdown()
+                sync_srv = join_srv = None
+                time.sleep(10)
+                continue
+            nid, pub, _wg = identity()
+            if nid not in members(st):                 # removed by an admin
+                log("this node is no longer in the mesh")
+                cmd_leave()
+                continue
+            wg_apply(st)
+            hosts_apply(st)
+            if not sync_srv:
+                host = "127.0.0.1" if E("ZT_MESH_ADDRMAP") else address(st["mesh"]["id"], pub)
+                try:
+                    sync_srv = serve(SyncHandler, host, SYNC_PORT)
+                except OSError as e:
+                    log("sync port: %s" % e)
+            pending = {k: v for k, v in (st.get("invites") or {}).items() if v["exp"] > time.time()}
+            if pending != (st.get("invites") or {}):
+                with LOCK:
+                    s2 = state()
+                    s2["invites"] = pending
+                    jsave("mesh.json", s2)
+            if time.time() - last_upnp > 1800 or bool(pending) != upnp_join:
+                upnp_join = bool(pending)
+                upnp_refresh(upnp_join)
+                last_upnp = time.time()
+            if pending and not join_srv:
+                join_srv = serve(JoinHandler, "127.0.0.1" if E("ZT_MESH_ADDRMAP") else "::", JOIN_PORT)
+            elif not pending and join_srv:
+                join_srv.shutdown()
+                join_srv = None
+            rec, changed = own_record(state())
+            if changed:
+                merge([rec])
+                log("endpoints now %s (seq %d)" % (", ".join(rec["ep"]) or "-", rec["seq"]))
+                forward([rec])
+            elif time.time() - last_full > 300:          # anti-entropy with one member
+                others = [k for k in members(state()) if k != nid]
+                if others:
+                    sync_with(random.choice(others), [rec], state())
+                last_full = time.time()
+        except Exception as e:                           # keep the mesh running
+            log("error: %s" % e)
+        idle(float(E("ZT_MESH_TICK", "30")))
+
+
+def idle(secs):
+    """Sleep until the next tick, or at once when mesh.json changed (an
+    invitation, a join, a removal from the CLI or the Desk)."""
+    def mtime():
+        try:
+            return os.stat(path("mesh.json")).st_mtime_ns
+        except OSError:
+            return 0
+    m0, end = mtime(), time.time() + secs
+    while time.time() < end:
+        time.sleep(min(0.5, secs))
+        if mtime() != m0:
+            return
+
+
+def main():
+    a = sys.argv[1:]
+    try:
+        if a == ["status"]:
+            out = status()
+        elif a[:1] == ["create"] and len(a) == 2:
+            out = cmd_create(a[1])
+        elif a[:1] == ["invite"] and len(a) <= 2:
+            out = cmd_invite(a[1] if len(a) == 2 else 24)
+        elif a[:1] == ["join"] and len(a) == 2:
+            out = cmd_join(a[1])
+        elif a[:1] == ["remove"] and len(a) == 2:
+            out = cmd_remove(a[1])
+        elif a == ["leave"]:
+            out = cmd_leave()
+        elif a[:1] == ["rename"] and len(a) == 2:
+            out = cmd_rename(a[1])
+        elif a == ["run"]:
+            return cmd_run()
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except SystemExit as e:
+        print(json.dumps({"error": str(e)}))
+        return 1
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

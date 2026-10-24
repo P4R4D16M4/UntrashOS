@@ -134,7 +134,7 @@ const APPS = {
   logs: { name: 'Logs', icon: 'logs', w: 860, h: 520 },
   status: { name: 'Status', icon: 'status', w: 760, h: 540 },
   terminal: { name: 'Terminal', icon: 'terminal', w: 860, h: 520 },
-  mesh: { name: 'UntrashMesh', icon: 'mesh', w: 560, h: 500 },
+  mesh: { name: 'UntrashMesh', icon: 'mesh', w: 860, h: 600 },
   sound: { name: 'Sounds', icon: 'synth', w: 1040, h: 700 },
   feedback: { name: 'Feedback', icon: 'feedback', w: 720, h: 600 },
   manual: { name: 'Manual', icon: 'manual', w: 940, h: 640, user: true },
@@ -1157,7 +1157,7 @@ VIEWS.terminal = async b => {
   CLEANUP.terminal = () => { ro.disconnect(); ws.close(); term.dispose(); };
 };
 
-/* UntrashMesh: teaser, not yet implemented ------------------------------- */
+/* UntrashMesh: members, invitations (untrash-mesh) ------------------------ */
 /* user manual (docs/user-guide, English; also readable without signing in) */
 VIEWS.manual = async b => {
   b.innerHTML = `<div class="ut-window__main ut-manual"><div class="row ut-manual__bar"><span class="muted">User guide (English)</span><span class="ut-spacer"></span>
@@ -1166,18 +1166,55 @@ VIEWS.manual = async b => {
     <iframe src="/manual/" title="User guide"></iframe></div>`;
 };
 VIEWS.mesh = async b => {
-  b.innerHTML = `<div class="ut-window__main ut-mesh">
-    <img src="${ICON('mesh')}" alt="" class="ut-mesh__logo">
-    <h2>UntrashMesh <span class="ut-pill ut-pill--warn">in progress</span></h2>
-    <p>Several UntrashOS devices form one shared, encrypted network – at home, at friends' or on the road.</p>
-    <ul>
-      <li>Mirror shares and backups between your NAS, without a cloud provider</li>
-      <li>Mutual off-site backup: your NAS backs up at a friend's, theirs at yours</li>
-      <li>Access on the road through the mesh instead of open router ports</li>
-      <li>Easy pairing: show a code on one device, enter it on the other</li>
-    </ul>
-    <p class="muted">This feature is not available yet. It will come with a later UntrashOS update – without reinstalling.</p>
-  </div>`;
+  const m = await api('mesh'), ago = t => t ? esc(new Date(t * 1000).toLocaleString(UTI18N.locale)) : '–';
+  const me = `<div class="ut-card"><div class="ut-card__head"><h3>This NAS</h3><span class="ut-spacer"></span>
+      <button class="ut-btn ut-btn--sm ut-btn--ghost" id="mren">Rename</button></div>
+    <p><b translate="no">${esc(m.name)}</b>${m.address ? ` · <span class="mono" translate="no">${esc(m.address)}</span> · <span class="mono" translate="no">${esc(m.name)}.mesh</span>` : ''}</p>
+    <p class="ut-faint">Key fingerprint <span class="mono" translate="no">${esc(m.node)}</span></p></div>`;
+  if (!m.mesh) {
+    b.innerHTML = `<div class="ut-window__main ut-mesh"><img src="${ICON('mesh')}" alt="" class="ut-mesh__logo"><h2>UntrashMesh</h2>
+      <p>Several UntrashOS devices form one encrypted network (WireGuard), at home and over the internet, without a cloud provider and without a fixed IP address: every device keeps an address book that the others update when their address changes.</p>
+      ${me}
+      <div class="ut-card"><h3>Start a mesh</h3>${field('mnew', 'Name of the mesh', 'home')}<button class="ut-btn ut-btn--primary" id="mcreate">Create the mesh</button></div>
+      <div class="ut-card"><h3>Join a mesh</h3><p class="ut-faint">Paste the invitation an admin of the mesh created on their device.</p>
+        <textarea class="ut-textarea" id="minv" rows="3" placeholder="Invitation" translate="no"></textarea>
+        <button class="ut-btn ut-btn--primary" id="mjoin" style="margin-top:8px">Join</button></div></div>`;
+    $('#mcreate', b).onclick = () => save('mesh/create', { name: $('#mnew', b).value }, 'mesh');
+    $('#mjoin', b).onclick = () => save('mesh/join', { invitation: $('#minv', b).value }, 'mesh');
+  } else {
+    const rows = m.members.map(x => `<tr><td><b translate="no">${esc(x.name)}</b>${x.self ? ' <span class="ut-pill ut-pill--plain">' + esc(UTI18N.tr('this NAS')) + '</span>' : ''}
+        <div class="ut-faint mono" translate="no">${esc(x.name)}.mesh · ${esc(x.address)}</div></td>
+      <td>${x.role === 'admin' ? 'Admin' : 'Member'} · ${x.kind === 'app' ? 'App' : 'NAS'}</td>
+      <td><span class="ut-pill ${x.online ? 'ut-pill--ok' : ''}">${x.online ? 'online' : 'not reachable'}</span>
+        <div class="ut-faint" translate="no">${esc(x.endpoint || (x.endpoints || [])[0] || '')}</div></td>
+      <td class="ut-faint">${x.self ? '' : ago(x.handshake || x.seen)}</td>
+      <td>${m.admin && !x.self ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-mrm="${esc(x.node)}" data-mname="${esc(x.name)}">Remove</button>` : ''}</td></tr>`).join('');
+    b.innerHTML = `<div class="ut-window__main ut-mesh"><div class="row"><img src="${ICON('mesh')}" alt="" style="width:40px;height:40px"><h2 style="margin:0">UntrashMesh <span translate="no">${esc(m.mesh.name)}</span></h2>
+        <span class="ut-spacer"></span>${m.admin ? '<button class="ut-btn ut-btn--primary" id="minvite">Invite a device</button>' : ''}</div>
+      ${me}
+      <div class="ut-section-title">Members</div>
+      <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Role</th><th>State</th><th>Last contact</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="ut-faint">Members reach each other at <span class="mono">name.mesh</span>, for example shares at <span class="mono" translate="no">\\\\${esc(m.members.find(x => !x.self)?.name || 'nas')}.mesh</span>, the Desk at <span class="mono" translate="no">http://${esc(m.members.find(x => !x.self)?.name || 'nas')}.mesh</span>. Over the internet the router needs UPnP or a forwarding of UDP port 51820 on at least one side.</p>
+      <div class="row" style="margin-top:12px"><button class="ut-btn ut-btn--ghost ut-btn--danger" id="mleave">Leave the mesh</button></div></div>`;
+    const inv = $('#minvite', b);
+    if (inv) inv.onclick = async () => {
+      try {
+        const r = await api('mesh/invite', { hours: 24 });
+        const d = dialog({ title: 'Invite a device', ok: 'Done', body: `<p>On the other UntrashOS device (or in the UntrashApp) open UntrashMesh, choose <b>Join</b> and paste this invitation. It works once, until ${ago(r.expires)}.</p>
+          <textarea class="ut-textarea mono" rows="5" readonly translate="no" id="minvt">${esc(r.invitation)}</textarea>
+          <div class="row" style="margin-top:8px"><button class="ut-btn ut-btn--sm" id="mcopy">Copy</button></div>` });
+        $('#mcopy', d).onclick = () => { $('#minvt', d).select(); navigator.clipboard ? navigator.clipboard.writeText(r.invitation).then(() => toast('Copied', '')) : document.execCommand('copy'); };
+      } catch (e) { fail(e); }
+    };
+    $$('[data-mrm]', b).forEach(x => x.onclick = () => dialog({ kind: 'danger', title: UTI18N.tr('Remove %s from the mesh?').replace('%s', x.dataset.mname), ok: 'Remove', okCls: 'ut-btn--danger',
+      body: '<p>It loses its connection to every member. To come back it needs a new invitation.</p>', onOk: () => save('mesh/remove', { node: x.dataset.mrm }, 'mesh') }));
+    $('#mleave', b).onclick = () => dialog({ kind: 'danger', title: 'Leave the mesh?', ok: 'Leave', okCls: 'ut-btn--danger',
+      body: '<p>The connections to all members end. To come back this NAS needs a new invitation.</p>', onOk: () => save('mesh/leave', {}, 'mesh') });
+  }
+  $('#mren', b).onclick = () => {
+    dialog({ title: 'Name in the mesh', ok: 'Save', body: field('mrn', 'Name (letters, digits, -)', m.name),
+      onOk: d => save('mesh/rename', { name: $('#mrn', d).value }, 'mesh') });
+  };
 };
 
 
