@@ -144,9 +144,49 @@ const APPS = {
   player: { name: 'Player', icon: 'player', w: 900, h: 560, user: true, hidden: true },
   account: { name: 'My account', icon: 'users', w: 480, h: 360, user: true },
 };
+/* the admin dock: two apps direct, the rest in categories that open a popup */
+const DOCK_ADMIN = ['overview', 'files',
+  { g: 'data', name: 'Data', apps: ['shares', 'storage', 'backup', 'cloud', 'downloads'] },
+  { g: 'net', name: 'Network', apps: ['network', 'mesh', 'adblock'] },
+  { g: 'media', name: 'Media', apps: ['media', 'tv', 'sound'] },
+  { g: 'system', name: 'System', apps: ['status', 'users', 'settings', 'updates', 'logs', 'terminal'] },
+  { g: 'help', name: 'Help', apps: ['manual', 'feedback'] }];
+const dockItem = k => `<button class="ut-dock__item" data-app="${k}" aria-label="${APPS[k].name}"><img src="${ICON(APPS[k].icon)}" alt=""><span class="ut-tip">${APPS[k].name}</span></button>`;
+const dockGroup = g => `<button class="ut-dock__item ut-dock__group" data-group="${g.g}" aria-label="${g.name}" aria-haspopup="menu" aria-expanded="false">
+  <span class="ut-dock__stack">${g.apps.slice(0, 4).map(k => `<img src="${ICON(APPS[k].icon)}" alt="">`).join('')}</span><span class="ut-tip">${g.name}</span></button>`;
+function dockPopup(btn) {
+  const open = $('.ut-dock-pop'), g = DOCK_ADMIN.find(x => x.g === btn.dataset.group);
+  closeDockPopup();
+  if (open && open.dataset.group === g.g) return;            // a second click closes it
+  const p = document.createElement('div');
+  p.className = 'ut-menu ut-dock-pop'; p.dataset.group = g.g; p.setAttribute('role', 'menu'); p.setAttribute('aria-label', UTI18N.tr(g.name));
+  p.innerHTML = `<div class="ut-menu__label">${esc(UTI18N.tr(g.name))}</div><div class="ut-dock-pop__grid">${g.apps.map(k =>
+    `<button class="ut-launcher__app" role="menuitem" data-app="${k}"><img src="${ICON(APPS[k].icon)}" alt=""><span>${esc(UTI18N.tr(APPS[k].name))}</span></button>`).join('')}</div>`;
+  document.body.append(p);
+  const r = btn.getBoundingClientRect(), w = p.offsetWidth;
+  p.style.left = Math.max(8, Math.min(innerWidth - w - 8, r.left + r.width / 2 - w / 2)) + 'px';
+  p.style.bottom = (innerHeight - r.top + 14) + 'px';
+  btn.setAttribute('aria-expanded', 'true');
+  const items = $$('[data-app]', p);
+  items[0].focus();
+  p.addEventListener('keydown', e => {
+    const i = items.indexOf(document.activeElement);
+    if (e.key === 'Escape') { closeDockPopup(); btn.focus(); }
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+  });
+  p.addEventListener('click', e => { const a = e.target.closest('[data-app]'); if (a) { closeDockPopup(); openApp(a.dataset.app); } });
+}
+function closeDockPopup() {
+  $$('.ut-dock-pop').forEach(x => x.remove());
+  $$('.ut-dock__group[aria-expanded=true]').forEach(x => x.setAttribute('aria-expanded', 'false'));
+}
+document.addEventListener('pointerdown', e => { if (!e.target.closest('.ut-dock-pop, .ut-dock__group')) closeDockPopup(); });
+addEventListener('resize', closeDockPopup);
+
 function desk(st) {
   const apps = Object.keys(APPS).filter(k => (ME.admin || APPS[k].user) && !APPS[k].hidden);
-  const dock = ME.admin ? ['overview', 'status', 'files', 'shares', 'storage', 'users', 'network', 'adblock', 'media', 'tv', 'cloud', 'downloads', 'backup', 'settings', 'updates', 'logs', 'sound', 'terminal', 'mesh', 'feedback', 'manual'] : ['files', 'tv', 'manual', 'account'];
+  const dock = ME.admin ? DOCK_ADMIN : ['files', 'tv', 'manual', 'account'];
   $('#app').innerHTML = `<div class="ut-desk" id="desk">
     <header class="ut-topbar"><span class="ut-topbar__item"><img src="/ut/assets/logo-mark-48.png" alt=""><span class="ut-topbar__title">Untrash<span style="color:var(--ut-teal)">OS</span></span></span>
       <span class="ut-topbar__item" id="active-title">${esc(st.hostname)}</span><div class="ut-topbar__spacer"></div>
@@ -155,11 +195,12 @@ function desk(st) {
       <button class="ut-topbar__item" id="user-btn" translate="no">${esc(ME.user)}</button><span class="ut-topbar__item" id="clock"></span></header>
     <nav class="ut-desktop-icons">${apps.filter(k => k !== 'account').slice(0, 6).map(k => `<button class="ut-desk-icon" data-app="${k}"><img src="${ICON(APPS[k].icon)}" alt="">${APPS[k].name}</button>`).join('')}</nav>
     <div id="windows"></div><div class="ut-toasts" id="toasts" aria-live="polite"></div>
-    <nav class="ut-dock" aria-label="Dock" style="--dock-n:${dock.length + (ME.admin ? 1 : 0)}">${dock.map(k => `<button class="ut-dock__item" data-app="${k}" aria-label="${APPS[k].name}"><img src="${ICON(APPS[k].icon)}" alt=""><span class="ut-tip">${APPS[k].name}</span></button>`).join('')}
+    <nav class="ut-dock" aria-label="Dock" style="--dock-n:${dock.length + (ME.admin ? 1 : 0)}">${dock.map(k => typeof k === 'string' ? dockItem(k) : dockGroup(k)).join('')}
       ${ME.admin ? '<span class="ut-dock__sep"></span><button class="ut-dock__item" data-power aria-label="Switch off"><img src="' + ICON('power') + '" alt=""><span class="ut-tip">Switch off</span></button>' : ''}</nav></div>`;
   $('#desk').addEventListener('click', e => {
     const b = e.target.closest('[data-app]'); if (b && !b.closest('.ut-window')) openApp(b.dataset.app);
     if (e.target.closest('[data-power]')) powerDialog();
+    const g = e.target.closest('[data-group]'); if (g) dockPopup(g);
   });
   $('#desk').addEventListener('dblclick', e => { const b = e.target.closest('.ut-desk-icon'); if (b) openApp(b.dataset.app); });
   $('#user-btn').onclick = () => {
