@@ -1,0 +1,13 @@
+#!/bin/sh
+# UntrashMesh off-site mirror: take the DRBD resources down at the very end of
+# a shutdown (systemd-shutdown runs this after the file systems are unmounted),
+# so DRBD writes a clean state and the next start needs no activity-log resync.
+# Best effort: a resource that does not go down within 20 s is left to the
+# kernel; the activity log makes that safe, only slower at the next start.
+[ -e /proc/drbd ] || exit 0            # the drbd module is not loaded: no mirror
+for conf in /etc/untrash/mesh/drbd/*.conf; do
+	[ -f "$conf" ] || continue
+	id=$(basename "$conf" .conf)
+	timeout 20 /usr/lib/drbd/drbdadm-84 -c "$conf" down "ut-$id" >/dev/null 2>&1
+done
+exit 0

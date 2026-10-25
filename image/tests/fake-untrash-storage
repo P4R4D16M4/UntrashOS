@@ -12,10 +12,10 @@ if sys.argv[1:2] == ["status"]:
     vol = {"id": "md", "dev": "/dev/md2", "mnt": "/i-data/aaaa0001", "name": "Volume aaaa", "mounted": True,
            "size": 4 * 10 ** 12, "free": 10 ** 12, "sysvol": False}
     print(json.dumps({
-        "disks": [{"bay": "disk%d" % i, "dev": "/dev/sd" + "abcd"[i - 1], "size": 4 * 10 ** 12, "model": "TEST",
+        "disks": [{"bay": "disk%d" % i, "dev": "/dev/sd" + "abcd"[i - 1], "size": 4 * 10 ** 12, "model": "WDC WD40EFRX-68N32N0",
                    "role": r, "detail": d} for i, (r, d) in enumerate(
             [("member", "md2 (active)"), ("member", "md2 (active)"), ("free", "empty"),
-             ("foreign", "Daten eines anderen Arrays (raid1, 1234abcd)")], 1)],
+             ("foreign", "data of another array (raid1, 1234abcd)")], 1)],
         "arrays": [{"md": "md2", "dev": "/dev/md2", "uuid": "aaaa0001:00:00:00", "uuid8": "aaaa0001", "level": "raid1",
                     "state": "Normal", "progress": None, "raid_disks": 2, "size": 4 * 10 ** 12, "type": "md", "vg": "",
                     "vg_free": 0, "name": "Volume aaaa", "host": False, "volumes": [vol], "next_level": "raid5",
@@ -31,7 +31,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "run":
     print("12:00:00 $ mdadm --fake", flush=True)
     time.sleep(0.3)
     if sys.argv[2] == "delete" and json.loads(sys.argv[3]).get("md") == "md9":
-        print("12:00:01 RESULT FAIL Unbekanntes Daten-Array: md9")
+        print("12:00:01 RESULT FAIL Unknown data array: md9")
         sys.exit(1)
     print("12:00:01 RESULT OK")
     sys.exit(0)

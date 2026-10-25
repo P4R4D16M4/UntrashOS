@@ -575,6 +575,8 @@ def volumes():
                 size, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
             except OSError:
                 size = free = 0
+            if TEST and os.path.isfile(os.path.join(d, ".system", "test_df")):   # manual screenshots: demo sizes
+                size, free = (int(x) for x in open(os.path.join(d, ".system", "test_df")).read().split()[:2])
             out.append({"id": n, "path": d.replace(R, "", 1), "kind": kind, "label": label or n,
                         "size": size, "free": free, "sysvol": os.path.realpath(IDATA + "/sysvol") == os.path.realpath(d),
                         "host": kind == "intern" and is_host(d)})
