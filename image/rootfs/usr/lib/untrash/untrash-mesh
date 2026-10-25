@@ -312,9 +312,10 @@ def own_record(st, extra=()):
         public = ["%s:%d" % (up["ext"], WG_PORT)] + [p for p in public if p != "%s:%d" % (up["ext"], WG_PORT)]
     eps = list(dict.fromkeys(local_endpoints() + public + list(extra)))
     cur = book().get(nid)
-    if cur and cur.get("ep") == eps and cur.get("name") == st.get("name") and now - cur.get("time", 0) < 6 * 3600:
+    name = st.get("name") or default_name()      # never None vs "": that made a new record every tick (untrash-2)
+    if cur and cur.get("ep") == eps and cur.get("name") == name and now - cur.get("time", 0) < 6 * 3600:
         return cur, False
-    rec = sign({"type": "node", "proto": PROTO, "node": nid, "pub": pub, "wg": wg, "name": st.get("name", ""),
+    rec = sign({"type": "node", "proto": PROTO, "node": nid, "pub": pub, "wg": wg, "name": name,
                 "ep": eps, "seq": (cur or {}).get("seq", 0) + 1, "time": int(now)})
     return rec, True
 
@@ -1083,17 +1084,35 @@ def partner_volumes(st):
     for mp in sorted(h for h in have if h.startswith(PDATA + "/") and h not in want):
         unmount(mp)
     vols = {}
+    ready = not want or pdata_ready()
     for mp, w in want.items():
-        if mp not in have and w["online"]:
+        if mp not in have and w["online"] and ready:
             try:
                 mount(mp, w)
-            except RuntimeError as e:
+            except (RuntimeError, OSError) as e:      # one volume must not stop the mesh
                 log("partner volume %s: %s" % (mp, e))
         vols[mp] = {k: w[k] for k in ("node", "partner", "share", "mode", "online")}
         vols[mp]["mounted"] = mp in mounted()
         vols[mp].update(space(mp) if vols[mp]["mounted"] else {"size": 0, "free": 0})
     jsave("partners.json", parts)
     jsave("volumes.json", vols)
+
+
+def pdata_ready():
+    """/p-data is an empty directory in the read-only image: a small tmpfs
+    over it holds the mount points (as untrash-import-zyxel does for /i-data)."""
+    if E("ZT_MESH_PDATA") or _TESTDIR:
+        os.makedirs(PDATA, exist_ok=True)
+        return True
+    if not os.path.isdir(PDATA):
+        log("partner volumes: %s missing in the image" % PDATA)
+        return False
+    if not os.path.ismount(PDATA):
+        r = subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=0755,size=1m", "tmpfs", PDATA], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode:
+            log("partner volumes: tmpfs on %s failed: %s" % (PDATA, r.stdout.strip()))
+            return False
+    return True
 
 
 def mount(mp, w):

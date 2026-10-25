@@ -169,7 +169,7 @@ ZT_TOP="$TOP" "$BOARD/slot-hook.sh" root "$W/root" "$KB"
 # md arrays and LVM VGs are never assembled/activated automatically (only
 # untrash-import-zyxel does that, read-only until the operator ran apply);
 # Samba starts only after a takeover (untrash-zyxel.service).
-mkdir -p "$W/root/i-data" "$W/root/e-data"
+mkdir -p "$W/root/i-data" "$W/root/e-data" "$W/root/p-data"      # p-data: UntrashMesh partner volumes (tmpfs over it)
 printf 'AUTO -all\n' >>"$W/root/etc/mdadm/mdadm.conf"
 printf '\nactivation {\n\tauto_activation_volume_list = []\n}\n' >>"$W/root/etc/lvm/lvmlocal.conf"
 rm -f "$W"/root/etc/systemd/system/multi-user.target.wants/{smbd,nmbd,samba-ad-dc}.service

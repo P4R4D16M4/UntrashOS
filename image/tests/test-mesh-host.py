@@ -200,6 +200,24 @@ try:
     cli("a", "remove", app_node)
     check("app: removed -> the link goes", wait(lambda: app_node not in jf("a", "state/apps.json")))
 
+    # hardware lessons (untrash-2/untrash1, 2026-10-25)
+    st_b = json.load(open(NODES["b"]["dir"] + "/state/mesh.json"))
+    st_b.pop("name", None)                                  # a node whose name was never set
+    json.dump(st_b, open(NODES["b"]["dir"] + "/state/mesh.json", "w"))
+    time.sleep(1.5)
+    s0 = book("b")[nb]["seq"]
+    time.sleep(4)
+    check("a node without a set name does not make a new record every tick", book("b")[nb]["seq"] - s0 <= 1)
+    cli("b", "rename", "nas-b")
+    os.chmod(NODES["b"]["dir"] + "/p-data", 0o555)          # like /p-data on the read-only image
+    cli("a", "share", nb, json.dumps({"Photos": {"mode": "ro", "path": "/i-data/v1/Photos"}}))
+    check("partner volume that cannot be mounted: listed as not mounted, the mesh goes on",
+          wait(lambda: jf("b", "state/volumes.json") and all(not v["mounted"] for v in jf("b", "state/volumes.json").values()))
+          and wait(lambda: "partner volume" in open(NODES["b"]["dir"] + "/log").read()) and "error:" not in open(NODES["b"]["dir"] + "/log").read())
+    os.chmod(NODES["b"]["dir"] + "/p-data", 0o755)
+    cli("a", "share", nb, "{}")
+    wait(lambda: not jf("b", "state/volumes.json"))
+
     # off-site mirror: a asks b to keep a copy of its volume /i-data/v1 (DRBD faked)
     VOL, SIZE = "/i-data/v1", 64 << 20
     json.dump({"mounts": {VOL: "/dev/vg/lv_v1"}, "sizes": {"/dev/vg/lv_v1": SIZE}}, open(NODES["a"]["dir"] + "/drbd.json", "w"))
