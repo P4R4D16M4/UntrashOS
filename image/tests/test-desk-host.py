@@ -123,6 +123,7 @@ def env_for(r, stick, port):
                 ZT_SOUND_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-sound"), ZT_SOUND_USER=r + "/etc/untrash/sounds.json",
                 ZT_SOUND_DEVICE=r + "/tone", ZT_SOUND_LOG=r + "/tones", ZT_SOUND_LOG_MS="1", ZT_SOUND_NO_SLEEP="1",
                 ZT_SOUND_LOCK=r + "/sound.lock", ZT_EXPORT_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-export"),
+                ZT_TRANSFER_CHUNK="65536", ZT_TRANSFER_DELAY="0.02",
                 ZT_DLNA_URL="http://127.0.0.1:9/", ZT_PROJECT=os.path.join(FILES, "usr/share/untrash/project.json"),
                 ZT_ADBLOCK_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-adblock"), ZT_ADBLOCK_STORE=r + "/etc/untrash/adblock.json",
                 ZT_ADBLOCK_DATA=r + "/var/lib/untrash/adblock", ZT_ADBLOCK_RUN=r + "/run/untrash/adblock")
@@ -341,6 +342,88 @@ def main():
             check("folder upload makes the subfolders", st == 200 and open(g0 + "/Neu/tief/c.txt").read() == "C")
             check("folder upload refuses .. and hidden folders", a.req("/api/files/upload?" + urllib.parse.urlencode({"share": "groups", "path": "", "name": "x", "dirs": "../x"}), raw=b"x")[0] == 400
                   and a.req("/api/files/upload?" + urllib.parse.urlencode({"share": "groups", "path": "", "name": "x", "dirs": ".ssh"}), raw=b"x")[0] == 400)
+            # transfers: copy/move, uploads and downloads in one list (untrash-transfer does the writing)
+            def ops(cl, q=""):
+                return cl.req("/api/transfers" + q)[1]["ops"]
+            up = [o for o in ops(a) if o["kind"] == "upload" and o["name"] == "c.txt"]
+            check("transfers: an upload is listed (done, size, target)", up and up[0]["state"] == "done" and up[0]["total"] == 1
+                  and up[0]["where"] == "groups/Neu/tief" and oct(os.stat(g0 + "/Neu/tief/c.txt").st_mode & 0o777) == "0o777")
+            check("transfers: copy jobs are listed with their kind", any(o["kind"] == "copy" and o["state"] == "done" for o in ops(a)))
+            a.req("/api/files/download?share=groups&path=fm/a.txt")
+            dl = [o for o in ops(a) if o["kind"] == "download"]
+            check("transfers: a download is listed, an inline view is not", dl and dl[0]["name"] == "a.txt" and dl[0]["state"] == "done"
+                  and dl[0]["done"] == dl[0]["total"] == 3000)
+            n_dl = len(dl)
+            open(g0 + "/fm/p.jpg", "wb").write(b"\xff\xd8\xff\xe0jpeg")
+            a.req("/api/files/download?share=groups&path=fm/p.jpg&inline=1")
+            check("transfers: inline views are not listed", len([o for o in ops(a) if o["kind"] == "download"]) == n_dl)
+            st, zb = a.req("/api/files/zip?" + urllib.parse.urlencode({"share": "groups", "path": "fm"}))
+            zo = [o for o in ops(a) if o["kind"] == "download" and o["name"] == "fm.zip"]
+            check("transfers: a ZIP download is listed with its size at the end", st == 200 and zo and zo[0]["state"] == "done" and zo[0]["total"] == len(zb))
+            check("transfers: alice sees only her own", all(o["user"] == "alice" for o in ops(u)) and any(o["user"] == "admin" for o in ops(a)))
+            open(g0 + "/gross.bin", "wb").write(os.urandom(4 << 20))
+            st, j = a.req("/api/files/transfer", {"op": "copy", "items": [{"share": "groups", "path": "gross.bin"}], "dst": {"share": "groups", "path": "fm"}})
+            jid = j.get("job", "")
+            check("transfers: alice cannot cancel the admin's copy", u.req("/api/transfers/ctl", {"id": jid, "action": "cancel"})[0] == 404)
+            time.sleep(0.3)
+            st, _ = a.req("/api/transfers/ctl", {"id": jid, "action": "pause"})
+            o1 = [o for o in ops(a) if o["id"] == jid]
+            time.sleep(0.5)
+            o2 = [o for o in ops(a) if o["id"] == jid]
+            check("transfers: pause holds the copy (state paused, no progress)", st == 200 and o1 and o1[0]["state"] == "paused"
+                  and o2[0]["done"] == o1[0]["done"] < 4 << 20 and os.path.exists(g0 + "/fm/gross.bin.untrash-part"))
+            def data_fds(pid):
+                out = []
+                for fd in os.listdir("/proc/%d/fd" % pid):
+                    try:
+                        t = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+                    except OSError:
+                        continue
+                    if t.startswith(r + "/i-data/"):
+                        out.append(t)
+                return out
+            # a CIFS file open for writing in the Desk hangs every process it forks (untrash1, 2026-10-25)
+            check("transfers: during a copy the Desk itself holds no file of a data volume open", data_fds(srv.pid) == [])
+            a.req("/api/transfers/ctl", {"id": jid, "action": "resume"})
+            time.sleep(0.3)
+            check("transfers: resume continues it", [o for o in ops(a) if o["id"] == jid][0]["done"] > o2[0]["done"])
+            a.req("/api/transfers/ctl", {"id": jid, "action": "pause"})
+            st, _ = a.req("/api/transfers/ctl", {"id": jid, "action": "cancel"})
+            j = job_wait(a, jid)
+            check("transfers: cancel of a paused copy ends it and removes the partial file", st == 200 and j.get("state") == "cancelled"
+                  and not os.path.exists(g0 + "/fm/gross.bin.untrash-part") and not os.path.exists(g0 + "/fm/gross.bin"))
+            check("transfers: an ended one cannot be cancelled again", a.req("/api/transfers/ctl", {"id": jid, "action": "cancel"})[0] == 409)
+            # an upload cancelled in the Transfers window while its body is still coming
+            import http.client
+            ck = "; ".join("%s=%s" % (c.name, c.value) for c in a.jar)
+            hc = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            hc.putrequest("POST", "/api/files/upload?share=groups&path=&name=lang.bin")
+            for k, v in (("X-UT", "1"), ("Cookie", ck), ("Content-Type", "application/octet-stream"), ("Content-Length", str(8 << 20))):
+                hc.putheader(k, v)
+            hc.endheaders()
+            hc.send(b"x" * (1 << 20))
+            uo = []
+            for _i in range(50):
+                uo = [o for o in ops(a) if o["kind"] == "upload" and o["name"] == "lang.bin" and o["state"] == "running" and o["done"]]
+                if uo:
+                    break
+                time.sleep(0.1)
+            st_c = a.req("/api/transfers/ctl", {"id": uo[0]["id"], "action": "cancel"})[0] if uo else 0
+            try:
+                hc.send(b"x" * (1 << 20))
+                rs = hc.getresponse().status
+            except OSError:
+                rs = 0
+            hc.close()
+            time.sleep(0.3)
+            check("transfers: an upload cancelled from the list (409, no file, no partial file)", st_c == 200 and rs in (409, 0)
+                  and not os.path.exists(g0 + "/lang.bin") and not os.path.exists(g0 + "/.lang.bin.untrash-upload")
+                  and [o for o in ops(a) if o["id"] == uo[0]["id"]][0]["state"] == "cancelled")
+            st, _ = a.req("/api/transfers/ctl", {"id": "", "action": "dismiss"})
+            check("transfers: finished ones leave the list", st == 200 and not [o for o in ops(a) if o["state"] in ("done", "errors", "cancelled")])
+            check("transfers: the download service is only for admins", u.req("/api/transfers/ctl", {"id": "dl:0123456789abcdef", "action": "pause"})[0] == 403)
+            os.unlink(g0 + "/gross.bin")
+            os.unlink(g0 + "/fm/p.jpg")
             shutil.rmtree(mx + "/fm")
             shutil.rmtree(mx + "/recycle")
             # media viewer: inline only for media types, sandboxed, with Range

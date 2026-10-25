@@ -2123,9 +2123,111 @@ def files_op(user, req):
     return {}
 
 
-# ------------------------------------------------- copy / move (background jobs)
+# ------------------------------------- transfers: copy/move jobs, uploads, downloads
 
-FILE_JOBS = {}                 # id -> job (memory; finished jobs are kept an hour)
+# The Desk never holds a file open for writing on a data volume while it
+# copies: a CIFS partner file is flushed whenever any process forked from the
+# Desk closes it, and with a copy writing on, that flush never ends (hung
+# Desk threads, untrash1 2026-10-25).  untrash-transfer writes instead.
+TRANSFER_TOOL = os.environ.get("ZT_TRANSFER_TOOL", os.path.join(HERE, "untrash-transfer"))
+OPS = {}               # id -> transfer record (JSON as sent); finished ones are kept an hour
+OPS_CTL = {}           # id -> {"proc": Popen | None, "cancel": bool}
+OPS_LOCK = threading.Lock()
+OPS_KEEP = 3600
+OPS_DONE = ("done", "errors", "cancelled")
+
+
+def op_new(kind, user, name, where, total=0, **extra):
+    now = time.time()
+    with OPS_LOCK:
+        for k in [k for k, o in OPS.items() if o["state"] in OPS_DONE and now - o["t"] > OPS_KEEP]:
+            del OPS[k]
+            OPS_CTL.pop(k, None)
+        o = {"id": secrets.token_hex(6), "kind": kind, "user": user, "name": name, "where": where, "state": "running",
+             "total": total, "done": 0, "files": 0, "skipped": 0, "current": "", "errors": [], "rate": 0,
+             "started": now, "t": now}
+        o.update(extra)
+        OPS[o["id"]] = o
+        OPS_CTL[o["id"]] = {"proc": None, "cancel": False, "mark": (now, 0)}
+    return o
+
+
+def op_progress(o, done):
+    """Bytes so far; the rate is smoothed over about two seconds."""
+    o["done"] = done
+    c = OPS_CTL.get(o["id"])
+    now = time.time()
+    if c and now - c["mark"][0] >= 1:
+        r = (done - c["mark"][1]) / (now - c["mark"][0])
+        o["rate"] = int(r if not o["rate"] else 0.5 * o["rate"] + 0.5 * r)
+        c["mark"] = (now, done)
+
+
+def op_end(o, state, errors=None):
+    o.update(state=state, rate=0, current="", t=time.time())
+    if errors:
+        o["errors"] = (o["errors"] + list(errors))[:20]
+    c = OPS_CTL.get(o["id"])
+    if c:
+        c["proc"] = None
+
+
+def ops_list(user, admin):
+    with OPS_LOCK:
+        mine = [dict(o) for o in OPS.values() if admin or o["user"] == user]
+    return sorted(mine, key=lambda o: (o["state"] in OPS_DONE, -o["started"]))
+
+
+def ops_state(user, admin, q):
+    out = {"ops": ops_list(user, admin), "service": None}
+    if admin and q.get("service") == "1":
+        d = settings_load()["services"]["download"]
+        if d["active"]:
+            out["service"] = downloads()["items"]
+    return out
+
+
+def ops_ctl(user, admin, req):
+    """cancel, pause, resume (copy/move), dismiss (finished ones; id "" = all);
+    ids "dl:<gid>" are jobs of the download service (admins)."""
+    oid, act = str(req.get("id") or ""), req.get("action")
+    if oid.startswith("dl:"):
+        if not admin:
+            raise Fail("Only administrators.", 403)
+        return downloads_ctl({"gid": oid[3:], "action": {"cancel": "remove"}.get(act, act)})
+    if act == "dismiss" and not oid:
+        with OPS_LOCK:
+            for k in [k for k, o in OPS.items() if o["state"] in OPS_DONE and (admin or o["user"] == user)]:
+                del OPS[k]
+                OPS_CTL.pop(k, None)
+        return {}
+    o, c = OPS.get(oid), OPS_CTL.get(oid)
+    if not o or not (admin or o["user"] == user):
+        raise Fail("No such transfer.", 404)
+    p = c and c["proc"]
+    if act == "dismiss":
+        if o["state"] not in OPS_DONE:
+            raise Fail("The transfer is still running.", 409)
+        with OPS_LOCK:
+            OPS.pop(oid, None)
+            OPS_CTL.pop(oid, None)
+    elif o["state"] in OPS_DONE:
+        raise Fail("The transfer has already ended.", 409)
+    elif act == "cancel":
+        c["cancel"] = True
+        if p and o["kind"] in ("copy", "move"):
+            p.terminate()                       # untrash-transfer removes the partial file
+            if o["state"] == "paused":
+                p.send_signal(signal.SIGCONT)
+                o["state"] = "running"
+    elif act in ("pause", "resume") and o["kind"] in ("copy", "move") and p:
+        p.send_signal(signal.SIGSTOP if act == "pause" else signal.SIGCONT)
+        o["state"] = "paused" if act == "pause" else "running"
+        o["rate"] = 0
+        c["mark"] = (time.time(), o["done"])
+    else:
+        raise Fail("Unknown action.")
+    return {}
 
 
 def files_transfer(user, req):
@@ -2150,139 +2252,60 @@ def files_transfer(user, req):
         items.append(f)
     if not items:
         raise Fail("Nothing selected.")
-    now = time.time()
-    for k in [k for k, j in FILE_JOBS.items() if j["state"] != "running" and now - j["t"] > 3600]:
-        del FILE_JOBS[k]
-    jid = secrets.token_hex(6)
-    job = {"id": jid, "user": user, "op": op, "state": "running", "total": 0, "done": 0, "files": 0, "current": "",
-           "errors": [], "skipped": 0, "cancel": False, "t": now, "dst": str(dst.get("path") or "") or str(dst.get("share") or "")}
-    FILE_JOBS[jid] = job
-    threading.Thread(target=transfer_run, args=(job, items, dfull, conflict), daemon=True).start()
-    return {"job": jid}
+    where = "/".join(x for x in (str(dst.get("share") or ""), str(dst.get("path") or "").strip("/")) if x)
+    name = os.path.basename(items[0]) if len(items) == 1 else "%d items" % len(items)
+    o = op_new(op, user, name, where, op=op, dst=str(dst.get("path") or "") or str(dst.get("share") or ""))
+    spec = {"op": op, "items": items, "dst": dfull, "conflict": conflict, "uid": None if TEST else owner_of(user), "gid": 500,
+            "skip_names": [IMP.RECYCLE_FN, IMP.RECYCLE_RBM_FN]}
+    threading.Thread(target=transfer_run, args=(o, spec), daemon=True).start()
+    return {"job": o["id"]}
 
 
-def transfer_run(job, items, dfull, conflict):
-    class Cancelled(Exception):
-        pass
-
-    def err(msg):
-        if len(job["errors"]) < 20:
-            job["errors"].append(msg)
-
-    def copy_file(src, dst):
-        tmp = dst + ".untrash-part"
-        try:
-            with open(src, "rb") as fi, open(tmp, "wb") as fo:
-                while True:
-                    if job["cancel"]:
-                        raise Cancelled()
-                    b = fi.read(1 << 20)
-                    if not b:
-                        break
-                    fo.write(b)
-                    job["done"] += len(b)
-            st = os.stat(src)
-            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
-            own(tmp, job["user"])
-            os.replace(tmp, dst)
-            job["files"] += 1
-        except BaseException:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
-
-    def copy_tree(src, dst):
-        if os.path.islink(src):
-            err("%s: links are not copied" % os.path.basename(src))
-            return False
-        if os.path.isdir(src):
-            os.mkdir(dst)
-            own(dst, job["user"])
-            ok = True
-            for e in sorted(os.listdir(src)):
-                if e in (IMP.RECYCLE_FN, IMP.RECYCLE_RBM_FN):
-                    continue
-                job["current"] = e
-                try:
-                    ok = copy_tree(os.path.join(src, e), os.path.join(dst, e)) and ok
-                except OSError as x:
-                    err("%s: %s" % (e, x.strerror or x))
-                    ok = False
-            return ok
-        copy_file(src, dst)
-        return True
-
-    def size(p):
-        if os.path.islink(p):
-            return 0
-        if os.path.isfile(p):
-            return os.path.getsize(p)
-        t = 0
-        for d, _ds, fs in os.walk(p):
-            for f in fs:
-                fp = os.path.join(d, f)
-                if not os.path.islink(fp):
-                    try:
-                        t += os.path.getsize(fp)
-                    except OSError:
-                        pass
-        return t
-
+def transfer_run(o, spec):
+    c = OPS_CTL[o["id"]]
     try:
-        job["total"] = sum(size(f) for f in items)
-        for src in items:
-            name = os.path.basename(src)
-            job["current"] = name
-            target = os.path.join(dfull, name)
-            if job["op"] == "move" and os.path.dirname(src) == dfull:
-                job["skipped"] += 1                  # moved onto itself: nothing to do
-                continue
-            if os.path.lexists(target):
-                if conflict == "skip":
-                    job["skipped"] += 1
-                    continue
-                if conflict == "rename" or target == src:
-                    target = free_name(target)
-                else:                                # overwrite: the old one goes
-                    if os.path.isdir(target) and not os.path.islink(target):
-                        shutil.rmtree(target)
-                    else:
-                        os.unlink(target)
+        p = subprocess.Popen(["nice", "-n", "10", TRANSFER_TOOL, "run"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    except OSError as x:
+        return op_end(o, "errors", [str(x)])
+    c["proc"] = p
+    if c["cancel"]:
+        p.terminate()
+    end = None
+    try:
+        p.stdin.write(json.dumps(spec))
+        p.stdin.close()
+        for line in p.stdout:
             try:
-                if job["op"] == "move":
-                    try:
-                        os.rename(src, target)       # same file system: instant
-                        job["done"] += size(target)
-                        job["files"] += 1
-                        continue
-                    except OSError as x:
-                        if x.errno != 18:            # EXDEV: other volume, copy + delete
-                            raise
-                if copy_tree(src, target) and job["op"] == "move":
-                    if os.path.isdir(src) and not os.path.islink(src):
-                        shutil.rmtree(src)
-                    else:
-                        os.unlink(src)
-            except OSError as x:
-                err("%s: %s" % (name, x.strerror or x))
-        job["state"] = "done" if not job["errors"] else "errors"
-    except Cancelled:
-        job["state"] = "cancelled"
-    except Exception as x:  # noqa: BLE001 - a job must end with a state
-        err(str(x))
-        job["state"] = "errors"
-    job["current"], job["t"] = "", time.time()
+                x = json.loads(line)
+            except ValueError:
+                continue
+            if "total" in x:
+                o["total"] = x["total"]
+            o.update(files=x.get("files", 0), skipped=x.get("skipped", 0), current=x.get("current", ""))
+            op_progress(o, x.get("done", 0))
+            if "state" in x:
+                end = x
+    except (OSError, ValueError):
+        pass
+    p.wait()
+    if end:
+        op_end(o, end["state"], end.get("errors"))
+    else:
+        op_end(o, "cancelled" if c["cancel"] else "errors", [] if c["cancel"] else ["The copy process ended unexpectedly."])
 
 
 def file_jobs(user):
-    return {"jobs": [{k: v for k, v in j.items() if k not in ("user", "cancel")} for j in FILE_JOBS.values() if j["user"] == user]}
+    """Copy/move jobs of this user (the Files window)."""
+    return {"jobs": [o for o in ops_list(user, False) if o["kind"] in ("copy", "move")]}
 
 
 def file_job_cancel(user, req):
-    j = FILE_JOBS.get(str(req.get("job") or ""))
-    if not j or j["user"] != user:
+    o = OPS.get(str(req.get("job") or ""))
+    if not o or o["user"] != user or o["kind"] not in ("copy", "move"):
         raise Fail("No such job.", 404)
-    j["cancel"] = True
+    if o["state"] not in OPS_DONE:
+        ops_ctl(user, False, {"id": o["id"], "action": "cancel"})
     return {}
 
 
@@ -2872,19 +2895,47 @@ def files_upload(user, q, handler, length):
         _b, full = resolve(user, q.get("share", ""), os.path.join(q.get("path", ""), q["dirs"]), write=True)
     dst = os.path.join(full, name)
     tmp = os.path.join(full, ".%s.untrash-upload" % name)
-    with open(tmp, "wb") as f:
-        left = length
+    where = "/".join(x for x in (q.get("share", ""), q.get("path", "").strip("/"), q.get("dirs", "")) if x)
+    o = op_new("upload", user, name, where, length)
+    c = OPS_CTL[o["id"]]
+    # untrash-transfer writes the file (see TRANSFER_TOOL), the Desk only pipes the body
+    p = subprocess.Popen([TRANSFER_TOOL, "receive", tmp, dst, str(length), "" if TEST else str(owner_of(user))],
+                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    c["proc"] = p
+    left, why = length, ""
+    try:
         while left:
+            if c["cancel"]:
+                why = "cancelled"
+                break
             b = handler.rfile.read(min(left, 1 << 20))
             if not b:
-                os.unlink(tmp)
-                raise Fail("Transfer aborted.")
-            f.write(b)
+                why = "aborted"
+                break
+            p.stdin.write(b)
             left -= len(b)
-    os.chmod(tmp, 0o777)
-    if not TEST:
-        os.chown(tmp, owner_of(user), 500)
-    os.replace(tmp, dst)
+            op_progress(o, length - left)
+    except BrokenPipeError:
+        why = "failed"
+    except OSError:
+        why = "aborted"
+    try:
+        p.stdin.close()
+    except BrokenPipeError:
+        pass
+    if why:
+        p.terminate()
+    err = p.stderr.read().decode(errors="replace").strip().splitlines()
+    rc = p.wait()
+    if why == "cancelled":
+        handler.close_connection = True            # the rest of the body is not read
+        op_end(o, "cancelled")
+        raise Fail("Cancelled.", 409)
+    if why or rc:
+        msg = err[-1] if why == "failed" or (rc and err) else "Transfer aborted."
+        op_end(o, "errors", [msg])
+        raise Fail("Transfer aborted." if msg == "Transfer aborted." else "Upload failed: %s" % msg)
+    op_end(o, "done")
     return {}
 
 
@@ -3848,7 +3899,7 @@ class Handler(BaseHTTPRequestHandler):
             _b, full = resolve(user, q.get("share", ""), q.get("path", ""))
             if not os.path.isfile(full):
                 raise Fail("Not a file.", 404)
-            return self.send_file(full, inline=q.get("inline") == "1")
+            return self.send_file(full, inline=q.get("inline") == "1", who=user)
         if p == "/api/export/targets" and method == "GET":
             return self.reply(200, export_targets(user))
         if p == "/api/export/start" and method == "POST":
@@ -3874,6 +3925,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, files_op(user, self.json_body()))
         if p == "/api/files/transfer" and method == "POST":
             return self.reply(200, files_transfer(user, self.json_body()))
+        if p == "/api/transfers" and method == "GET":
+            return self.reply(200, ops_state(user, admin, q))
+        if p == "/api/transfers/ctl" and method == "POST":
+            return self.reply(200, ops_ctl(user, admin, self.json_body()))
         if p == "/api/files/jobs" and method == "GET":
             return self.reply(200, file_jobs(user))
         if p == "/api/files/jobs/cancel" and method == "POST":
@@ -3895,7 +3950,7 @@ class Handler(BaseHTTPRequestHandler):
                 zname = os.path.basename(full) or q.get("share", "download")
             else:
                 sel, zname = [full], os.path.basename(full) or q.get("share", "download")
-            return self.zip_stream(sel, zname)
+            return self.zip_stream(sel, zname, who=user)
         if p == "/api/files/upload" and method == "POST":
             return self.reply(200, files_upload(user, q, self, int(self.headers.get("Content-Length") or 0)))
         if p == "/api/tv" and method == "GET":
@@ -4126,15 +4181,18 @@ class Handler(BaseHTTPRequestHandler):
         except Fail:
             return self.reply(410, LINK_PAGE % ("Link", "UntrashOS", "<p>No access to this file any more.</p>"), "text/html; charset=utf-8")
         if os.path.isfile(full):
-            return self.send_file(full)
+            return self.send_file(full, who=v["owner"], via="link")
         if not os.path.isdir(full):
             return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>The file no longer exists.</p>"), "text/html; charset=utf-8")
-        return self.zip_stream([full], os.path.basename(full.rstrip("/")) or "download")
+        return self.zip_stream([full], os.path.basename(full.rstrip("/")) or "download", who=v["owner"], via="link")
 
-    def zip_stream(self, items, name):
+    def zip_stream(self, items, name, who=None, via="files"):
         """Files and folders as one ZIP (stored, streamed while it is made;
-        hidden files, links and recycle bins left out)."""
+        hidden files, links and recycle bins left out).  who: listed under
+        Transfers (size unknown until the end)."""
         import zipfile
+        o = op_new("download", who, name + ".zip", via) if who else None
+        c = OPS_CTL[o["id"]] if o else None
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Disposition", "attachment; filename*=UTF-8''%s.zip" % urllib.parse.quote(name))
@@ -4147,8 +4205,12 @@ class Handler(BaseHTTPRequestHandler):
                 s.w, s.n = w, 0
 
             def write(s, b):
+                if c and c["cancel"]:
+                    raise ConnectionAbortedError()
                 s.w.write(b)
                 s.n += len(b)
+                if o:
+                    op_progress(o, s.n)
                 return len(b)
 
             def tell(s):
@@ -4175,8 +4237,16 @@ class Handler(BaseHTTPRequestHandler):
                             if os.path.islink(fp) or f.startswith("."):
                                 continue
                             z.write(fp, os.path.join(top, os.path.relpath(fp, full)))
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            if o:
+                o["total"] = o["done"]
+                op_end(o, "done")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            if o:
+                op_end(o, "cancelled")
+        except BaseException as x:
+            if o:
+                op_end(o, "errors", [str(x)])
+            raise
 
     def stream_media(self, full, q):
         """Remux for the player: video copied, sound to AAC unless the browser
@@ -4207,9 +4277,10 @@ class Handler(BaseHTTPRequestHandler):
             p.kill()
             p.wait()
 
-    def send_file(self, full, inline=False):
+    def send_file(self, full, inline=False, who=None, via="files"):
         """Download; inline (photo/music/video viewer) only for media types a
-        browser cannot run as a page, with Range for seeking in audio/video."""
+        browser cannot run as a page, with Range for seeking in audio/video.
+        Downloads (not inline views) of user who are listed under Transfers."""
         size = os.path.getsize(full)
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         inline = inline and (ctype in INLINE_TYPES or ctype.startswith(("audio/", "video/")))
@@ -4241,15 +4312,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command == "HEAD":
             return
-        with open(full, "rb") as f:
-            f.seek(start)
-            left = end - start + 1
-            while left > 0:
-                b = f.read(min(left, 1 << 20))
-                if not b:
-                    break
-                self.wfile.write(b)
-                left -= len(b)
+        o = op_new("download", who, os.path.basename(full), via, end - start + 1) if who and not inline else None
+        c = OPS_CTL[o["id"]] if o else {"cancel": False}
+        left = end - start + 1
+        try:
+            with open(full, "rb") as f:
+                f.seek(start)
+                while left > 0 and not c["cancel"]:
+                    b = f.read(min(left, 1 << 20))
+                    if not b:
+                        break
+                    self.wfile.write(b)
+                    left -= len(b)
+                    if o:
+                        op_progress(o, end - start + 1 - left)
+        except (BrokenPipeError, ConnectionResetError):
+            if o:
+                op_end(o, "cancelled")
+                return
+            raise
+        if c["cancel"]:
+            self.close_connection = True
+        if o:
+            op_end(o, "done" if not left else "cancelled" if c["cancel"] else "errors",
+                   [] if not left or c["cancel"] else ["The file got shorter while it was sent."])
 
     def run(self, method):
         try:
