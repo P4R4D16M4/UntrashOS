@@ -1,0 +1,32 @@
+#!/bin/sh
+# Way A data partition ut-data (btrfs) at /i-data/utdata (untrash-data.service).
+# With an UntrashMesh off-site mirror it is mounted through its DRBD device
+# (untrash-mesh mirror-up, as untrash-import-zyxel does for stock volumes);
+# when the mirror does not start, the partition itself is mounted and the
+# copy is marked for a full resync by untrash-mesh.
+# Test hooks: ZT_IDATA (instead of /i-data), ZT_UTDATA_DEV, ZT_MESH_TOOL.
+I=${ZT_IDATA:-/i-data}
+DEV=${ZT_UTDATA_DEV:-/dev/disk/by-partlabel/ut-data}
+MESH=${ZT_MESH_TOOL:-/usr/lib/untrash/untrash-mesh}
+M=$I/utdata
+mountpoint -q "$I" || mount -t tmpfs -o mode=0755,size=1m tmpfs "$I"
+mkdir -p "$M"
+if ! mountpoint -q "$M"; then
+	part=$(readlink -f "$DEV")
+	use=$part
+	if [ -x "$MESH" ]; then
+		out=$("$MESH" mirror-up "$part" /i-data/utdata 2>/dev/null | tail -n 1)
+		drbd=$(printf '%s' "$out" | sed -n 's/.*"device": *"\([^"]*\)".*/\1/p')
+		err=$(printf '%s' "$out" | sed -n 's/.*"error": *"\([^"]*\)".*/\1/p')
+		[ -n "$err" ] && echo "untrash-data: $err; mounted directly" >&2
+		[ -n "$drbd" ] && use=$drbd
+	fi
+	# device= pins btrfs to this device: under DRBD the partition and the DRBD
+	# device carry the same file system id
+	if ! mount -t btrfs -o "noatime,device=$use" "$use" "$M"; then
+		[ "$use" != "$part" ] && echo "untrash-data: mount of $use failed, mounting $part" >&2 &&
+			mount -t btrfs -o noatime "$part" "$M"
+	fi
+fi
+chmod 777 "$M"
+[ -e "$I/sysvol" ] || ln -s utdata "$I/sysvol"
