@@ -1689,6 +1689,20 @@ def boot_env():
         return {}
 
 
+def running_slot():
+    """(slot a/b of the running system, boot kind).  A slot file boot has it
+    in boot.env; a partition boot has no boot.env (zt-slotinit writes none),
+    there the loader's cmdline names the partition.  None when unknown: an
+    update must then not guess (2026-10-25: the guess "a" wrote over the
+    running slot of a partition-booted NAS)."""
+    env = boot_env()
+    if env.get("ZT_BOOT") == "file":
+        return (env.get("ZT_SLOT") if env.get("ZT_SLOT") in ("a", "b") else None), "file"
+    cmd = first("/proc/cmdline")
+    m = re.search(r"untrash\.part=ut-sys-([ab])(?:\s|$)", cmd) or re.search(r"dm-mod\.waitfor=PARTLABEL=ut-sys-([ab])(?:\s|$)", cmd)
+    return (m.group(1) if m else None), "partition"
+
+
 def update_upload(handler, length):
     """Body = a slot file (*.utslot, firmware install/mk-stick-system.sh); stored,
     signature + payload hashes checked by zt-loader's rules, written to the
@@ -1745,10 +1759,12 @@ def update_install(req):
     if UPDATE.get("older") and not req.get("downgrade"):
         raise Fail("This image is not newer than the running system (%s); confirm the downgrade." % first("/etc/untrash-version", "?").strip())
     env = boot_env()
-    slot = env.get("ZT_SLOT") or ""
+    slot, kind = running_slot()
+    if slot is None:
+        raise Fail("Cannot tell which system slot is running; nothing written.", 500)
     other = "b" if slot == "a" else "a"
     f = UPDATE["file"]
-    if env.get("ZT_BOOT") == "file":
+    if kind == "file":
         dst = "%s/.untrash/slot-%s.utslot" % (env.get("ZT_HOST", "/run/untrash/host"), other)
         sysrun(["cp", f, dst + ".new"])
         sysrun(["sync"])

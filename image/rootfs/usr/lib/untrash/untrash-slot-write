@@ -6,6 +6,12 @@
 set -e
 F=$1; P=$2
 [ -f "$F" ] && [ -b "$P" ] || { echo "usage: untrash-slot-write FILE PARTITION" >&2; exit 2; }
+# never the running system: refuse a partition that is mounted or under an
+# active device-mapper device (the dm-verity root of the running slot)
+real=$(readlink -f "$P"); name=${real##*/}
+if grep -q "^$real " /proc/mounts || ls /sys/class/block/"$name"/holders/ 2>/dev/null | grep -q .; then
+	echo "$P is in use (mounted or the running system), nothing written" >&2; exit 1
+fi
 size=$(stat -c %s "$F"); hlen=$((size - 8192)); psize=$(blockdev --getsize64 "$P")
 [ $((hlen % 4096)) = 0 ] && [ $hlen -gt 0 ] && [ $size -le $psize ] || { echo "bad slot file or partition too small" >&2; exit 1; }
 blocks=$((psize / 4096))

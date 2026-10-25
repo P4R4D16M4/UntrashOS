@@ -66,6 +66,7 @@ T = {
     "Beta (pre-releases too)": ("Beta (auch Vorabversionen)", "Bêta (préversions comprises)"),
     "Blue-weak (tritanopia)": ("Blauschwäche (Tritanopie)", "Faiblesse du bleu (tritanopie)"),
     "Cancelled.": ("Abgebrochen.", "Annulé."),
+    "Cannot tell which system slot is running; nothing written.": ("Es ist nicht erkennbar, welcher Systemslot läuft; nichts geschrieben.", "Impossible de savoir quel emplacement système est actif ; rien n'a été écrit."),
     "catching up": ("holt auf", "rattrape"),
     "Channel": ("Kanal", "Canal"),
     "Check for updates every day": ("Täglich nach Updates suchen", "Rechercher des mises à jour chaque jour"),

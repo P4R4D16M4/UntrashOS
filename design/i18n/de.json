@@ -182,6 +182,7 @@
 "Cancel": "Abbrechen",
 "Cancelled – see the log.": "Abgebrochen – siehe Protokoll.",
 "Cancelled.": "Abgebrochen.",
+"Cannot tell which system slot is running; nothing written.": "Es ist nicht erkennbar, welcher Systemslot läuft; nichts geschrieben.",
 "Case": "Gehäuse",
 "Caution: the stock array %s (%s) loses a disk and is incomplete afterwards": "Achtung: Der Stock-Verband %s (%s) verliert damit eine Platte und ist danach unvollständig",
 "Certificate / HTTPS": "Zertifikat / HTTPS",
