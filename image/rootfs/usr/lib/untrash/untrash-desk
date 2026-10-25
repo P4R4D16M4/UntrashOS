@@ -2308,6 +2308,21 @@ def files_size(user, q):
     return {"size": total, "files": files, "dirs": dirs, "partial": partial}
 
 
+def process_kill(req):
+    """Status → Processes: end one (TERM, or KILL when it does not react)."""
+    try:
+        out = untrash_live.kill(R, req.get("pid", 0), req.get("start", -1), "KILL" if req.get("signal") == "KILL" else "TERM", test=TEST)
+    except (LookupError, PermissionError, ValueError, TypeError) as e:
+        raise Fail(str(e) or "Invalid process.", 409 if isinstance(e, LookupError) else 400)
+    except ProcessLookupError:
+        raise Fail("This process has ended already.", 409)
+    if TEST:
+        SYSLOG.append(["kill", "-" + ("KILL" if req.get("signal") == "KILL" else "TERM"), str(req.get("pid"))])
+    log_line = "process %s (%s) ended with %s" % (req.get("pid"), out["name"], req.get("signal") or "TERM")
+    sys.stderr.write("untrash-desk: %s\n" % log_line)
+    return out
+
+
 # ------------------------------------------------------------- feedback
 
 PROJECT = os.environ.get("ZT_PROJECT", "/usr/share/untrash/project.json")
@@ -3368,6 +3383,10 @@ def office_open(user, req):
     return {"url": url, "access_token": wopi_token(user, share, path, exp), "access_token_ttl": exp * 1000, "action": act[0]}
 
 
+def wopi_mtime(full):
+    return datetime.datetime.fromtimestamp(os.stat(full).st_mtime, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def wopi_version(full):
     st = os.stat(full)
     return "%d-%d" % (st.st_mtime_ns, st.st_size)
@@ -3404,7 +3423,7 @@ def wopi_handle(handler, method, rest, q):
             "OwnerId": share, "UserId": user, "UserFriendlyName": user, "UserCanWrite": can_write, "ReadOnly": not can_write,
             "SupportsLocks": True, "SupportsGetLock": True, "SupportsUpdate": True, "UserCanNotWriteRelative": True,
             "SupportsRename": False, "UserCanRename": False,
-            "LastModifiedTime": datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")})
+            "LastModifiedTime": wopi_mtime(full)})
     if method == "GET" and contents:                           # GetFile
         _u, _s, _p, full = wopi_check(fid, token)
         if os.path.getsize(full) > WOPI_MAX:
@@ -3436,7 +3455,8 @@ def wopi_handle(handler, method, rest, q):
         if not TEST:
             os.chown(tmp, st.st_uid, st.st_gid)        # the file keeps its owner (stock rights)
         os.replace(tmp, full)
-        return handler.reply(200, {}, headers=[("X-WOPI-ItemVersion", wopi_version(full))])
+        # Collabora reads LastModifiedTime from this answer (detects changes by others later)
+        return handler.reply(200, {"LastModifiedTime": wopi_mtime(full)}, headers=[("X-WOPI-ItemVersion", wopi_version(full))])
     if override in ("LOCK", "GET_LOCK", "REFRESH_LOCK", "UNLOCK"):
         write = override != "GET_LOCK"
         wopi_check(fid, token, write=write)
@@ -3481,7 +3501,7 @@ def static(base, rel):
     return (open(full, "rb").read(), t) if t else None
 
 
-ADMIN_GET = {"/api/mesh", "/api/adblock", "/api/adblock/log", "/api/overview", "/api/live", "/api/activity", "/api/sound", "/api/volumes/dirs", "/api/feedback/info", "/api/storage", "/api/users", "/api/settings", "/api/logs", "/api/update", "/api/stock",
+ADMIN_GET = {"/api/processes", "/api/mesh", "/api/adblock", "/api/adblock/log", "/api/overview", "/api/live", "/api/activity", "/api/sound", "/api/volumes/dirs", "/api/feedback/info", "/api/storage", "/api/users", "/api/settings", "/api/logs", "/api/update", "/api/stock",
              "/api/timezones", "/api/raid", "/api/printers", "/api/cloud", "/api/downloads", "/api/copybtn", "/api/backup", "/api/users/quota", "/api/cert", "/api/upnp", "/api/iscsi", "/api/power/next",
              "/api/backup/versions"}
 ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete,
@@ -3494,7 +3514,7 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/mesh/leave": lambda req: mesh_post("leave", req), "/api/mesh/rename": lambda req: mesh_post("rename", req),
               "/api/mesh/share": lambda req: mesh_post("share", req),
               "/api/mesh/pair": lambda req: mesh_post("pair", req), "/api/mesh/app-link": lambda req: mesh_post("app-link", req),
-              "/api/users/signin": signin_reset, "/api/office/settings": office_save,
+              "/api/users/signin": signin_reset, "/api/processes/kill": process_kill, "/api/office/settings": office_save,
               "/api/mesh/mirror-start": lambda req: mesh_post("mirror-start", req),
               "/api/mesh/mirror-accept": lambda req: mesh_post("mirror-accept", req),
               "/api/mesh/mirror-decline": lambda req: mesh_post("mirror-decline", req),
@@ -3778,6 +3798,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, volume_dirs(q))
             if p == "/api/live":
                 return self.reply(200, untrash_live.live(R))
+            if p == "/api/processes":
+                return self.reply(200, untrash_live.processes(R))
             if p == "/api/activity":
                 a = untrash_live.activities(R)
                 for name, n in TV.running():

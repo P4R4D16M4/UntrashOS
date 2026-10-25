@@ -1560,18 +1560,62 @@ VIEWS.status = async b => {
         <svg viewBox="0 0 120 24" preserveAspectRatio="none"><polyline points="${h.map((x, i) => `${i * 3},${24 - 22 * x / mx}`).join(' ')}"/></svg></div>`;
     }
     const disks = Object.entries(L.disks).map(([d, t]) => `<span class="ut-pill ${t == null ? '' : t >= 50 ? 'ut-pill--warn' : 'ut-pill--ok'}">${esc(d)} ${t == null ? 'asleep' : t + ' °C'}</span>`).join(' ');
-    const main = b.querySelector('.ut-status');
+    const main = b.querySelector('#st-top');
     const html = `<div class="ut-rings">${ring(L.cpu.total, 100, 'CPU', '%', 70, 90)}${L.cpu.cores.map((c, i) => ring(c, 100, 'Core ' + (i + 1), '%', 70, 90)).join('')}
         ${ring(100 * used / m.total, 100, 'RAM ' + size(used), '%', 80, 92)}${ring(L.board.temp_c, 80, 'Case' + (L.board.stale ? ' (old)' : ''), '°C', 55, 68)}</div>
       <div class="ut-section-title">Disks</div><div class="row" style="flex-wrap:wrap;gap:6px">${disks || '<span class="muted">none</span>'}</div>
       <div class="ut-section-title">Network</div>${net}
       <p class="muted">Load ${L.load.join(' · ')} · Fan level ${L.board.level ?? '–'} · up for ${days ? days + ' d ' : ''}${hours % 24} h · swap ${size(m.swap_total - m.swap_free)} / ${size(m.swap_total)}</p>`;
-    if (main) main.innerHTML = html; else b.innerHTML = `<div class="ut-window__main ut-status">${html}</div>`;
+    if (main) main.innerHTML = html;
+    else {
+      b.innerHTML = `<div class="ut-window__main ut-status"><div id="st-top">${html}</div>
+        <div class="row ut-procs__head"><div class="ut-section-title">Processes</div><span class="ut-spacer"></span>
+          <input class="ut-input ut-procs__filter" id="psf" type="search" placeholder="${esc(UTI18N.tr('Filter by name, user or command'))}" aria-label="Filter">
+          ${sw('psk', PROCS.kernel, 'Kernel threads')}</div>
+        <div class="ut-table-wrap"><table class="ut-table ut-procs"><thead><tr>
+          ${[['name', 'Name'], ['pid', 'PID'], ['user', 'User'], ['cpu', 'CPU'], ['rss', 'Memory']].map(([k, n]) => `<th${k === 'pid' || k === 'cpu' || k === 'rss' ? ' class="num"' : ''}><button class="ut-th" data-ps="${k}">${esc(UTI18N.tr(n))}</button></th>`).join('')}
+          <th>Command</th><th></th></tr></thead><tbody id="pst"></tbody></table></div>
+        <p class="muted" id="psn"></p></div>`;
+      $('#psf', b).oninput = e => { PROCS.filter = e.target.value; procDraw(b); };
+      $('#psk', b).onchange = e => { PROCS.kernel = e.target.checked; procDraw(b); };
+      $$('[data-ps]', b).forEach(x => x.onclick = () => { PROCS.dir = PROCS.sort === x.dataset.ps ? -PROCS.dir : (x.dataset.ps === 'name' || x.dataset.ps === 'user' ? 1 : -1); PROCS.sort = x.dataset.ps; procDraw(b); });
+      $('#pst', b).onclick = e => {
+        const btn = e.target.closest('[data-pk]'); if (!btn) return;
+        const p = PROCS.list.find(x => x.pid === +btn.dataset.pk); if (!p) return;
+        const hard = btn.dataset.sig === 'KILL';
+        dialog({ kind: 'danger', title: hard ? 'Kill the process?' : 'End the process?', ok: hard ? 'Kill' : 'End', okCls: 'ut-btn--danger',
+          body: `<p><b translate="no">${esc(p.name)}</b> (PID ${p.pid}, ${esc(p.user)})</p><p class="ut-faint mono" translate="no">${esc(p.cmd)}</p>
+            <p>${esc(UTI18N.tr(hard ? 'It stops at once, without saving anything.' : 'It is asked to end (TERM). System services may be started again automatically.'))}</p>`,
+          onOk: async () => { await api('processes/kill', { pid: p.pid, start: p.start, signal: hard ? 'KILL' : 'TERM' }); toast(UTI18N.tr(hard ? 'Killed' : 'Ended'), p.name); setTimeout(() => procs(b), 600); } });
+      };
+    }
+    await procs(b);
   };
   await draw();
   const d1 = single(draw), t = setInterval(() => d1().catch(() => { }), 2000);
   CLEANUP.status = () => clearInterval(t);
 };
+const PROCS = { list: [], self: 0, sort: 'cpu', dir: -1, filter: '', kernel: false };
+async function procs(b) {
+  try { const r = await apiRaw('processes'); PROCS.list = r.processes; PROCS.self = r.self; } catch (e) { return; }
+  procDraw(b);
+}
+function procDraw(b) {
+  const tb = $('#pst', b); if (!tb) return;
+  const f = PROCS.filter.toLowerCase(), k = PROCS.sort;
+  const list = PROCS.list.filter(p => (PROCS.kernel || !p.kernel) && (!f || (p.name + ' ' + p.user + ' ' + p.cmd + ' ' + p.pid).toLowerCase().includes(f)))
+    .sort((a, c) => { const x = a[k] ?? -1, y = c[k] ?? -1; return PROCS.dir * (typeof x === 'string' ? x.localeCompare(y) : x - y) || a.pid - c.pid; });
+  const shown = list.slice(0, 200);
+  tb.innerHTML = shown.map(p => {
+    const locked = p.kernel || p.pid <= 2 || p.pid === PROCS.self;
+    return `<tr><td translate="no"><b>${esc(p.name)}</b></td><td class="num">${p.pid}</td><td translate="no">${esc(p.user)}</td>
+      <td class="num">${p.cpu == null ? '–' : p.cpu.toFixed(1) + ' %'}</td><td class="num">${p.rss ? size(p.rss) : '–'}</td>
+      <td class="ut-procs__cmd mono" translate="no" title="${esc(p.cmd)}">${esc(p.cmd)}</td>
+      <td class="ut-rowbtns">${locked ? '' : `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-pk="${p.pid}" data-sig="TERM">End</button><button class="ut-btn ut-btn--sm ut-btn--ghost ut-btn--danger" data-pk="${p.pid}" data-sig="KILL">Kill</button>`}</td></tr>`;
+  }).join('');
+  $$('[data-ps]', b).forEach(x => { x.dataset.on = x.dataset.ps === k ? (PROCS.dir > 0 ? '▲' : '▼') : ''; });
+  const n = $('#psn', b); if (n) n.textContent = UTI18N.tr('%s processes').replace('%s', list.length) + (list.length > shown.length ? ' · ' + UTI18N.tr('the first 200 shown') : '');
+}
 
 /* terminal: xterm.js over a WebSocket to a login shell (admins; sudo for root) */
 const loadOnce = (tag, attrs) => new Promise((ok, bad) => {

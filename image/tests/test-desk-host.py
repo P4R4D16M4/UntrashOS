@@ -252,6 +252,32 @@ def main():
             check("admin rename + delete", a.req("/api/files/op", {"op": "rename", "share": "mixed", "path": "neu.txt", "name": "n2.txt"})[0] == 200
                   and a.req("/api/files/op", {"op": "delete", "share": "mixed", "path": "n2.txt"})[0] == 200
                   and not os.path.exists(r + "/i-data/aaaa0001/mixed/n2.txt"))
+            # Status → processes (fake /proc in the test root)
+            for pid, name, ppid, cmd, uid, ticks in ((1, "systemd", 0, "/sbin/init", 0, 900), (77, "kworker/0:1", 2, "", 0, 5),
+                                                     (4242, "rclone", 1, "rclone sync /i-data/x remote:", 1000, 300)):
+                os.makedirs(r + "/proc/%d" % pid, exist_ok=True)
+                open(r + "/proc/%d/stat" % pid, "w").write("%d (%s) S %d 1 1 0 -1 0 0 0 0 0 %d 50 0 0 20 0 1 0 1234%d 99999 512 0\n"
+                                                         % (pid, name, ppid, ticks, pid))
+                open(r + "/proc/%d/status" % pid, "w").write("Name:\t%s\nUid:\t%d\t%d\t%d\t%d\n" % (name, uid, uid, uid, uid))
+                open(r + "/proc/%d/cmdline" % pid, "w").write(cmd.replace(" ", "\0"))
+            os.makedirs(r + "/etc", exist_ok=True)
+            with open(r + "/etc/passwd", "a") as pw:
+                pw.write("root:x:0:0::/root:/bin/sh\nalice:x:1000:500::/nonexistent:/bin/sh\n")
+            st, pj = a.req("/api/processes")
+            ps = {p["pid"]: p for p in pj.get("processes", [])}
+            check("processes: listed with name, user, command, memory", st == 200 and ps[4242]["name"] == "rclone" and ps[4242]["user"] == "alice"
+                  and ps[4242]["cmd"] == "rclone sync /i-data/x remote:" and ps[4242]["rss"] == 512 * os.sysconf("SC_PAGE_SIZE"))
+            check("processes: kernel threads marked", ps[77]["kernel"] is True and ps[4242]["kernel"] is False)
+            check("processes: users get 403", u.req("/api/processes")[0] == 403 and u.req("/api/processes/kill", {"pid": 4242, "start": ps[4242]["start"]})[0] == 403)
+            st, kj = a.req("/api/processes/kill", {"pid": 4242, "start": ps[4242]["start"], "signal": "TERM"})
+            check("processes: end one (TERM)", st == 200 and kj["name"] == "rclone")
+            check("processes: KILL on request", a.req("/api/processes/kill", {"pid": 4242, "start": ps[4242]["start"], "signal": "KILL"})[0] == 200)
+            check("processes: a PID used again (other start time) is not hit", a.req("/api/processes/kill", {"pid": 4242, "start": 1})[0] == 409)
+            check("processes: PID 1 and kernel threads are refused", a.req("/api/processes/kill", {"pid": 1, "start": ps[1]["start"]})[0] == 400
+                  and a.req("/api/processes/kill", {"pid": 77, "start": ps[77]["start"]})[0] == 400)
+            check("processes: an ended process", a.req("/api/processes/kill", {"pid": 9999, "start": 1})[0] == 409)
+            for pid in (1, 77, 4242):
+                shutil.rmtree(r + "/proc/%d" % pid)
             # file manager: recycle bin, copy/move jobs, ZIP, search, size, folder upload
             mx = r + "/i-data/aaaa0001/mixed"
             check("delete on a share with recycle bin moves it there (tree kept)", os.path.isfile(mx + "/recycle/n2.txt"))
@@ -760,7 +786,7 @@ def main():
             check("wopi: PutFile with the wrong lock refused", wopi("POST", fid + "/contents", tk, b"BAD", {"X-WOPI-Override": "PUT", "X-WOPI-Lock": "L2"})[0] == 409
                   and open(r + "/i-data/aaaa0001/mixed/brief.odt", "rb").read() == b"ODT-1")
             st, _b, h = wopi("POST", fid + "/contents", tk, b"ODT-2 saved", {"X-WOPI-Override": "PUT", "X-WOPI-Lock": "L1"})
-            check("wopi: PutFile with the lock saves the file (new version)", st == 200 and open(r + "/i-data/aaaa0001/mixed/brief.odt", "rb").read() == b"ODT-2 saved"
+            check("wopi: PutFile with the lock saves the file (new version, LastModifiedTime for Collabora)", st == 200 and json.loads(_b).get("LastModifiedTime", "").endswith("Z") and open(r + "/i-data/aaaa0001/mixed/brief.odt", "rb").read() == b"ODT-2 saved"
                   and h.get("X-WOPI-ItemVersion") and not [x for x in os.listdir(r + "/i-data/aaaa0001/mixed") if "untrash-office" in x])
             check("wopi: UnlockAndRelock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "LOCK", "X-WOPI-Lock": "L3", "X-WOPI-OldLock": "L1"})[0] == 200)
             check("wopi: RefreshLock / Unlock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "REFRESH_LOCK", "X-WOPI-Lock": "L3"})[0] == 200

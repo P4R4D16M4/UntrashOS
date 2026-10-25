@@ -4,6 +4,9 @@ live(root)      CPU (per core, from /proc/stat deltas), memory, swap, load,
                 board temperature + fan level (zt-fan, /run/untrash/fan.json),
                 disk temperatures (smartctl -n standby, cached, never wakes a
                 disk), network rates, uptime.  Cheap enough for a 2 s poll.
+processes(root) the running processes with CPU share (deltas between two
+                calls), memory, user and command line; kill(root, pid, start,
+                sig) ends one (never PID 1, kernel threads or the caller).
 activities(root) what the NAS is doing right now: DLNA indexing and streams,
                 SMB clients, RAID resync/check, backup, downloads, COPY button,
                 slot update.  Polled by the Desk status bar.
@@ -32,6 +35,9 @@ _LOCK = threading.Lock()
 _CPU = {}         # last /proc/stat sample per cpu
 _NET = {}         # last /proc/net/dev sample per interface
 _DISKT = {"t": 0, "v": {}}
+_PROC = {}        # pid -> (start, cpu ticks, time) of the last processes() call
+_HZ = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+_PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 
 def _first(path, default=""):
@@ -129,6 +135,78 @@ def live(root=""):
                     "swap_total": mem.get("SwapTotal", 0), "swap_free": mem.get("SwapFree", 0)},
             "board": fan, "disks": _disk_temps(root), "net": _net(root),
             "uptime": int(float((_first(root + "/proc/uptime", "0").split() or ["0"])[0]))}
+
+
+# ------------------------------------------------------------- processes
+
+def _users(root):
+    out = {}
+    for line in _first(root + "/etc/passwd").splitlines():
+        p = line.split(":")
+        if len(p) > 2 and p[2].isdigit():
+            out[int(p[2])] = p[0]
+    return out
+
+
+def _stat(root, pid):
+    """(name, state, ppid, cpu ticks, start ticks, rss bytes) or None."""
+    raw = _first(root + "/proc/%s/stat" % pid)
+    if ")" not in raw:
+        return None
+    name = raw[raw.index("(") + 1:raw.rindex(")")]
+    f = raw[raw.rindex(")") + 2:].split()
+    try:            # fields 3.. of proc(5): state ppid ... utime(14) stime(15) ... starttime(22) vsize rss(24)
+        return name, f[0], int(f[1]), int(f[11]) + int(f[12]), int(f[19]), int(f[21]) * _PAGE
+    except (IndexError, ValueError):
+        return None
+
+
+def processes(root=""):
+    users, now, out = _users(root), time.time(), []
+    seen = {}
+    for pid in os.listdir(root + "/proc") if os.path.isdir(root + "/proc") else []:
+        if not pid.isdigit():
+            continue
+        st = _stat(root, pid)
+        if not st:
+            continue
+        name, state, ppid, ticks, start, rss = st
+        uid = None
+        for line in _first(root + "/proc/%s/status" % pid).splitlines():
+            if line.startswith("Uid:"):
+                uid = int(line.split()[1])
+                break
+        cmd = _first(root + "/proc/%s/cmdline" % pid).replace("\0", " ").strip()
+        kernel = not cmd and (ppid == 2 or int(pid) == 2)
+        prev = _PROC.get(pid)
+        cpu = None
+        if prev and prev[0] == start and now > prev[2]:
+            cpu = round(100.0 * (ticks - prev[1]) / _HZ / (now - prev[2]), 1)
+        seen[pid] = (start, ticks, now)
+        out.append({"pid": int(pid), "ppid": ppid, "name": name, "state": state, "user": users.get(uid, str(uid)),
+                    "cmd": (cmd or "[%s]" % name)[:300], "cpu": max(0.0, cpu) if cpu is not None else None,
+                    "rss": rss, "start": start, "kernel": kernel})
+    with _LOCK:
+        _PROC.clear()
+        _PROC.update(seen)
+    return {"processes": out, "self": os.getpid()}
+
+
+def kill(root, pid, start, sig, test=False):
+    """End a process; start must match (a PID used again by another process
+    is never hit).  Refused: PID 1, kernel threads, the calling process."""
+    pid = int(pid)
+    st = _stat(root, pid)
+    if not st:
+        raise LookupError("This process has ended already.")
+    name, _state, ppid, _t, pstart, _rss = st
+    if pstart != int(start):
+        raise LookupError("This process has ended already.")
+    if pid <= 2 or ppid == 2 or pid == os.getpid():
+        raise PermissionError("%s cannot be ended here." % name)
+    if not test:
+        os.kill(pid, signal.SIGKILL if sig == "KILL" else signal.SIGTERM)
+    return {"name": name}
 
 
 # ------------------------------------------------------------- activities

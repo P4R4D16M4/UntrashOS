@@ -86,8 +86,8 @@ editor. A restart of the Desk drops them.
 
 ### Office server notes
 
-These are starting points, not tested here. Check the suite's own
-documentation.
+Collabora was tried as described above; ONLYOFFICE was not. Check the
+suite's own documentation.
 
 - **Collabora Online / CODE:** the NAS must be an allowed WOPI host. With
   the CODE container that is the `aliasgroup1=<WOPISrc base>` environment
@@ -107,4 +107,9 @@ documentation.
 - it checks rights (read-only, deny, rights at request time) and the token
   (wrong, expired, other file).
 
-No real office server has been tried yet.
+**Tried with a real office server (2026-10-25):** Collabora Online CODE
+26.04 (container `collabora/code`, `aliasgroup1=<WOPISrc base>`, SSL off
+on the PC). Opening a document from the Desk, editing it and saving it back
+works; Collabora locks and unlocks through the WOPI host. The test found one
+fault, since fixed: Collabora reads `LastModifiedTime` from the PutFile
+answer (it was `{}`). ONLYOFFICE has not been tried.

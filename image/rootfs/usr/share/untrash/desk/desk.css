@@ -240,3 +240,11 @@ tr.ut-ab-blocked td { color: var(--ut-danger); }
 .ut-xfer__err { grid-column: 1 / -1; color: var(--ut-danger); }
 .ut-ctx { position: fixed; z-index: 120; }
 @media (max-width: 640px) { .ut-xfer { grid-template-columns: minmax(0, 1fr) auto; } .ut-xfer .ut-progress { grid-column: 1 / -1; } }
+
+/* Status: process list (flex: none, or the table shrinks into a scroll box of its own) */
+.ut-status > * { flex: none; }
+.ut-procs__head { gap: 10px; align-items: center; flex-wrap: wrap; }
+.ut-procs__filter { width: min(260px, 100%); }
+.ut-procs td, .ut-procs th { white-space: nowrap; }
+.ut-procs__cmd { max-width: 380px; overflow: hidden; text-overflow: ellipsis; font-size: var(--ut-fs-xs); color: var(--ut-fg-2); }
+.ut-procs [data-on]:not([data-on=""])::after { content: " " attr(data-on); }
