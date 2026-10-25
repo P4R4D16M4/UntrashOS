@@ -1,0 +1,11 @@
+[Unit]
+Description=UntrashOS: background jobs (backup, cloud, downloads, RAID check)
+Documentation=file:/usr/share/doc/untrash/untrash-memd.c
+
+# Above MemoryHigh the jobs reclaim their own memory (mostly page cache)
+# instead of pushing out Desk and the shares; untrash-memd offloads them
+# first.  No MemoryMax: a job slows down, it is not killed.
+[Slice]
+MemoryHigh=50%
+CPUWeight=25
+IOWeight=25

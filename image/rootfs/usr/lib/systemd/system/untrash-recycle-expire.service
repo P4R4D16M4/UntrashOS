@@ -3,6 +3,7 @@ Description=UntrashOS: empty old files from the share recycle bins (stock rbm_ex
 ConditionPathExists=/etc/untrash/recycle.env
 
 [Service]
+Slice=untrash-background.slice
 Type=oneshot
 Nice=10
 IOSchedulingClass=idle

@@ -116,6 +116,10 @@ arm-linux-gnueabihf-strip "$W/root/usr/lib/untrash/zt-sig"
 arm-linux-gnueabihf-gcc -static -O2 -Wall -Werror -o "$W/root/usr/lib/untrash/untrash-wdt" "$OS/image/tools/untrash-wdt.c"
 arm-linux-gnueabihf-strip "$W/root/usr/lib/untrash/untrash-wdt"
 install -D -m 644 "$OS/image/tools/untrash-wdt.c" "$W/root/usr/share/doc/untrash/untrash-wdt.c"
+# memory offloading (image/tools/untrash-memd.c), source next to it as well
+arm-linux-gnueabihf-gcc -static -O2 -Wall -Werror -o "$W/root/usr/lib/untrash/untrash-memd" "$OS/image/tools/untrash-memd.c"
+arm-linux-gnueabihf-strip "$W/root/usr/lib/untrash/untrash-memd"
+install -D -m 644 "$OS/image/tools/untrash-memd.c" "$W/root/usr/share/doc/untrash/untrash-memd.c"
 mkdir -p "$W/root/usr/lib/untrash/keys"; cp "$OS"/slot/keys/*.pub "$W/root/usr/lib/untrash/keys/"
 mkdir -p "$W/root/etc/systemd/system/timers.target.wants" "$W/root/etc/systemd/system/sysinit.target.wants"
 ln -sf /usr/lib/systemd/system/untrash-mark-good.timer "$W/root/etc/systemd/system/timers.target.wants/"
@@ -133,8 +137,8 @@ rm -f "$W/root/etc/init.d/inadyn" "$W"/root/etc/rc?.d/[SK]??inadyn
 mkdir -p "$W/root/etc/systemd/system/multi-user.target.wants"
 ln -sf /usr/lib/systemd/system/untrash-takeover-firstboot.service "$W/root/etc/systemd/system/multi-user.target.wants/"
 # Untrash Desk (port 80, not on the installer stick), way A data partition, SSH host keys,
-# service SSH key from the stick
-for u in untrash-desk untrash-data untrash-ssh-hostkeys untrash-copybtn untrash-servicekey untrash-adblock untrash-netname untrash-mesh; do
+# service SSH key from the stick, memory offloading
+for u in untrash-desk untrash-data untrash-ssh-hostkeys untrash-copybtn untrash-servicekey untrash-adblock untrash-netname untrash-mesh untrash-memd; do
 	ln -sf /usr/lib/systemd/system/$u.service "$W/root/etc/systemd/system/multi-user.target.wants/"
 done
 # services of the stock features run only when untrash-config switches them on (settings),

@@ -1,0 +1,11 @@
+[Unit]
+Description=UntrashOS: interactive services (Desk, shares, SSH)
+Documentation=file:/usr/share/doc/untrash/untrash-memd.c
+
+# Protected memory: reclaim (proactive and under pressure) takes it last.
+# systemd mounts cgroup2 with memory_recursiveprot, so the services inside
+# share the protection.  The I/O weights act once io.cost is enabled.
+[Slice]
+MemoryLow=256M
+CPUWeight=400
+IOWeight=400

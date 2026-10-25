@@ -4,5 +4,6 @@ ConditionPathExists=/etc/untrash/notify.json
 After=network-online.target
 
 [Service]
+Slice=untrash-background.slice
 Type=oneshot
 ExecStart=/usr/lib/untrash/untrash-notify report

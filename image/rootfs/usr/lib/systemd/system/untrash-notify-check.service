@@ -3,5 +3,6 @@ Description=UntrashOS: alert when a volume is almost full
 ConditionPathExists=/etc/untrash/notify.json
 
 [Service]
+Slice=untrash-background.slice
 Type=oneshot
 ExecStart=/usr/lib/untrash/untrash-notify check

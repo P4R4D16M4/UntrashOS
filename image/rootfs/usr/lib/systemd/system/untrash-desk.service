@@ -4,6 +4,7 @@ ConditionKernelCommandLine=!untrash.installer=1
 After=network.target untrash-settings.service untrash-zyxel.service untrash-data.service
 
 [Service]
+Slice=untrash-interactive.slice
 ExecStart=/usr/lib/untrash/untrash-desk
 Restart=on-failure
 RestartSec=3

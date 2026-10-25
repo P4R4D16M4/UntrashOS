@@ -4,6 +4,7 @@ After=network-online.target untrash-zyxel.service untrash-data.service
 Wants=network-online.target
 
 [Service]
+Slice=untrash-background.slice
 Type=oneshot
 Nice=10
 IOSchedulingClass=idle

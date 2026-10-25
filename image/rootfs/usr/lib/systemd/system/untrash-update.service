@@ -5,6 +5,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Slice=untrash-background.slice
 Type=oneshot
 ExecStart=/usr/lib/untrash/untrash-update check
 Nice=10

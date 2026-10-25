@@ -5,6 +5,7 @@ After=network-online.target untrash-zyxel.service untrash-data.service
 Wants=network-online.target
 
 [Service]
+Slice=untrash-background.slice
 # downloaded files 0666/0777 like the stock Samba rules
 UMask=0000
 Nice=10

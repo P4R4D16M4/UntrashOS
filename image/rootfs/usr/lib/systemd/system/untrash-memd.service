@@ -1,0 +1,16 @@
+[Unit]
+Description=UntrashOS: proactive memory offloading (RAM -> zswap -> swap)
+Documentation=file:/usr/share/doc/untrash/untrash-memd.c
+# without PSI/memcg (older kernel) the daemon exits 0 by itself
+After=swap.target
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-memd
+Restart=on-failure
+RestartSec=10
+# mlockall: the controller must never wait for its own pages
+LimitMEMLOCK=infinity
+MemoryMax=16M
+
+[Install]
+WantedBy=multi-user.target

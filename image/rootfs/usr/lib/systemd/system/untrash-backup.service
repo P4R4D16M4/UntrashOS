@@ -3,6 +3,7 @@ Description=UntrashOS: Backup Planner jobs (stock BackupPlanner)
 After=untrash-zyxel.service untrash-data.service network-online.target
 
 [Service]
+Slice=untrash-background.slice
 Type=oneshot
 Nice=10
 IOSchedulingClass=idle

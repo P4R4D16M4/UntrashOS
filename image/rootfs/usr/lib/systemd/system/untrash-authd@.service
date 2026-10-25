@@ -2,6 +2,7 @@
 Description=UntrashOS: password check (WebDAV)
 
 [Service]
+Slice=untrash-interactive.slice
 ExecStart=/usr/lib/untrash/untrash-authd
 StandardInput=socket
 StandardOutput=socket

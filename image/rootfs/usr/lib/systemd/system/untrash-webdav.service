@@ -5,6 +5,7 @@ After=network.target untrash-zyxel.service untrash-data.service
 Wants=untrash-authd.socket
 
 [Service]
+Slice=untrash-interactive.slice
 # files created over WebDAV get 0666/0777 like the stock Samba rules (force mode 0777)
 UMask=0000
 RuntimeDirectory=untrash-webdav
