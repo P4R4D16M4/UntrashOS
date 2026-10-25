@@ -652,10 +652,14 @@ VIEWS.files = async b => {
   OFFICE = office;
   const isDoc = n => (office.exts || []).includes((n.split('.').pop() || '').toLowerCase()) && n.includes('.');
   const all = (sh.shares || []).filter(s => s.enabled !== false);
+  // UntrashMesh partner volumes (admins): opened like a share, "mesh:<partner>-<share>"
+  const partners = (sh.volumes || []).filter(v => v.kind === 'partner').map(v => ({ name: 'mesh:' + v.id.slice(2), label: v.label }));
+  FS.labels = Object.fromEntries(partners.map(p => [p.name, p.label]));
   // shares whose folder is missing (stock volume not present) are listed but not opened
-  const list = all.filter(s => s.present !== false), gone = all.filter(s => s.present === false);
+  const list = all.filter(s => s.present !== false).concat(partners), gone = all.filter(s => s.present === false);
   if (!list.some(s => s.name === FS.share)) { FS.share = list.length ? list[0].name : null; FS.path = ''; FS.sel.clear(); }
-  const side = sidebar('files', [['#', 'Shares']].concat(list.map(s => ['s:' + s.name, s.name]),
+  const side = sidebar('files', [['#', 'Shares']].concat(list.filter(s => !FS.labels[s.name]).map(s => ['s:' + s.name, s.name]),
+    partners.length ? [['#', 'Partner volumes']].concat(partners.map(p => ['s:' + p.name, p.label])) : [],
     gone.length ? [['#', 'Volume missing']].concat(gone.map(s => ['x:' + s.name, s.name])) : []), 's:' + FS.share);
   let main = '<div class="empty">No share available.</div>';
   let r = null;
@@ -676,7 +680,7 @@ VIEWS.files = async b => {
       .sort((a, c) => (c.dir - a.dir) || FS.dir * cmp(a, c));
     for (const n of [...FS.sel]) if (!FS.entries.some(e => e.name === n)) FS.sel.delete(n);
     const parts = FS.path ? FS.path.split('/') : [];
-    const crumbs = `<span class="crumbs" translate="no"><button data-p="" data-drop="">${esc(FS.share)}</button>${parts.map((p, i) => ` / <button data-p="${esc(parts.slice(0, i + 1).join('/'))}" data-drop="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`).join('')}</span>`;
+    const crumbs = `<span class="crumbs" translate="no"><button data-p="" data-drop="">${esc((FS.labels || {})[FS.share] || FS.share)}</button>${parts.map((p, i) => ` / <button data-p="${esc(parts.slice(0, i + 1).join('/'))}" data-drop="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`).join('')}</span>`;
     const n = FS.sel.size, arrow = k => FS.sort === k ? (FS.dir > 0 ? ' ▲' : ' ▼') : '';
     const cut = CLIP && CLIP.op === 'cut' && CLIP.share === FS.share && CLIP.from === FS.path ? new Set(CLIP.items) : new Set();
     main = `<div class="row ut-files__bar">${crumbs}<span class="ut-spacer"></span>

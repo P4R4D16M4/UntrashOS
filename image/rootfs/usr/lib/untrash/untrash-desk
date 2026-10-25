@@ -1982,7 +1982,13 @@ def stock_rollback(req):
 
 def share_access(user):
     if is_admin(user):
-        return {x["name"]: {"path": x["path"], "access": "rw"} for x in shares() if x["enabled"]}
+        out = {x["name"]: {"path": x["path"], "access": "rw"} for x in shares() if x["enabled"]}
+        # UntrashMesh partner volumes: admins open them in Files directly
+        # ("mesh:<partner>-<share>"); users get them through a share on them
+        for v in volumes():
+            if v["kind"] == "partner":
+                out["mesh:" + v["id"][2:]] = {"path": v["path"], "access": "ro" if v.get("mode") == "ro" else "rw"}
+        return out
     stock = IMP.Stock(CONFIG)
     gl = [g for _gid, g, _t, _d in stock.groups() if user in stock.members(g)] + [EVERYONE]
     return IMP.user_access(stock, user, gl)

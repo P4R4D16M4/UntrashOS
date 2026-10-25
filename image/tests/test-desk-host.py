@@ -625,6 +625,19 @@ def main():
             check("co-op: share made on the partner volume", st == 200 and any(x["name"] == "VonB" and x["path"] == "/p-data/nas-b-Photos/VonB"
                                                                               for x in a.req("/api/shares")[1]["shares"]))
             a.req("/api/shares/delete", {"name": "VonB"})
+            # Files: admins open partner volumes directly ("mesh:<partner>-<share>"), users do not see them
+            st, fl = a.req("/api/files?share=mesh:nas-b-Photos&path=")
+            check("files: admin lists the partner volume directly", st == 200 and "VonB" in [e["name"] for e in fl["entries"]])
+            st, _ = a.req("/api/files/upload?share=mesh:nas-b-Photos&path=&name=aus-dem-mesh.txt", raw=b"mesh")
+            check("files: admin writes to a read/write partner volume", st == 200 and open(r + "/p-data/nas-b-Photos/aus-dem-mesh.txt").read() == "mesh")
+            check("files: users do not get partner volumes", u.req("/api/files?share=mesh:nas-b-Photos&path=")[0] == 403
+                  and not any(x["name"].startswith("mesh:") for x in u.req("/api/shares")[1]["shares"]))
+            vj = json.load(open(r + "/etc/untrash/mesh/volumes.json"))
+            vj[r + "/p-data/nas-b-Photos"]["mode"] = "ro"
+            json.dump(vj, open(r + "/etc/untrash/mesh/volumes.json", "w"))
+            check("files: a read-only partner volume refuses writes", a.req("/api/files/op", {"op": "mkdir", "share": "mesh:nas-b-Photos", "path": "", "name": "x"})[0] == 403)
+            vj[r + "/p-data/nas-b-Photos"]["mode"] = "rw"
+            json.dump(vj, open(r + "/etc/untrash/mesh/volumes.json", "w"))
 
             # UntrashApp (docs/architecture/app-api.md): pairing, signed requests, sign-in, confirmations
             sig = os.path.join(r, "zt-sig")
