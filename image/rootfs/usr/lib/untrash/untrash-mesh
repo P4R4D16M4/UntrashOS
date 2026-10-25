@@ -1122,9 +1122,19 @@ def mount(mp, w):
         d[mp] = {"source": "//%s/ut-mesh-%s" % (w["addr"], w["share"]), "user": w["user"], "password": w["password"]}
         json.dump(d, open(FAKE_MOUNT, "w"))
         return
-    opts = ("ip=%s,username=%s,password=%s,vers=3.1.1,noperm,soft,echo_interval=10,actimeo=5,file_mode=0777,dir_mode=0777%s"
-            % (w["addr"], w["user"], w["password"], ",ro" if w["mode"] == "ro" else ""))
-    run(["mount", "-t", "cifs", "//%s/ut-mesh-%s" % (w["addr"], w["share"].replace(" ", "\\040")), mp, "-o", opts])
+    # mount(2) directly: the image has no mount.cifs, and util-linux mount
+    # would put the password on a command line (ps) and into its error text
+    # (journal); /proc/mounts does not show a cifs password
+    import ctypes
+    import ctypes.util
+    opts = ("ip=%s,username=%s,password=%s,vers=3.1.1,noperm,soft,echo_interval=10,actimeo=5,file_mode=0777,dir_mode=0777"
+            % (w["addr"], w["user"], w["password"]))
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    flags = 1 if w["mode"] == "ro" else 0                     # MS_RDONLY
+    src = "//%s/ut-mesh-%s" % (w["addr"], w["share"])
+    if libc.mount(src.encode(), mp.encode(), b"cifs", ctypes.c_ulong(flags), opts.encode()) != 0:
+        e = ctypes.get_errno()
+        raise RuntimeError("mount of %s from %s failed: %s" % (w["share"], w["partner"], os.strerror(e)))
 
 
 def unmount(mp):
