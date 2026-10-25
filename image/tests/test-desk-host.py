@@ -25,6 +25,7 @@ import re
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -792,7 +793,7 @@ def main():
             check("wopi: RefreshLock / Unlock", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "REFRESH_LOCK", "X-WOPI-Lock": "L3"})[0] == 200
                   and wopi("POST", fid, tk, b"", {"X-WOPI-Override": "UNLOCK", "X-WOPI-Lock": "L3"})[0] == 200
                   and wopi("POST", fid, tk, b"", {"X-WOPI-Override": "GET_LOCK"})[2].get("X-WOPI-Lock") == "")
-            check("wopi: PutRelative not supported (501)", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "PUT_RELATIVE"})[0] == 501)
+            check("wopi: RenameFile not supported (501)", wopi("POST", fid, tk, b"", {"X-WOPI-Override": "RENAME_FILE"})[0] == 501)
             st, opu = u.req("/api/office/open", {"share": "mixed", "path": "brief.odt"})
             st2, iu, _h = wopi("GET", fid, opu.get("access_token", ""))
             check("wopi: alice (read only on mixed) gets the same file id, may not write", st == 200 and st2 == 200 and json.loads(iu)["UserCanWrite"] is False
@@ -807,6 +808,51 @@ def main():
             check("wopi: rights are checked now, not at opening (bob's token is refused)",
                   wopi("GET", fid, forge({"u": "bob", "s": "mixed", "p": "brief.odt", "e": int(time.time()) + 99}))[0] == 403)
             check("wopi: key file only for root", oct(os.stat(r + "/etc/untrash/wopi.key").st_mode & 0o777) == "0o600")
+            # PutRelativeFile ("Save as", "Export as PDF"): names in UTF-7
+            st, _b2, _h = wopi("POST", fid, tk, b"%PDF-1.4 x", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-SuggestedTarget": ".pdf"})
+            pr = json.loads(_b2) if st == 200 else {}
+            check("wopi: PutRelative with a suggested extension makes brief.pdf next to it", st == 200 and pr.get("Name") == "brief.pdf"
+                  and open(r + "/i-data/aaaa0001/mixed/brief.pdf", "rb").read() == b"%PDF-1.4 x" and pr.get("Url", "").startswith("http://nas.test/wopi/files/") and pr.get("LastModifiedTime", "").endswith("Z"))
+            ntk = urllib.parse.unquote(pr.get("Url", "x=").split("access_token=")[1])
+            check("wopi: the new file's URL and token work", wopi("GET", pr["Url"].split("/wopi/files/")[1].split("?")[0], ntk)[0] == 200)
+            st, _b2, _h = wopi("POST", fid, tk, b"X", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-SuggestedTarget": ".pdf"})
+            check("wopi: a suggestion never overwrites (brief (2).pdf)", json.loads(_b2).get("Name") == "brief (2).pdf")
+            st, _b2, h = wopi("POST", fid, tk, b"X", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-RelativeTarget": "brief.pdf"})
+            check("wopi: an exact name that exists: 409 with a free name", st == 409 and h.get("X-WOPI-ValidRelativeTarget") == "brief (3).pdf")
+            st, _b2, _h = wopi("POST", fid, tk, b"NEW", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-RelativeTarget": "brief.pdf", "X-WOPI-OverwriteRelativeTarget": "true"})
+            check("wopi: ... or overwritten on request", st == 200 and open(r + "/i-data/aaaa0001/mixed/brief.pdf", "rb").read() == b"NEW")
+            st, _b2, _h = wopi("POST", fid, tk, b"U", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-RelativeTarget": "Grüße.odt".encode("utf-7").decode()})
+            check("wopi: UTF-7 names (Grüße)", st == 200 and json.loads(_b2).get("Name") == "Grüße.odt")
+            check("wopi: no names outside the folder", wopi("POST", fid, tk, b"X", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-RelativeTarget": "../x.odt"})[0] == 400)
+            check("wopi: alice (read only) cannot save as", wopi("POST", fid, opu["access_token"], b"X", {"X-WOPI-Override": "PUT_RELATIVE", "X-WOPI-SuggestedTarget": ".pdf"})[0] == 403)
+            for f in ("brief.pdf", "brief (2).pdf", "Grüße.odt"):
+                os.unlink(r + "/i-data/aaaa0001/mixed/" + f)
+            # proof keys: an office server that signs its requests (key made with openssl)
+            kdir = tempfile.mkdtemp()
+            subprocess.run(["openssl", "genrsa", "-out", kdir + "/k.pem", "2048"], check=True, capture_output=True)
+            mod = subprocess.run(["openssl", "rsa", "-in", kdir + "/k.pem", "-noout", "-modulus"], check=True, capture_output=True, text=True).stdout.strip().split("=")[1]
+            b64 = lambda bb: base64.b64encode(bb).decode()  # noqa: E731
+            pk = '<proof-key value="x" modulus="%s" exponent="%s" oldvalue="x" oldmodulus="%s" oldexponent="%s"/>' % (
+                b64(bytes.fromhex(mod)), b64((65537).to_bytes(3, "big")), b64(bytes.fromhex(mod)), b64((65537).to_bytes(3, "big")))
+            DISC = DISC.replace(b"</net-zone>", b"</net-zone>" + pk.encode())
+            OfficeH.do_GET = lambda self: (self.send_response(200), self.send_header("Content-Type", "text/xml"), self.end_headers(), self.wfile.write(DISC))
+            a.req("/api/office/settings", {"server": office, "wopi_base": "http://nas.test"})       # discovery read again
+            def proof(path, token, ts=None, url_base="http://nas.test"):
+                ts = ts if ts is not None else int((time.time() + 62135596800) * 1e7)
+                url = (url_base + path).upper().encode()
+                msg = struct.pack(">I", len(token)) + token.encode() + struct.pack(">I", len(url)) + url + struct.pack(">I", 8) + struct.pack(">q", ts)
+                open(kdir + "/m", "wb").write(msg)
+                sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", kdir + "/k.pem", kdir + "/m"], check=True, capture_output=True).stdout
+                return {"X-WOPI-TimeStamp": str(ts), "X-WOPI-Proof": b64(sig)}
+            ppath = "/wopi/files/%s?access_token=%s" % (fid, urllib.parse.quote(tk))
+            check("proof: without a proof the token alone is refused", wopi("GET", fid, tk)[0] == 401)
+            check("proof: with a valid proof accepted", wopi("GET", fid, tk, hdrs=proof(ppath, tk))[0] == 200)
+            check("proof: a proof for another URL is refused", wopi("GET", fid, tk, hdrs=proof(ppath, tk, url_base="http://evil.test"))[0] == 401)
+            check("proof: an old time stamp is refused", wopi("GET", fid, tk, hdrs=proof(ppath, tk, ts=int((time.time() - 3600 + 62135596800) * 1e7)))[0] == 401)
+            bad = proof(ppath, tk)
+            bad["X-WOPI-Proof"] = b64(bytes(256))
+            check("proof: a wrong signature is refused", wopi("GET", fid, tk, hdrs=bad)[0] == 401)
+            shutil.rmtree(kdir)
             a.req("/api/office/settings", {"server": "", "wopi_base": ""})
             check("office: switched off", a.req("/api/office")[1]["enabled"] is False and a.req("/api/office/open", {"share": "mixed", "path": "brief.odt"})[0] == 400)
             osrv.shutdown()

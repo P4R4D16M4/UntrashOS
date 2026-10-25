@@ -41,9 +41,19 @@ action. URL placeholders such as `<ui=UI_LLCC&>` are removed. Files shows
 2. The NAS answers with the editor URL
    (`urlsrc` + `WOPISrc=<base>/wopi/files/<id>` + `lang`), an access token
    and its expiry.
-3. The browser opens a new tab and posts `access_token` and
-   `access_token_ttl` to the editor URL as a form. The token therefore never
-   appears in the browser's address bar or history.
+3. The browser opens a new tab that frames the editor (an iframe) and posts
+   `access_token` and `access_token_ttl` into it as a form. The token
+   therefore never appears in the browser's address bar or history.
+4. The tab answers the editor's postMessages (`PostMessageOrigin` in
+   CheckFileInfo = the Desk's origin, kept in the token):
+   - **Save As** and **Export As** (`UI_SaveAs`): a name field, then
+     `Action_SaveAs`. The editor saves the copy next to the document
+     (PutRelativeFile), e.g. a PDF.
+   - **Close** (`UI_Close`) closes the tab.
+   Collabora only allows the frame when the Desk's origin may frame it: when
+   the Desk is opened under another address than the WOPISrc base (e.g.
+   `untrash.local` vs. `untrash.mesh`), add that origin to Collabora's
+   `net.frame_ancestors`.
 
 **File id.** `sha256(share + "\0" + path)`, first 32 hex digits. It is
 stable, so two people editing the same file share one editing session.
@@ -65,7 +75,8 @@ with an unexpired token.
 | `GET /wopi/files/<id>/contents` | GetFile, with header `X-WOPI-ItemVersion` |
 | `POST /wopi/files/<id>/contents` | PutFile |
 | `POST /wopi/files/<id>` + `X-WOPI-Override: LOCK / GET_LOCK / REFRESH_LOCK / UNLOCK` (LOCK + `X-WOPI-OldLock` = UnlockAndRelock) | locks |
-| other overrides (PUT_RELATIVE, RENAME_FILE, …) | `501` |
+| `POST /wopi/files/<id>` + `X-WOPI-Override: PUT_RELATIVE` | PutRelativeFile ("Save As", "Export as PDF"): `X-WOPI-SuggestedTarget` (a name or only an extension, never overwrites: "name (2).pdf") or `X-WOPI-RelativeTarget` (exact; `409` + `X-WOPI-ValidRelativeTarget` when it exists, unless `X-WOPI-OverwriteRelativeTarget: true`); names UTF-7 encoded; answer `{Name, Url, LastModifiedTime}` |
+| other overrides (RENAME_FILE, …) | `501` |
 
 **PutFile:**
 - It writes to a temporary file in the same folder, `fsync`s it, then
@@ -79,10 +90,16 @@ with an unexpired token.
 **Locks.** They are kept in memory for 30 minutes and refreshed by the
 editor. A restart of the Desk drops them.
 
-**Not done (version 1):**
-- WOPI proof keys (`X-WOPI-Proof`) are not checked. The token alone
-  authorises a request.
-- No PutRelativeFile ("save as" into the NAS) and no rename.
+**Proof keys.** When the discovery publishes a `<proof-key>`, every WOPI
+request must carry `X-WOPI-TimeStamp` (within 20 minutes) and an
+`X-WOPI-Proof` (or `-ProofOld`) signature: RSA PKCS#1 v1.5 / SHA-256 over
+token, upper-case URL (WOPISrc base + path + query) and time stamp, checked
+in pure Python. Without it only the token counts. Collabora publishes a key
+only when it has one: `coolwsd-generate-proof-key`, or a PEM RSA key mounted
+as `/etc/coolwsd/proof_key` in the container.
+
+**Not done:** RenameFile (`501`): the file id is derived from the path, so
+a rename would change the id under an open session.
 
 ### Office server notes
 
@@ -110,6 +127,9 @@ suite's own documentation.
 **Tried with a real office server (2026-10-25):** Collabora Online CODE
 26.04 (container `collabora/code`, `aliasgroup1=<WOPISrc base>`, SSL off
 on the PC). Opening a document from the Desk, editing it and saving it back
-works; Collabora locks and unlocks through the WOPI host. The test found one
-fault, since fixed: Collabora reads `LastModifiedTime` from the PutFile
-answer (it was `{}`). ONLYOFFICE has not been tried.
+works; Collabora locks and unlocks through the WOPI host. With a proof key
+mounted, its signed requests pass and a request with the token alone is
+refused. In the framing tab, Export As → PDF and Save As (a name with
+umlauts) put the copies next to the document. Faults found and fixed:
+Collabora reads `LastModifiedTime` from the PutFile and PutRelativeFile
+answers. ONLYOFFICE has not been tried.

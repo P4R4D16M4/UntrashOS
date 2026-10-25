@@ -33,6 +33,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -3250,7 +3251,8 @@ WOPI_TTL = 10 * 3600                      # a token lives as long as a long work
 WOPI_LOCK_S = 30 * 60                     # WOPI: a lock expires after 30 minutes
 WOPI_LOCKS = {}                           # file id -> (lock string, expiry)
 WOPI_MAX = 512 << 20                      # largest document saved through WOPI
-DISCOVERY = {"t": 0, "url": None, "actions": {}}
+DISCOVERY = {"t": 0, "url": None, "actions": {}, "proof": {}}
+SHA256_DI = bytes.fromhex("3031300d060960864801650304020105000420")    # PKCS#1 DigestInfo prefix of SHA-256
 
 
 def office_load():
@@ -3273,7 +3275,7 @@ def office_save(req):
     os.makedirs(os.path.dirname(OFFICE_CONF), exist_ok=True)
     with open(OFFICE_CONF, "w") as f:
         json.dump({"server": srv, "wopi_base": base, "insecure": bool(req.get("insecure"))}, f)
-    DISCOVERY.update(t=0, url=None, actions={})
+    DISCOVERY.update(t=0, url=None, actions={}, proof={})
     return office_state(check=bool(srv))
 
 
@@ -3301,8 +3303,56 @@ def discovery(force=False):
         if ext and name in ("edit", "view") and src.startswith(("http://", "https://")):
             if ext not in acts or (name == "edit" and acts[ext][0] != "edit"):
                 acts[ext] = (name, re.sub(r"<[^>]*>", "", src))      # placeholders like <ui=UI_LLCC&> stay out
-    DISCOVERY.update(t=time.time(), url=c["server"], actions=acts)
+    proof = {}
+    pk = root.find(".//proof-key")
+    if pk is not None:          # the office server signs its WOPI requests (X-WOPI-Proof)
+        for slot, m, e in (("cur", "modulus", "exponent"), ("old", "oldmodulus", "oldexponent")):
+            try:
+                if pk.get(m) and pk.get(e):
+                    proof[slot] = (int.from_bytes(base64.b64decode(pk.get(m)), "big"), int.from_bytes(base64.b64decode(pk.get(e)), "big"))
+            except ValueError:
+                pass
+    DISCOVERY.update(t=time.time(), url=c["server"], actions=acts, proof=proof)
     return acts
+
+
+def rsa_verify(key, msg, sig_b64):
+    """RSASSA-PKCS1-v1_5 with SHA-256 (no crypto library on the NAS)."""
+    n, e = key
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+    except ValueError:
+        return False
+    k = (n.bit_length() + 7) // 8
+    if len(sig) != k or k < 128:
+        return False
+    em = pow(int.from_bytes(sig, "big"), e, n).to_bytes(k, "big")
+    want = b"\x00\x01" + b"\xff" * (k - 3 - len(SHA256_DI) - 32) + b"\x00" + SHA256_DI + hashlib.sha256(msg).digest()
+    return hmac.compare_digest(em, want)
+
+
+def wopi_proof(handler, token):
+    """WOPI proof keys: when the office server publishes one, every request
+    must carry its signature over token, URL and time, so a stolen token
+    alone is not enough.  Without a proof key the token decides alone."""
+    discovery()
+    keys = DISCOVERY.get("proof") or {}
+    if not keys.get("cur"):
+        return
+    h = lambda k: handler.headers.get(k) or ""  # noqa: E731
+    try:
+        ts = int(h("X-WOPI-TimeStamp"))
+    except ValueError:
+        raise Fail("WOPI proof missing.", 401)
+    if abs(ts / 1e7 - 62135596800 - time.time()) > 20 * 60:          # .NET ticks
+        raise Fail("WOPI proof too old.", 401)
+    url = (office_load()["wopi_base"] + handler.path).upper().encode()
+    tok = token.encode()
+    msg = (struct.pack(">I", len(tok)) + tok + struct.pack(">I", len(url)) + url + struct.pack(">I", 8) + struct.pack(">q", ts))
+    proof, old = h("X-WOPI-Proof"), h("X-WOPI-ProofOld")
+    if not (rsa_verify(keys["cur"], msg, proof) or (old and rsa_verify(keys["cur"], msg, old))
+            or (keys.get("old") and rsa_verify(keys["old"], msg, proof))):
+        raise Fail("Wrong WOPI proof.", 401)
 
 
 def office_state(check=False):
@@ -3337,8 +3387,9 @@ def wopi_id(share, path):
     return hashlib.sha256(("%s\0%s" % (share, path.strip("/"))).encode()).hexdigest()[:32]
 
 
-def wopi_token(user, share, path, exp):
-    body = base64.urlsafe_b64encode(json.dumps({"u": user, "s": share, "p": path.strip("/"), "e": exp},
+def wopi_token(user, share, path, exp, origin=""):
+    """origin: the Desk page that frames the editor (PostMessageOrigin)."""
+    body = base64.urlsafe_b64encode(json.dumps(dict({"u": user, "s": share, "p": path.strip("/"), "e": exp}, **({"o": origin} if origin else {})),
                                                separators=(",", ":")).encode()).decode().rstrip("=")
     return body + "." + hmac.new(wopi_key(), body.encode(), hashlib.sha256).hexdigest()
 
@@ -3358,6 +3409,15 @@ def wopi_check(fid, token, write=False):
     if not os.path.isfile(full):
         raise Fail("File not found.", 404)
     return t["u"], t["s"], t["p"], full
+
+
+def wopi_origin(token):
+    """The framing Desk origin stored in a (checked) token, or ""."""
+    try:
+        body = token.split(".", 1)[0]
+        return str(json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("o") or "")
+    except (ValueError, TypeError):
+        return ""
 
 
 def office_open(user, req):
@@ -3380,7 +3440,10 @@ def office_open(user, req):
     lang = re.sub(r"[^a-z-]", "", str(req.get("lang") or "en"))[:5]
     url = act[1] + ("" if act[1].endswith(("?", "&")) else ("&" if "?" in act[1] else "?")) + \
         urllib.parse.urlencode({"WOPISrc": src, "lang": lang})
-    return {"url": url, "access_token": wopi_token(user, share, path, exp), "access_token_ttl": exp * 1000, "action": act[0]}
+    origin = str(req.get("origin") or "")
+    if origin and not re.fullmatch(r"https?://[A-Za-z0-9.\-\[\]:]{1,200}", origin):
+        origin = ""
+    return {"url": url, "access_token": wopi_token(user, share, path, exp, origin), "access_token_ttl": exp * 1000, "action": act[0]}
 
 
 def wopi_mtime(full):
@@ -3408,6 +3471,9 @@ def wopi_handle(handler, method, rest, q):
     if not m:
         raise Fail("Unknown.", 404)
     fid, contents, token = m.group(1), bool(m.group(2)), q.get("access_token", "")
+    if not office_load()["server"]:
+        raise Fail("The office bridge is off.", 403)
+    wopi_proof(handler, token)
     hdr = lambda k: handler.headers.get(k) or ""
     override = hdr("X-WOPI-Override").upper()
     if method == "GET" and not contents:                       # CheckFileInfo
@@ -3421,8 +3487,10 @@ def wopi_handle(handler, method, rest, q):
         return handler.reply(200, {
             "BaseFileName": os.path.basename(full), "Size": st.st_size, "Version": wopi_version(full),
             "OwnerId": share, "UserId": user, "UserFriendlyName": user, "UserCanWrite": can_write, "ReadOnly": not can_write,
-            "SupportsLocks": True, "SupportsGetLock": True, "SupportsUpdate": True, "UserCanNotWriteRelative": True,
+            "SupportsLocks": True, "SupportsGetLock": True, "SupportsUpdate": True, "UserCanNotWriteRelative": not can_write,
             "SupportsRename": False, "UserCanRename": False,
+            # the Desk frames the editor: Save As / Export ask it for the name, Close closes the tab
+            **({"PostMessageOrigin": wopi_origin(token), "ClosePostMessage": True} if wopi_origin(token) else {}),
             "LastModifiedTime": wopi_mtime(full)})
     if method == "GET" and contents:                           # GetFile
         _u, _s, _p, full = wopi_check(fid, token)
@@ -3481,7 +3549,54 @@ def wopi_handle(handler, method, rest, q):
             else:
                 WOPI_LOCKS.pop(fid, None)
         return handler.reply(200, {})
-    return handler.reply(501, {"error": "not supported"})      # PUT_RELATIVE, RENAME_FILE, ...
+    if override == "PUT_RELATIVE":
+        return wopi_put_relative(handler, fid, token, hdr)
+    return handler.reply(501, {"error": "not supported"})      # RENAME_FILE, ...
+
+
+def wopi_put_relative(handler, fid, token, hdr):
+    """PutRelativeFile: "Save as" / "Export as PDF" into the folder of the
+    document.  Names come UTF-7 encoded (WOPI)."""
+    user, share, path, full = wopi_check(fid, token)
+    n = int(hdr("Content-Length") or 0)
+    if n > WOPI_MAX:
+        raise Fail("Document too large.", 413)
+    body = handler.rfile.read(n) if n else b""
+    sugg, rel = hdr("X-WOPI-SuggestedTarget"), hdr("X-WOPI-RelativeTarget")
+    if bool(sugg) == bool(rel):
+        raise Fail("SuggestedTarget or RelativeTarget, one of them.", 400)
+    try:
+        name = (sugg or rel).encode("ascii").decode("utf-7")
+    except (UnicodeError, ValueError):
+        raise Fail("Invalid name.", 400)
+    if sugg and name.startswith("."):                       # only an extension: the document's name with it
+        name = os.path.splitext(os.path.basename(path))[0] + name
+    name = name.strip()
+    if not name or "/" in name or "\\" in name or name.startswith(".") or len(name.encode()) > 255:
+        raise Fail("Invalid name.", 400)
+    folder = os.path.dirname(path)
+    _b, dst = resolve(user, share, os.path.join(folder, name), write=True)
+    if sugg:
+        dst = free_name(dst)                                    # a suggestion never overwrites
+    elif os.path.lexists(dst):
+        free = os.path.basename(free_name(dst))
+        if hdr("X-WOPI-OverwriteRelativeTarget").lower() != "true":
+            return handler.reply(409, {"error": "exists"}, headers=[("X-WOPI-ValidRelativeTarget", free.encode("utf-7").decode("ascii"))])
+        lk = wopi_lock(wopi_id(share, os.path.join(folder, name)))
+        if lk:
+            return handler.reply(409, {"error": "locked"}, headers=[("X-WOPI-Lock", lk)])
+    name = os.path.basename(dst)
+    tmp = os.path.join(os.path.dirname(dst), ".%s.untrash-office" % name)
+    with open(tmp, "wb") as f:
+        f.write(body)
+        f.flush()
+        os.fsync(f.fileno())
+    own(tmp, user)
+    os.replace(tmp, dst)
+    npath = os.path.join(folder, name).strip("/")
+    tok = wopi_token(user, share, npath, int(time.time() + WOPI_TTL), wopi_origin(token))
+    url = "%s/wopi/files/%s?access_token=%s" % (office_load()["wopi_base"], wopi_id(share, npath), urllib.parse.quote(tok, safe=""))
+    return handler.reply(200, {"Name": name, "Url": url, "LastModifiedTime": wopi_mtime(dst)})
 
 
 # ------------------------------------------------------------------- HTTP

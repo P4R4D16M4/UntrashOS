@@ -419,18 +419,51 @@ const FS = { share: null, path: '', sel: new Set(), last: null, sort: 'name', di
 let CLIP = null;                                  // { op: 'cut' | 'copy', share, from, items: [names] }
 const XFER = [];                                  // uploads and copy/move jobs shown in the Files window
 /* opens a document in the office server's editor (WOPI) in a new tab: the
-   token goes as a form POST, never in the address bar */
+   tab frames the editor (iframe), the token goes as a form POST, never in
+   an address bar.  The frame answers the editor's postMessages: Save As /
+   Export ask for a name and save a copy on the NAS (PutRelativeFile),
+   Close closes the tab. */
 async function officeOpen(share, path) {
   const w = window.open('', '_blank');
+  if (!w) return fail(new Error(UTI18N.tr('The browser blocked the new tab.')));
   try {
-    const r = await api('office/open', { share, path, lang: UTI18N.lang });
-    const f = w.document.createElement('form');
-    f.method = 'POST'; f.action = r.url;
+    const r = await api('office/open', { share, path, lang: UTI18N.lang, origin: location.origin });
+    const name = path.split('/').pop(), office = new URL(r.url).origin, d = w.document;
+    d.open();
+    d.write(`<!doctype html><meta charset="utf-8"><title>${esc(name)}</title><style>html,body{margin:0;height:100%;background:#0d1115}iframe{border:0;width:100%;height:100%;display:block}</style>
+      <iframe name="ed" title="${esc(name)}" allow="clipboard-read *; clipboard-write *; fullscreen"></iframe>`);
+    d.close();
+    const f = d.createElement('form');
+    f.method = 'POST'; f.action = r.url; f.target = 'ed';
     for (const [k, v] of [['access_token', r.access_token], ['access_token_ttl', r.access_token_ttl]]) {
-      const i = w.document.createElement('input'); i.type = 'hidden'; i.name = k; i.value = v; f.append(i);
+      const i = d.createElement('input'); i.type = 'hidden'; i.name = k; i.value = v; f.append(i);
     }
-    w.document.body.append(f); f.submit();
-  } catch (e) { if (w) w.close(); fail(e); }
+    d.body.append(f); f.submit();
+    const send = (id, values) => d.querySelector('iframe').contentWindow.postMessage(JSON.stringify({ MessageId: id, SendTime: Date.now(), Values: values || {} }), office);
+    w.addEventListener('message', e => {
+      if (e.origin !== office) return;
+      let m;
+      try { m = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (x) { return; }
+      const v = (m && m.Values) || {};
+      if (m.MessageId === 'App_LoadingStatus' && v.Status === 'Frame_Ready') send('Host_PostmessageReady');
+      else if (m.MessageId === 'UI_SaveAs') {
+        const ext = v.format || name.split('.').pop();
+        d.querySelectorAll('.sa').forEach(x => x.remove());
+        const bar = d.createElement('form');
+        bar.className = 'sa';
+        bar.style.cssText = 'position:fixed;left:50%;top:12px;transform:translateX(-50%);z-index:9;display:flex;gap:8px;align-items:center;padding:10px 12px;'
+          + 'background:#161c22;color:#e6edf3;border:1px solid #2c3640;border-radius:10px;font:14px system-ui,sans-serif;box-shadow:0 8px 30px #000a';
+        bar.innerHTML = `<label for="san">${esc(UTI18N.tr('Save a copy in the same folder on the NAS as:'))}</label>
+          <input id="san" style="width:260px;padding:6px 8px;border-radius:6px;border:1px solid #2c3640;background:#0d1115;color:inherit" value="${esc(name.replace(/\.[^.]+$/, '') + '.' + ext)}">
+          <button style="padding:6px 12px;border:0;border-radius:6px;background:#2ee6a6;color:#04120d;font-weight:600">${esc(UTI18N.tr('Save'))}</button>
+          <button type="button" data-x style="padding:6px 12px;border:1px solid #2c3640;border-radius:6px;background:none;color:inherit">${esc(UTI18N.tr('Cancel'))}</button>`;
+        d.body.append(bar);
+        const inp = bar.querySelector('#san'); inp.focus(); inp.setSelectionRange(0, inp.value.lastIndexOf('.') > 0 ? inp.value.lastIndexOf('.') : inp.value.length);
+        bar.querySelector('[data-x]').onclick = () => bar.remove();
+        bar.onsubmit = ev => { ev.preventDefault(); const n = inp.value.trim(); bar.remove(); if (n) send('Action_SaveAs', { Filename: n, Notify: true }); };
+      } else if (m.MessageId === 'UI_Close') w.close();
+    });
+  } catch (e) { w.close(); fail(e); }
 }
 /* context menu at x, y: items [{ label, fn, danger, disabled }] or 'sep' */
 function ctxMenu(x, y, items) {
