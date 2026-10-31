@@ -301,6 +301,20 @@ def local_endpoints():
     return out
 
 
+NOT_PUBLIC = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                                                 "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8")]
+
+
+def router_public(ext):
+    """The router's external address is reachable from outside: not a LAN or
+    carrier-grade NAT address (a router behind another router reports one)."""
+    try:
+        ip = ipaddress.ip_address(ext)
+    except ValueError:
+        return False
+    return ip.version == 4 and not any(ip in n for n in NOT_PUBLIC)
+
+
 def own_record(st, extra=()):
     """This node's signed record; a new seq only when the endpoints changed."""
     nid, pub, wg = identity()
@@ -310,6 +324,11 @@ def own_record(st, extra=()):
     up = st.get("upnp") or {}
     if up.get("ok") and now - up.get("t", 0) < 7200:
         public = ["%s:%d" % (up["ext"], WG_PORT)] + [p for p in public if p != "%s:%d" % (up["ext"], WG_PORT)]
+    elif up.get("ext") and now - up.get("t", 0) < 7200 and router_public(up["ext"]):
+        # the router refused the UPnP forward, but the port may be forwarded
+        # by hand: the external address goes last, peers try it after the rest
+        # (a phone on mobile data has nothing else; untrash1, 2026-10-31)
+        public = public + ["%s:%d" % (up["ext"], WG_PORT)]
     eps = list(dict.fromkeys(local_endpoints() + public + list(extra)))
     cur = book().get(nid)
     name = st.get("name") or default_name()      # never None vs "": that made a new record every tick (untrash-2)

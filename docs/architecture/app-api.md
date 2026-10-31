@@ -151,8 +151,16 @@ up to 1 MiB. In version 1 the app cannot use the streamed uploads
 | `GET /api/app/info` | `{"api": 1, "user", "admin", "node", "nas", "version", "mesh", "signin"}` |
 | `GET /api/app/requests` | `{"requests": [{"id", "kind", "action", "detail", "ip", "agent", "choices": [n, n, n], "created", "expires"}]}` |
 | `POST /api/app/answer` `{"id", "approve": true/false, "code": n}` | `{"state": "approved" or "denied"}`; `404` if the request is gone |
+| `POST /api/app/session` `{}` | `{"url": "/api/app/enter?t=…", "expires": 60}` (since 1.1-rc9) |
 
 These answer only signed requests (`403` for a browser session).
+
+**The Desk in the app.** The app opens the whole Desk in a web view: it asks
+for `POST /api/app/session`, then loads `http://[<NAS mesh address>]` +
+`url`. That link works once, within 60 s, and only from the app's own mesh
+address; it sets an ordinary Desk session cookie for the linked user and
+redirects to `/`. It gives no new rights: signed requests may already do
+everything the user may.
 
 **Number matching.** The browser shows a two-digit number; the app shows
 the three `choices`. Approving with the wrong number denies the request: the

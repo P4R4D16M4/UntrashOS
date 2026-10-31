@@ -3289,6 +3289,39 @@ def confirm_action(user, path, req, handler, by_app):
     raise Fail("Confirm this in the UntrashApp.", 428, {"confirm": rid, "code": code, "action": action})
 
 
+APP_ENTER = {}                                     # one-time token -> (user, app node, expiry)
+
+
+def app_session(user, node):
+    """The Desk in the app (app-api.md §5): a one-time token for
+    /api/app/enter, which turns it into an ordinary Desk session.  No new
+    rights: a signed request may already do all the user may."""
+    now = time.time()
+    tok = secrets.token_urlsafe(32)
+    with APP_LOCK:
+        for k in [k for k, v in APP_ENTER.items() if v[2] < now]:
+            del APP_ENTER[k]
+        APP_ENTER[tok] = (user, node, now + 60)
+    return {"url": "/api/app/enter?t=" + tok, "expires": 60}
+
+
+def app_enter(handler, tok):
+    """The token once, within 60 s, from the app's own mesh address -> a
+    session for its user (the cookie never travels outside the tunnel)."""
+    with APP_LOCK:
+        e = APP_ENTER.pop(str(tok), None)
+    if not e or e[2] < time.time():
+        raise Fail("This link is used or expired. Open the Desk from the app again.", 403)
+    a = app_nodes().get(e[1])
+    if not a or a["user"] != e[0]:
+        raise Fail("This app is not linked to a user of this NAS.", 403)
+    if not os.environ.get("ZT_MESH_ADDRMAP") and handler.client_address[0] not in (a["addr"], "::ffff:" + a["addr"]):
+        raise Fail("The app reaches the Desk over UntrashMesh only.", 403)
+    s = secrets.token_urlsafe(32)
+    SESSIONS[s] = (e[0], time.time() + SESSION_S)
+    return s
+
+
 def app_confirm_poll(user, rid):
     with APP_LOCK:
         r = APP_REQ.get(rid)
@@ -3860,12 +3893,22 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/login/app" and method == "GET":
             out, tok = app_login_poll(self, q.get("id", ""))
             return self.reply(200, out, headers=[("Set-Cookie", "utsess=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (tok, SESSION_S))] if tok else ())
+        if p == "/api/app/enter" and method == "GET":      # the app's web view: token -> session -> the Desk
+            tok = app_enter(self, q.get("t", ""))
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "utsess=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (tok, SESSION_S))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         user = self.app[0] if self.app else session_user(self)
         if not user:
             raise Fail("Please sign in.", 401)
         admin = is_admin(user)
         if p.startswith("/api/app/") and not self.app:
             raise Fail("Only the UntrashApp (signed requests).", 403)
+        if p == "/api/app/session" and method == "POST":
+            return self.reply(200, app_session(user, self.app[1]))
         if p == "/api/app/info" and method == "GET":
             st = mesh_file("mesh.json", {})
             return self.reply(200, {"api": APP_API, "user": user, "admin": admin, "node": self.app[1],

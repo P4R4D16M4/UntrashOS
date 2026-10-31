@@ -41,3 +41,4 @@ test-run:
 	python3 image/tests/test_data_mount.py
 	python3 image/tests/test-update-host.py
 	python3 image/tests/test-mesh-host.py
+	python3 image/tests/test_mesh_endpoints.py

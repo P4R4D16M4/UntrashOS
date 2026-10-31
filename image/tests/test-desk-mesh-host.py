@@ -134,15 +134,17 @@ def main():
         app = mesh_address(mesh, pub)
         subprocess.run(["ip", "-6", "addr", "add", app + "/128", "dev", "lo"], check=True)
 
-        def signed(path, source):
+        def signed(path, source, method="GET", body=None):
+            raw = json.dumps(body).encode() if body is not None else b""
             ts, nonce = str(int(time.time())), os.urandom(12).hex()
-            msg = "\n".join(["UTAPP1", "GET", path, ts, nonce, hashlib.sha256(b"").hexdigest()]).encode()
+            msg = "\n".join(["UTAPP1", method, path, ts, nonce, hashlib.sha256(raw).hexdigest()]).encode()
             mf, sf = os.path.join(w, "m"), os.path.join(w, "s")
             open(mf, "wb").write(msg)
             subprocess.run([sig, "sign", sec, mf, sf], check=True)
             c = http.client.HTTPConnection(nas, port, timeout=5, source_address=(source, 0))
-            c.request("GET", path, headers={"Authorization": "UntrashApp node=%s, ts=%s, nonce=%s, sig=%s"
-                                            % (node, ts, nonce, open(sf, "rb").read().hex())})
+            c.request(method, path, body=raw if method == "POST" else None,
+                      headers={"Authorization": "UntrashApp node=%s, ts=%s, nonce=%s, sig=%s"
+                               % (node, ts, nonce, open(sf, "rb").read().hex())})
             resp = c.getresponse()
             body = resp.read()
             c.close()
@@ -157,6 +159,26 @@ def main():
         check("app requests over the mesh address", st == 200 and rq.get("requests") == [])
         check("the same request from another address is refused (mesh only)", signed("/api/app/info", "::1")[0] == 401)
         check("IPv4 keeps working", a.req("/api/me")[1].get("user") == "admin")
+
+        # the Desk in the app: a one-time token turns into a session for the app's user
+        def plain(path, source, cookie=None):
+            c = http.client.HTTPConnection(nas, port, timeout=5, source_address=(source, 0))
+            c.request("GET", path, headers={"Cookie": cookie} if cookie else {})
+            resp = c.getresponse()
+            body = resp.read()
+            c.close()
+            return resp.status, resp.getheader("Location"), resp.getheader("Set-Cookie") or "", body
+        st, sj = signed("/api/app/session", app, "POST", {})
+        check("app session: a one-time link for the app's user", st == 200 and sj.get("url", "").startswith("/api/app/enter?t="))
+        st, loc, ck, _ = plain(sj["url"], app)
+        cookie = ck.split(";")[0]
+        check("app session: the link signs the web view in and goes to the Desk", st == 302 and loc == "/" and cookie.startswith("utsess="))
+        st, _, _, body = plain("/api/me", app, cookie)
+        check("app session: the session is alice's", st == 200 and json.loads(body).get("user") == "alice")
+        check("app session: the link works once", plain(sj["url"], app)[0] == 403)
+        st, sj = signed("/api/app/session", app, "POST", {})
+        check("app session: the link only from the app's mesh address", plain(sj["url"], "::1")[0] == 403)
+        check("app session: a browser cannot ask for one", a.req("/api/app/session", {})[0] == 403)
 
         st, _ = a.req("/api/mesh/leave", {})
         check("mesh left: the mesh listener is gone", st == 200 and wait(lambda: not listening(nas, port)))
