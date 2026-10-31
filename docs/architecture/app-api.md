@@ -24,10 +24,10 @@ Additions that old apps can ignore keep version 1. Anything else raises it.
   The app derives every member's address itself. Members are also reachable
   as `<name>.mesh` on NAS nodes (their `/etc/hosts`). The app resolves names
   from the roster and the address book.
-- **Desk API.** It lives at `http://[<NAS mesh address>]/api/...`, or on the
-  HTTPS port if the NAS forces HTTPS (Settings; default 443; self-signed
-  certificate: pin it at the first contact). Signed requests (§4) are only accepted from the app's own mesh
-  address.
+- **Desk API.** It lives at `http://[<NAS mesh address>]/api/...` (port 80).
+  The Desk listens there as soon as the NAS is in a mesh, with plain HTTP
+  even when the NAS forces HTTPS: the WireGuard tunnel already encrypts it.
+  Signed requests (§4) are only accepted from the app's own mesh address.
 
 ## 2. Pairing
 
@@ -58,7 +58,11 @@ WireGuard listens; it may be empty.
 
 The `mac` is HMAC-SHA256 with the secret (hex-decoded) as key, over the
 canonical JSON of the request without `mac`. Canonical JSON means keys
-sorted, separators `,` and `:` without spaces, and UTF-8.
+sorted, separators `,` and `:` without spaces, and ASCII only: as Python's
+`json.dumps(sort_keys=True, separators=(",", ":"))` writes it, every
+character outside space…`~` is a `\uXXXX` escape (lower-case hex, UTF-16
+surrogate pairs), so `ü` is `ü`. A top-level `sig` is never part of
+it. The same form is signed for records and rosters.
 
 - **Accepted:** `200`, answer `{"roster", "items", "mac"}`. The `mac` covers
   the answer the same way. Check it before trusting anything.

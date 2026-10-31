@@ -3089,6 +3089,16 @@ def mesh_address(mesh_id, pub):
     return str(ipaddress.IPv6Address(b"\xfd" + h[:5] + b"\0\0" + iid))
 
 
+def own_mesh_address():
+    """This node's UntrashMesh address, None outside a mesh."""
+    st = mesh_file("mesh.json", {})
+    try:
+        pub = open(os.path.join(MESH_DIR, "node.pub"), "rb").read().hex()
+    except OSError:
+        return None
+    return mesh_address(st["mesh"]["id"], pub) if st.get("mesh") and len(pub) == 64 else None
+
+
 def app_nodes():
     """App members of the mesh linked to a Desk user of this NAS."""
     st, links = mesh_file("mesh.json", {}), mesh_file("apps.json", {})
@@ -3760,7 +3770,7 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         p, q = url.path, dict(urllib.parse.parse_qsl(url.query))
         hs = HTTPS_STATE
-        if hs.get("force") and not getattr(self.server, "tls", False):
+        if hs.get("force") and not getattr(self.server, "tls", False) and not getattr(self.server, "mesh", False):
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0] or "localhost"
             self.send_response(301)
             self.send_header("Location", "https://%s%s%s" % (host, "" if hs["port"] == 443 else ":%d" % hs["port"], self.path))
@@ -4371,9 +4381,48 @@ HTTPS_STATE = {}
 INLINE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "application/pdf"}
 
 
+class MeshServer(ThreadingHTTPServer):
+    """The Desk on this node's UntrashMesh address (app-api.md §1): IPv6
+    only, bound before ut-mesh carries the address (IPV6_FREEBIND), plain
+    HTTP inside the WireGuard tunnel even when HTTPS is forced."""
+    address_family = socket.AF_INET6
+    mesh = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, getattr(socket, "IPV6_FREEBIND", 78), 1)
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
+
+def mesh_listener():
+    """Follows the mesh: listens on the current mesh address, again after a
+    create/join, not at all after leaving.  The main listener is IPv4 only,
+    so without this the app could not reach the Desk (found on the first
+    phone, 2026-10-31)."""
+    cur, srv = None, None
+    while True:
+        try:
+            addr = own_mesh_address()
+            if addr != cur:
+                if srv:
+                    srv.shutdown()
+                    srv.server_close()
+                    srv = None
+                if addr:
+                    srv = MeshServer((addr, PORT), Handler)
+                    threading.Thread(target=srv.serve_forever, daemon=True).start()
+                    print("untrash-desk on UntrashMesh [%s]:%d" % (addr, PORT), flush=True)
+                cur = addr
+        except OSError as e:
+            print("untrash-desk: mesh listener: %s" % e, flush=True)
+            cur, srv = None, None
+        time.sleep(float(os.environ.get("ZT_DESK_MESH_POLL", "15")))
+
+
 def main():
     import ssl
     bind = os.environ.get("ZT_DESK_BIND", "")
+    threading.Thread(target=mesh_listener, daemon=True).start()
     hs = settings_load()["services"]["https"]
     crt, key = TLS_DIR + "/untrash.crt", TLS_DIR + "/untrash.key"
     if hs.get("active") and os.path.isfile(crt) and os.path.isfile(key):
