@@ -246,8 +246,9 @@ def activities(root=""):
     n = _tcp_peers(root, 445)
     if n:
         acts.append({"kind": "smb", "text": "Devices on the shares: %d" % n})
-    for m in re.finditer(r"^(md\d+) : .*?\n.*?\n\s*\[.*?\]\s*(resync|recovery|check|reshape)\s*=\s*([\d.]+)%",
-                         _first(root + "/proc/mdstat"), re.M | re.S):
+    # line by line: with DOTALL a resync was put on the array before it
+    for m in re.finditer(r"^(md\d+) : [^\n]*\n[^\n]*\n\s*\[[^\]\n]*\]\s*(resync|recovery|check|reshape)\s*=\s*([\d.]+)%",
+                         _first(root + "/proc/mdstat"), re.M):
         acts.append({"kind": "raid", "text": "RAID %s: %s %s %%" % (m.group(1), m.group(2), m.group(3)),
                      "progress": float(m.group(3))})
     # oneshot jobs: "activating" while they run

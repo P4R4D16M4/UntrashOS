@@ -480,6 +480,20 @@ def main():
             check("bad mail address refused", a.req("/api/settings", {"notify": {"mail": {"active": True, "server": "s", "alerts_to": "kein-at"}}})[0] == 400)
             check("unknown dyndns provider refused", a.req("/api/settings", {"services": {"dyndns": {"active": True, "provider": "x", "hostname": "h"}}})[0] == 400)
             check("test mail endpoint", a.req("/api/notify/test", {})[0] == 200)
+            # smart home: MQTT password hidden, Home Assistant address normalized
+            st, _ = a.req("/api/settings", {"smarthome": {"mqtt": {"active": True, "server": "broker.lan", "username": "nas",
+                                                                   "password": "geheim-mq"},
+                                                          "ha_proxy": {"active": True, "target": "http://192.168.1.20:8123/"}}})
+            sh = json.load(open(r + "/etc/untrash/settings.json"))["smarthome"]
+            check("smart home saved, HA address -> host:port", st == 200 and sh["mqtt"]["password"] == "geheim-mq" and
+                  sh["ha_proxy"] == {"active": True, "target": "192.168.1.20:8123"})
+            check("MQTT password never sent back", "geheim-mq" not in json.dumps(a.req("/api/settings")[1]))
+            for t, want in (("homeassistant.lan", "homeassistant.lan:8123"), ("fd00::5", "[fd00::5]:8123"), ("[fd00::5]:8443", "[fd00::5]:8443")):
+                a.req("/api/settings", {"smarthome": {"ha_proxy": {"active": True, "target": t}}})
+                check("HA address %s -> %s" % (t, want), json.load(open(r + "/etc/untrash/settings.json"))["smarthome"]["ha_proxy"]["target"] == want)
+            check("bad HA address refused", a.req("/api/settings", {"smarthome": {"ha_proxy": {"active": True, "target": "x y"}}})[0] == 400
+                  and a.req("/api/settings", {"smarthome": {"ha_proxy": {"active": True, "target": "h:70000"}}})[0] == 400)
+            check("bad MQTT server refused", a.req("/api/settings", {"smarthome": {"mqtt": {"active": True, "server": "a b"}}})[0] == 400)
             # web publishing (stock /MyWeb), link aggregation, printers
             pubc = Client(port)
             check("MyWeb off -> 404", pubc.req("/MyWeb/mixed/readme.txt")[0] == 404)

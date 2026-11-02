@@ -1159,7 +1159,7 @@ function powerRow(e, i) { return `<tr data-ps="${i}"><td><select class="ut-selec
 VIEWS.settings = async (b, sel = 'services') => {
   const s = await api('settings');
   const side = sidebar('settings', [['#', 'System'], ['language', 'Language'], ['services', 'Services'], ['time', 'Time'], ['power', 'Power'], ['recycle', 'Recycle bin'],
-    ['notify', 'Notification'], ['syslog', 'Syslog'], ['dyndns', 'DynDNS'], ['printers', 'Printers'], ['copybtn', 'COPY button'], ['cert', 'Certificate / HTTPS'], ['office', 'Office'], ['#', 'Firmware'], ['stock', 'Back to stock']], sel);
+    ['notify', 'Notification'], ['syslog', 'Syslog'], ['smarthome', 'Smart home'], ['dyndns', 'DynDNS'], ['printers', 'Printers'], ['copybtn', 'COPY button'], ['cert', 'Certificate / HTTPS'], ['office', 'Office'], ['#', 'Firmware'], ['stock', 'Back to stock']], sel);
   let main = '';
   if (sel === 'language') {
     main = `<h2>Language</h2><div class="form"><div class="ut-field"><label for="slang">System language</label>${langSel('slang', s.language || 'en')}</div>
@@ -1223,6 +1223,22 @@ VIEWS.settings = async (b, sel = 'services') => {
       <div class="row"><div class="ut-field"><label for="lsfm">Format</label><select class="ut-select" id="lsfm"><option value="simple"${ss.format === 'simple' ? ' selected' : ''}>simple (date, device, message)</option><option value="full"${ss.format === 'full' ? ' selected' : ''}>complete</option></select></div>
         ${field('lsm', 'Keep months', ss.months, 'type=number min=1 max=60')}</div>
       <button class="ut-btn ut-btn--primary" id="lgsave">Save</button></div>`;
+  } else if (sel === 'smarthome') {
+    const q = s.smarthome.mqtt, hp = s.smarthome.ha_proxy, ma = (await api('mesh').catch(() => ({}))).address;
+    main = `<h2>Smart home</h2><div class="form"><p class="ut-faint">The NAS reports its state to an MQTT broker. Home Assistant shows it as a device by itself (MQTT discovery): temperatures, fan, disks, volumes, RAID, activity, updates.</p>
+      ${sw('mq', q.active, 'Connect to the MQTT broker')}
+      <div class="row">${field('mqs', 'Broker', q.server)}${field('mqp', 'Port', q.port, 'type=number min=1 max=65535')}</div>${sw('mqt', q.tls, 'TLS (encrypted, usually port 8883)')}
+      <div class="row">${field('mqu', 'User name', q.username, 'autocomplete=off')}${field('mqw', q.password_set ? 'Password (saved; empty = keep)' : 'Password', '', 'type=password autocomplete=new-password')}</div>
+      <div class="row">${field('mqd', 'Discovery prefix', q.discovery_prefix)}${field('mqi', 'Send every (seconds)', q.interval, 'type=number min=10 max=3600')}</div>
+      ${sw('mqc', q.commands, 'Allow restart and shut down from the smart home')}
+      <p class="ut-faint">Everyone who may publish on the broker can then restart the NAS. Secure the broker with a password.</p>
+      <div class="ut-section-title">Home Assistant from anywhere (UntrashMesh)</div>
+      ${sw('hp', hp.active, 'Reach Home Assistant through UntrashMesh')}${field('hpt', 'Home Assistant in the network (address:port)', hp.target, 'placeholder="192.168.1.20:8123"')}
+      <p class="ut-faint">${ma ? `With the UntrashApp connected, enter this address in the Home Assistant app on your phone: <b class="mono">http://[${esc(ma)}]:8123</b>` : 'Needs UntrashMesh: create or join a mesh first.'}</p>
+      <p class="ut-faint">Only members of your mesh reach it; Home Assistant still asks for its own login. Home Assistant sees these connections as coming from the NAS: keep the NAS out of trusted_networks, and too many wrong logins (ip_ban) block the NAS for every phone.</p>
+      <div class="ut-section-title">Media in Home Assistant</div>
+      <p class="ut-faint">Switch on the media server (Services). Home Assistant finds it as “DLNA Digital Media Server”; its music, videos and photos can then be picked in the media browser and in automations.</p>
+      <button class="ut-btn ut-btn--primary" id="mqsave">Save</button></div>`;
   } else if (sel === 'printers') {
     const pr = await api('printers');
     main = `<h2>Printer (USB)</h2><div class="form">${sw('prt', s.services.printer.active, 'Share USB printers on the network (SMB and IPP)')}
@@ -1324,6 +1340,9 @@ VIEWS.settings = async (b, sel = 'services') => {
   on('cbsave', () => save('settings', { copybtn: { copy: { share: $('#cbs', b).value, bak_share: $('#cbb', b).value, direction: $('#cbd', b).value, newdir: $('#cbn', b).checked },
     sync: { share: $('#sys', b).value, bak_share: $('#syb', b).value, direction: $('#syd', b).value } } }, 'settings', 'copybtn'));
   $$('[data-cbrun]', b).forEach(x => x.onclick = async () => { try { await api('copybtn/run', { kind: x.dataset.cbrun }); toast('Running', x.dataset.cbrun.toUpperCase()); setTimeout(() => body('settings') && render('settings', 'copybtn'), 5000); } catch (e) { fail(e); } });
+  on('mqsave', () => save('settings', { smarthome: { mqtt: { active: $('#mq', b).checked, server: $('#mqs', b).value.trim(), port: +$('#mqp', b).value || 0, tls: $('#mqt', b).checked,
+    username: $('#mqu', b).value, password: $('#mqw', b).value, discovery_prefix: $('#mqd', b).value.trim(), interval: +$('#mqi', b).value || 60, commands: $('#mqc', b).checked },
+    ha_proxy: { active: $('#hp', b).checked, target: $('#hpt', b).value.trim() } } }, 'settings', 'smarthome'));
   on('prsave', () => save('settings', { services: { printer: { active: $('#prt', b).checked } } }, 'settings', 'printers'));
   $$('[data-cancel]', b).forEach(x => x.onclick = async () => { try { await api('printers/cancel', { name: x.dataset.cancel }); toast('Jobs deleted'); render('settings', 'printers'); } catch (e) { fail(e); } });
   on('ddsave', () => save('settings', { services: { dyndns: { active: $('#dd', b).checked, provider: $('#ddp', b).value, hostname: $('#ddh', b).value.trim(), username: $('#ddu', b).value, password: $('#ddw', b).value } } }, 'settings', 'dyndns'));

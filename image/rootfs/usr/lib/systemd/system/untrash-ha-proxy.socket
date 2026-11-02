@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashOS: Home Assistant over UntrashMesh (port 8123, mesh interface only)
+Documentation=file:/usr/lib/systemd/system/untrash-ha-proxy.service
+ConditionPathExists=/etc/untrash/ha-proxy.env
+
+[Socket]
+# only on the mesh: BindToDevice also ties the socket to the ut-mesh device
+# unit, so it starts when the mesh comes up and stops when it goes away
+ListenStream=8123
+BindToDevice=ut-mesh
+
+[Install]
+WantedBy=sockets.target

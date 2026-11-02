@@ -1,0 +1,21 @@
+# Plain TCP relay (HTTP and the WebSocket of the Home Assistant app pass
+# unchanged; HTTPS too).  Home Assistant sees every remote connection as
+# coming from the NAS: no X-Forwarded-For, so no trusted_proxies needed, but
+# the NAS address must never be in Home Assistant's trusted_networks.
+# Target: /etc/untrash/ha-proxy.env (untrash-config, smarthome.ha_proxy).
+[Unit]
+Description=UntrashOS: Home Assistant over UntrashMesh (relay)
+Requires=untrash-ha-proxy.socket
+After=untrash-ha-proxy.socket
+PartOf=untrash-ha-proxy.socket
+
+[Service]
+EnvironmentFile=/etc/untrash/ha-proxy.env
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=10min ${TARGET}
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+Slice=untrash-interactive.slice
+MemoryMax=16M

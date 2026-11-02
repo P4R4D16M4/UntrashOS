@@ -29,6 +29,7 @@ test-run:
 	python3 image/tests/test_tv_host.py
 	python3 image/tests/test_wdt_host.py
 	python3 image/tests/test_memd_host.py
+	python3 image/tests/test_mqtt_host.py
 	PATH=$$PATH:/usr/sbin python3 image/tests/test_adblock_host.py
 	python3 tools/i18n/build.py --check
 	python3 image/tests/test_import_zyxel.py

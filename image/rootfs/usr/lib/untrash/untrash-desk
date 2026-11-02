@@ -959,6 +959,36 @@ def settings_update(req):
                 raise Fail("Check the syslog server address.")
             s["notify"]["syslog"] = {"active": bool(lg.get("active")), "server": (lg.get("server") or "").strip(),
                                      "port": max(1, min(65535, int(lg.get("port") or 514)))}
+    mq = (req.get("smarthome") or {}).get("mqtt")
+    if mq is not None:
+        m = s["smarthome"]["mqtt"]
+        server = (mq.get("server") or "").strip()
+        if mq.get("active") and not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", server):
+            raise Fail("Check the MQTT server address.")
+        prefix = (mq.get("discovery_prefix") or "homeassistant").strip().strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*", prefix) or len(prefix) > 64:
+            raise Fail("Discovery prefix: letters, digits, - and _.")
+        m.update({"active": bool(mq.get("active")), "server": server, "tls": bool(mq.get("tls")),
+                  "port": max(1, min(65535, int(mq.get("port") or (8883 if mq.get("tls") else 1883)))),
+                  "username": str(mq.get("username", m["username"]))[:128], "discovery_prefix": prefix,
+                  "interval": max(10, min(3600, int(mq.get("interval") or 60))), "commands": bool(mq.get("commands"))})
+        if mq.get("password"):
+            m["password"] = str(mq["password"])[:256]
+        elif not m["username"]:
+            m["password"] = ""
+    hp = (req.get("smarthome") or {}).get("ha_proxy")
+    if hp is not None:
+        # "http://192.168.1.5:8123/", "homeassistant.local" -> host:port (default 8123)
+        t = re.sub(r"^[a-z]+://", "", (hp.get("target") or "").strip(), flags=re.I).split("/", 1)[0]
+        if t.count(":") > 1 and not t.startswith("["):          # bare IPv6 address
+            t = "[%s]" % t
+        if t and not re.search(r"(^[^\[]*|\]):\d+$", t):
+            t += ":8123"
+        if hp.get("active") or t:
+            cfg = load_module(CFGTOOL, "untrash_config")
+            if not cfg.HA_TARGET_RE.match(t) or not 0 < int(t.rsplit(":", 1)[1]) < 65536:
+                raise Fail("Home Assistant address: host or IP address, optionally with :port.")
+        s["smarthome"]["ha_proxy"] = {"active": bool(hp.get("active")), "target": t}
     p = req.get("power")
     if p:
         if "spindown_min" in p:
@@ -999,7 +1029,7 @@ def settings_update(req):
 def settings_public():
     """Settings for the browser: stored passwords are never sent back."""
     s = settings_load()
-    for d in (s["services"]["dyndns"], s["notify"]["mail"]):
+    for d in (s["services"]["dyndns"], s["notify"]["mail"], s["smarthome"]["mqtt"]):
         d["password_set"] = bool(d.get("password"))
         d["password"] = ""
     return s

@@ -1,0 +1,481 @@
+#!/usr/bin/python3
+"""untrash-mqtt - the NAS as a device in Home Assistant (or any MQTT smart
+home): state over MQTT with Home Assistant MQTT discovery.
+
+Settings: /etc/untrash/mqtt.json (untrash-config, settings smarthome.mqtt):
+  server, port, tls, username, password, discovery_prefix, interval, commands
+
+Topics (<base> = untrash/<node>, <node> = host name, lower case):
+  <base>/status          online / offline (retained, last will)
+  <base>/state           JSON with every value (retained, every interval)
+  <base>/cmd/<button>    reboot, poweroff: only with commands=true; retained
+                         messages are ignored (a stale retained "PRESS" must
+                         never restart the NAS at every connect)
+  <disc>/<component>/<node>/<object>/config   discovery (retained); entities
+                         of disks/volumes/arrays that are gone get an empty
+                         config, which removes them in Home Assistant
+  <disc>/status          Home Assistant's birth message: on "online" the
+                         discovery is sent again
+
+Values: CPU, load, memory, swap, board temperature and fan level, disk
+temperatures (never wakes a sleeping disk: untrash_live), volume use, RAID
+state, what the NAS is doing (untrash_live.activities), uptime, update.
+MQTT 3.1.1 over TCP or TLS, QoS 0, standard library only.
+"""
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "pylib"))
+import untrash_live  # noqa: E402
+
+E = os.environ.get
+R = E("ZT_MQTT_ROOT", "")                   # test prefix for /proc, /run, /i-data ...
+CONF = E("ZT_MQTT_CONF", "/etc/untrash/mqtt.json")
+UPDATE_STATE = E("ZT_UPDATE_STATE", "/var/lib/untrash/update/state.json")
+VERSION = E("ZT_VERSION_FILE", "/etc/untrash-version")
+STATE_FILE = E("ZT_MQTT_STATE", "/var/lib/untrash/mqtt.json")   # discovery topics sent
+POWER_CMD = E("ZT_MQTT_POWER_CMD", "systemctl")
+KEEPALIVE = 60
+SYSTEM_MD = (E("ZT_STORAGE_MDFW", "md0"), E("ZT_STORAGE_MDSWAP", "md1"))
+BUTTONS = {"reboot": ("Restart", "restart"), "poweroff": ("Shut down", None)}
+
+
+def log(msg):
+    print("untrash-mqtt: " + msg, flush=True)
+
+
+def first(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def jload(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+# ------------------------------------------------------------- MQTT 3.1.1
+
+def _str(s):
+    b = s.encode() if isinstance(s, str) else s
+    return struct.pack("!H", len(b)) + b
+
+
+def _packet(ptype, body):
+    n, rl = len(body), b""
+    while True:
+        d, n = n % 128, n // 128
+        rl += bytes([d | (0x80 if n else 0)])
+        if not n:
+            return bytes([ptype]) + rl + body
+
+
+class MQTTError(Exception):
+    pass
+
+
+class Client:
+    def __init__(self, host, port, tls=False, client_id="untrash", username="", password="",
+                 will=None, keepalive=KEEPALIVE, timeout=15):
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if tls:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        self.sock, self.buf, self.keepalive = sock, b"", keepalive
+        flags, payload = 0x02, _str(client_id)                     # clean session
+        if will:
+            flags |= 0x04 | 0x20                                   # will, will retain, QoS 0
+            payload += _str(will[0]) + _str(will[1])
+        if username:
+            flags |= 0x80
+            payload += _str(username)
+            if password:
+                flags |= 0x40
+                payload += _str(password)
+        self.sock.sendall(_packet(0x10, _str("MQTT") + bytes([4, flags]) + struct.pack("!H", keepalive) + payload))
+        ptype, body = self.read(timeout)
+        if ptype != 0x20 or len(body) < 2:
+            raise MQTTError("no CONNACK")
+        if body[1]:
+            raise MQTTError({1: "protocol refused", 2: "client id refused", 3: "server unavailable",
+                             4: "wrong user name or password", 5: "not authorized"}.get(body[1], "refused %d" % body[1]))
+        self.last_send, self.pid = time.time(), 0
+
+    def send(self, data):
+        self.sock.sendall(data)
+        self.last_send = time.time()
+
+    def publish(self, topic, payload, retain=False):
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload, separators=(",", ":"))
+        if isinstance(payload, str):
+            payload = payload.encode()
+        self.send(_packet(0x30 | (1 if retain else 0), _str(topic) + payload))
+
+    def subscribe(self, *topics):
+        self.pid = self.pid % 65535 + 1
+        self.send(_packet(0x82, struct.pack("!H", self.pid) + b"".join(_str(t) + b"\x00" for t in topics)))
+
+    def ping(self):
+        self.send(b"\xc0\x00")
+
+    def disconnect(self):
+        try:
+            self.send(b"\xe0\x00")
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _fill(self, need, deadline):
+        while len(self.buf) < need:
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            if not (self.sock.pending() if hasattr(self.sock, "pending") else 0):
+                if not select.select([self.sock], [], [], left)[0]:
+                    return False
+            data = self.sock.recv(65536)
+            if not data:
+                raise MQTTError("connection closed by the server")
+            self.buf += data
+        return True
+
+    def read(self, timeout):
+        """One packet (type, body), or (None, None) after timeout seconds."""
+        deadline = time.time() + timeout
+        if not self._fill(2, deadline):
+            return None, None
+        n, mult, i = 0, 1, 1
+        while True:
+            if not self._fill(i + 1, deadline + 5):
+                raise MQTTError("truncated packet")
+            b = self.buf[i]
+            n += (b & 0x7f) * mult
+            mult, i = mult * 128, i + 1
+            if not b & 0x80:
+                break
+            if i > 4:
+                raise MQTTError("bad packet length")
+        if not self._fill(i + n, deadline + 5):
+            raise MQTTError("truncated packet")
+        ptype, body, self.buf = self.buf[0], self.buf[i:i + n], self.buf[i + n:]
+        return ptype, body
+
+    def message(self, ptype, body):
+        """PUBLISH packet -> (topic, payload, retained); acks QoS 1."""
+        tl = struct.unpack("!H", body[:2])[0]
+        topic, rest = body[2:2 + tl].decode("utf-8", "replace"), body[2 + tl:]
+        qos = (ptype >> 1) & 3
+        if qos:
+            pid, rest = rest[:2], rest[2:]
+            if qos == 1:
+                self.send(b"\x40\x02" + pid)
+        return topic, rest, bool(ptype & 1)
+
+
+# ------------------------------------------------------------- values
+
+def node_id(host):
+    return re.sub(r"[^a-z0-9_-]", "_", host.lower())[:64] or "untrash"
+
+
+def device_uid(host):
+    mid = first(R + "/etc/machine-id").strip() or host
+    return "untrash_" + hashlib.sha256(("untrash-mqtt|" + mid).encode()).hexdigest()[:12]
+
+
+def volumes():
+    out = []
+    for root, kind in ((R + "/i-data", "intern"), (R + "/e-data", "usb")):
+        for d in sorted(glob.glob(root + "/*")):
+            n = os.path.basename(d)
+            if n in ("sysvol", ".system", ".media") or os.path.islink(d) or not os.path.isdir(d):
+                continue
+            try:
+                st = os.statvfs(d)
+            except OSError:
+                continue
+            size, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+            if not size:
+                continue
+            label = first(os.path.join(d, ".system", "name_label")).strip() or n
+            out.append({"id": re.sub(r"[^a-z0-9_]", "_", n.lower()), "label": label, "kind": kind,
+                        "used_pct": round(100.0 * (size - free) / size, 1), "free_gb": round(free / 1e9, 1),
+                        "size_gb": round(size / 1e9, 1)})
+    return out
+
+
+def arrays():
+    """/proc/mdstat: per data array the member state ([UU_U] -> degraded)
+    and a running resync/recovery/check with its progress.  The stock
+    firmware and swap mirrors (md0, md1, as untrash-storage) span every bay
+    with fewer disks present, so [4/1] is normal there and left out."""
+    out = []
+    md = first(R + "/proc/mdstat")
+    for m in re.finditer(r"^(md\d+) : (\w+)(?: \(\S+\))? (\S+)?.*?\n(.*?)(?=^md\d+ :|^unused|\Z)", md, re.M | re.S):
+        name, state, level, rest = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+        if name in SYSTEM_MD:
+            continue
+        mem = re.search(r"\[(\d+)/(\d+)\] \[([U_]+)\]", rest)
+        job = re.search(r"(resync|recovery|check|reshape|repair)\s*=\s*([\d.]+)%", rest)
+        out.append({"id": name, "level": level, "active": state == "active",
+                    "degraded": bool(mem and "_" in mem.group(3)) or state != "active",
+                    "job": job.group(1) if job else "idle", "progress": float(job.group(2)) if job else None})
+    return out
+
+
+def bay_names():
+    """sdb -> disk1 (board's untrash_bays, optional): stable entity names
+    while sdX letters change with the disks plugged in."""
+    if R:
+        return {}
+    try:
+        import untrash_bays
+        return {os.path.basename(dev): bay for bay, dev in untrash_bays.bays().items()}
+    except Exception:          # no board module or no bay information
+        return {}
+
+
+def collect():
+    lv = untrash_live.live(R)
+    bays = bay_names()
+    acts = untrash_live.activities(R)["activities"]
+    mem = lv["mem"]
+    board = lv.get("board") or {}
+    up = jload(UPDATE_STATE, {})
+    installed = first(R + VERSION, "?").strip() or "?"
+    latest = (up.get("available") or {}).get("version") or installed
+    used = lambda tot, fr: round(100.0 * (tot - fr) / tot, 1) if tot else 0.0     # noqa: E731
+    return {
+        "cpu": lv["cpu"]["total"],
+        "load1": float(lv["load"][0]) if lv["load"] else 0.0,
+        "mem_used": used(mem["total"], mem["avail"]),
+        "swap_used": used(mem["swap_total"], mem["swap_free"]),
+        "board_temp": None if board.get("stale") else board.get("temp_c"),
+        "fan_level": None if board.get("stale") else board.get("level"),
+        "disks": dict(sorted((bays.get(d, d), t) for d, t in lv["disks"].items())),
+        "volumes": volumes(),
+        "arrays": arrays(),
+        "activity": acts[0]["text"] if acts else "Idle",
+        "activities": [a["text"] for a in acts],
+        "boot": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - lv["uptime"])),
+        "installed": installed,
+        "latest": latest,
+    }
+
+
+def disk_key(d):
+    """disk1 (bay of the board) stays disk1, sda becomes disk_sda."""
+    return d if re.fullmatch(r"disk\d+", d) else "disk_" + d
+
+
+def state_payload(v):
+    s = {k: v[k] for k in ("cpu", "load1", "mem_used", "swap_used", "board_temp", "fan_level", "activity",
+                           "activities", "boot", "installed", "latest")}
+    for d, t in v["disks"].items():
+        s["%s_temp" % disk_key(d)] = t
+        s["%s_sleeping" % disk_key(d)] = "ON" if t is None else "OFF"
+    for x in v["volumes"]:
+        s["vol_%s_used" % x["id"]] = x["used_pct"]
+        s["vol_%s_free" % x["id"]] = x["free_gb"]
+    for a in v["arrays"]:
+        s["%s_degraded" % a["id"]] = "ON" if a["degraded"] else "OFF"
+        s["%s_job" % a["id"]] = a["job"]
+        s["%s_progress" % a["id"]] = a["progress"]
+    return s
+
+
+def entities(v, commands):
+    """object id -> (component, discovery fields without the common ones)."""
+    def sensor(key, name, **kw):
+        return ("sensor", dict(name=name, value_template="{{ value_json.%s }}" % key, **kw))
+    pct = dict(unit_of_measurement="%", state_class="measurement")
+    ent = {
+        "cpu": sensor("cpu", "CPU", icon="mdi:cpu-32-bit", **pct),
+        "load1": sensor("load1", "Load", icon="mdi:gauge", state_class="measurement", entity_category="diagnostic"),
+        "mem_used": sensor("mem_used", "Memory used", icon="mdi:memory", **pct),
+        "swap_used": sensor("swap_used", "Swap used", icon="mdi:swap-horizontal", entity_category="diagnostic", **pct),
+        "board_temp": sensor("board_temp", "Board temperature", device_class="temperature",
+                             unit_of_measurement="°C", state_class="measurement"),
+        "fan_level": sensor("fan_level", "Fan level", icon="mdi:fan", state_class="measurement"),
+        "activity": sensor("activity", "Activity", icon="mdi:progress-clock",
+                           json_attributes_template="{{ {'activities': value_json.activities} | tojson }}"),
+        "boot": sensor("boot", "Last start", device_class="timestamp", entity_category="diagnostic"),
+        "update": ("update", dict(name="System", title="UntrashOS", entity_category="diagnostic",
+                                  value_template="{{ {'installed_version': value_json.installed, "
+                                                 "'latest_version': value_json.latest} | tojson }}")),
+    }
+    for d in v["disks"]:
+        k = disk_key(d)
+        label = "Disk " + d[4:] if re.fullmatch(r"disk\d+", d) else "Disk " + d
+        ent["%s_temp" % k] = sensor("%s_temp" % k, "%s temperature" % label, device_class="temperature",
+                                         unit_of_measurement="°C", state_class="measurement")
+        ent["%s_sleeping" % k] = ("binary_sensor", dict(name="%s sleeping" % label, icon="mdi:sleep",
+                                  value_template="{{ value_json.%s_sleeping }}" % k))
+    for x in v["volumes"]:
+        ent["vol_%s_used" % x["id"]] = sensor("vol_%s_used" % x["id"], "%s used" % x["label"], icon="mdi:harddisk", **pct)
+        ent["vol_%s_free" % x["id"]] = sensor("vol_%s_free" % x["id"], "%s free" % x["label"], device_class="data_size",
+                                              unit_of_measurement="GB", state_class="measurement")
+    for a in v["arrays"]:
+        ent["%s_degraded" % a["id"]] = ("binary_sensor", dict(name="RAID %s" % a["id"], device_class="problem",
+                                        value_template="{{ value_json.%s_degraded }}" % a["id"]))
+        ent["%s_job" % a["id"]] = sensor("%s_job" % a["id"], "RAID %s job" % a["id"], icon="mdi:sync",
+                                         entity_category="diagnostic")
+        ent["%s_progress" % a["id"]] = sensor("%s_progress" % a["id"], "RAID %s progress" % a["id"],
+                                              entity_category="diagnostic", **pct)
+    if commands:
+        for b, (name, dc) in BUTTONS.items():
+            ent[b] = ("button", dict(name=name, payload_press="PRESS", entity_category="config",
+                                     **({"device_class": dc} if dc else {"icon": "mdi:power"})))
+    return ent
+
+
+# ------------------------------------------------------------- service
+
+class Bridge:
+    def __init__(self, conf, host=None):
+        self.conf = conf
+        self.host = host or socket.gethostname()
+        self.node = node_id(self.host)
+        self.base = "untrash/" + self.node
+        self.disc = (conf.get("discovery_prefix") or "homeassistant").strip("/")
+        self.commands = bool(conf.get("commands"))
+        self.sent = set()       # discovery topics with a config on the broker
+
+    def device(self):
+        return {"identifiers": [device_uid(self.host)], "name": self.host, "manufacturer": "UntrashOS",
+                "model": jload(R + "/usr/share/untrash/board.json", {}).get("title") or "NAS",
+                "sw_version": first(R + VERSION, "?").strip(),
+                "configuration_url": "http://%s.local/" % self.host}
+
+    def discovery(self, cl, v, force=False):
+        dev, ent, now = self.device(), entities(v, self.commands), set()
+        for obj, (comp, cfg) in ent.items():
+            topic = "%s/%s/%s/%s/config" % (self.disc, comp, self.node, obj)
+            now.add(topic)
+            if topic in self.sent and not force:
+                continue
+            cfg = dict(cfg, unique_id="%s_%s" % (dev["identifiers"][0], obj), availability_topic=self.base + "/status", device=dev)
+            if comp == "button":
+                cfg["command_topic"] = "%s/cmd/%s" % (self.base, obj)
+            else:
+                cfg["state_topic"] = self.base + "/state"
+            cl.publish(topic, cfg, retain=True)
+        for topic in self.sent - now:             # disk/volume/array gone, commands switched off
+            cl.publish(topic, b"", retain=True)
+        if now != self.sent:
+            self.sent = now
+            save_state(self)
+
+    def command(self, cl, topic, payload, retained):
+        b = topic[len(self.base + "/cmd/"):]
+        if retained and payload:
+            log("retained command on %s ignored and cleared" % topic)
+            cl.publish(topic, b"", retain=True)
+            return False
+        if retained or not self.commands or b not in BUTTONS or payload.strip() != b"PRESS":
+            return False
+        log("command %s from MQTT" % b)
+        subprocess.run([POWER_CMD, b], check=False)
+        return True
+
+    def session(self):
+        c = self.conf
+        cl = Client(c["server"], int(c.get("port") or (8883 if c.get("tls") else 1883)), tls=bool(c.get("tls")),
+                    client_id="untrash-" + self.node, username=c.get("username") or "",
+                    password=c.get("password") or "", will=(self.base + "/status", "offline"))
+        log("connected to %s:%s" % (c["server"], c.get("port")))
+        try:
+            subs = [self.disc + "/status"] + (["%s/cmd/+" % self.base] if self.commands else [])
+            cl.subscribe(*subs)
+            self.sent = set(self._known(cl))
+            v = collect()
+            self.discovery(cl, v, force=True)
+            cl.publish(self.base + "/status", "online", retain=True)
+            interval = max(10, int(c.get("interval") or 60))
+            nxt = time.time() + 5       # first CPU value over a few seconds, not over our own start
+            while True:
+                now = time.time()
+                if now >= nxt:
+                    v = collect()
+                    self.discovery(cl, v)
+                    cl.publish(self.base + "/state", state_payload(v), retain=True)
+                    nxt = now + interval
+                if time.time() - cl.last_send > KEEPALIVE * 0.75:
+                    cl.ping()
+                ptype, body = cl.read(min(max(0.1, nxt - time.time()), KEEPALIVE / 2))
+                if ptype is None or ptype >> 4 != 3:
+                    continue
+                topic, payload, retained = cl.message(ptype, body)
+                if topic == self.disc + "/status" and payload.strip() == b"online" and not retained:
+                    log("Home Assistant started: discovery again")
+                    self.discovery(cl, collect(), force=True)
+                    nxt = 0
+                elif topic.startswith(self.base + "/cmd/"):
+                    self.command(cl, topic, payload, retained)
+        finally:
+            try:
+                cl.publish(self.base + "/status", "offline", retain=True)   # a clean DISCONNECT drops the will
+            except OSError:
+                pass
+            cl.disconnect()
+
+    def _known(self, cl):
+        """Discovery topics a previous run left on the broker (retained), so
+        that entities which vanished while the service was off are removed."""
+        st = jload(STATE_FILE, {})
+        return st.get("sent", []) if st.get("node") == self.node and st.get("disc") == self.disc else []
+
+
+
+def save_state(br):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE + ".tmp", "w") as f:
+            json.dump({"node": br.node, "disc": br.disc, "sent": sorted(br.sent)}, f)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    except OSError:
+        pass
+
+
+def main():
+    conf = jload(CONF, {})
+    if not conf.get("server"):
+        log("no MQTT server configured")
+        return 0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))      # finally: "offline", DISCONNECT
+    br, wait = Bridge(conf), 5
+    while True:
+        start = time.time()
+        try:
+            br.session()
+        except (OSError, MQTTError, ssl.SSLError) as e:
+            if time.time() - start > 300:          # it ran for a while: try again soon
+                wait = 5
+            log("connection: %s; again in %d s" % (e, wait))
+        time.sleep(wait)
+        wait = min(wait * 2, 300)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

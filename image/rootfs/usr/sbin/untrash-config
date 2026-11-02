@@ -41,6 +41,10 @@ Settings (docs/architecture/stock-takeover.md section 8):
           alerts_to, log_to, subject, alerts, report_all, schedule, day, hour,
           minute}, syslog {active, server, port}}
   power {spindown_min, wol}, recycle {expire_days}, usb {names {uuid: name}}
+  smarthome {mqtt {active, server, port, tls, username, password,
+           discovery_prefix, interval, commands}}  (untrash-mqtt)
+           ha_proxy {active, target host:port}  (Home Assistant over the
+           mesh: untrash-ha-proxy.socket, port 8123 on ut-mesh only)
   unsupported [stock features that were on and UntrashOS does not offer]
 Shares, users and rights stay in the stock database (untrash-import-zyxel).
 """
@@ -117,6 +121,9 @@ DEFAULTS = {
     "cloud": {"jobs": []},
     "upnp": {"services": {}},
     "iscsi": {"luns": [], "targets": []},
+    "smarthome": {"mqtt": {"active": False, "server": "", "port": 1883, "tls": False, "username": "", "password": "",
+                           "discovery_prefix": "homeassistant", "interval": 60, "commands": False},
+                  "ha_proxy": {"active": False, "target": ""}},
     "copybtn": {"copy": {"share_path": "", "bak_path": "", "direction": "cp2Vol", "newdir": True},
                 "sync": {"share_path": "", "bak_path": "", "direction": "twoWay"}},
     "unsupported": [],
@@ -663,6 +670,15 @@ def render(s, root=""):
     return out
 
 
+HA_TARGET_RE = re.compile(r"^([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\]):\d{1,5}$")
+
+
+def ha_proxy_on(s):
+    """Home Assistant relay wanted, with a target the relay can parse."""
+    hp = s["smarthome"]["ha_proxy"]
+    return bool(hp["active"] and HA_TARGET_RE.match(hp["target"] or "") and 0 < int(hp["target"].rsplit(":", 1)[1]) < 65536)
+
+
 def q(v):
     """Quoted value for inadyn/apcupsd-style config files."""
     return '"%s"' % str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
@@ -697,6 +713,18 @@ def render_extra(s, root, out):
     lg = s["notify"]["syslog"]
     w(root, "/etc/untrash/syslog-forward.env", "SERVER=%s\nPORT=%d\n" % (
         lg["server"] if re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", lg["server"] or "") else "", int(lg["port"] or 514)))
+    mq = s["smarthome"]["mqtt"]
+    if mq["active"] and mq["server"]:
+        w(root, "/etc/untrash/mqtt.json", json.dumps(mq, indent=1) + "\n", 0o600)    # broker password
+        out.append("mqtt %s:%s" % (mq["server"], mq["port"]))
+    else:
+        rm(root, "/etc/untrash/mqtt.json")
+    hp = s["smarthome"]["ha_proxy"]
+    if ha_proxy_on(s):
+        w(root, "/etc/untrash/ha-proxy.env", "TARGET=%s\n" % hp["target"])
+        out.append("ha-proxy -> %s" % hp["target"])
+    else:
+        rm(root, "/etc/untrash/ha-proxy.env")
     ss = sv["syslog_server"]
     w(root, "/etc/untrash/syslog-server.json", json.dumps(ss, indent=1) + "\n")
 
@@ -891,6 +919,8 @@ UNITS = {  # setting -> systemd units
     "iscsi": ["untrash-iscsi.service"],
     "syslog_server": ["untrash-syslogd.service"],
     "syslog_forward": ["untrash-syslog-forward.service"],
+    "mqtt": ["untrash-mqtt.service"],
+    "ha_proxy": ["untrash-ha-proxy.socket"],
     "mail_report": ["untrash-log-report.timer"],
     "mail_alerts": ["mdmonitor.service", "smartmontools.service", "untrash-notify-check.timer"],
 }
@@ -974,6 +1004,8 @@ def wanted(s):
             "iscsi": any(t.get("active") for t in s.get("iscsi", {}).get("targets", [])),
             "upnp": any(int(v) > 0 for v in s.get("upnp", {}).get("services", {}).values()), "syslog_server": sv["syslog_server"]["active"] and bool(sv["syslog_server"]["path"]),
             "syslog_forward": s["notify"]["syslog"]["active"] and bool(s["notify"]["syslog"]["server"]),
+            "mqtt": s["smarthome"]["mqtt"]["active"] and bool(s["smarthome"]["mqtt"]["server"]),
+            "ha_proxy": ha_proxy_on(s),
             "mail_report": s["notify"]["mail"]["active"] and bool(s["notify"]["mail"]["log_to"]),
             "mail_alerts": s["notify"]["mail"]["active"] and s["notify"]["mail"]["alerts"] and bool(s["notify"]["mail"]["alerts_to"])}
 

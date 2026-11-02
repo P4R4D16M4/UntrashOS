@@ -1,0 +1,15 @@
+[Unit]
+Description=UntrashOS: the NAS as a device in the smart home (MQTT, Home Assistant discovery)
+ConditionPathExists=/etc/untrash/mqtt.json
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-mqtt
+Restart=always
+RestartSec=10
+Slice=untrash-background.slice
+MemoryMax=48M
+
+[Install]
+WantedBy=multi-user.target
