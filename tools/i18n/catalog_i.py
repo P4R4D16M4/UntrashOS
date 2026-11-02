@@ -385,6 +385,7 @@ T = {
     "Telnet (not offered on purpose)": ("Telnet (bewusst nicht angeboten)", "Telnet (volontairement non proposé)"),
     "That is not the return address (http://127.0.0.1:%d/?state=…&code=…).": ("Das ist nicht die Rücksprung-Adresse (http://127.0.0.1:%d/?state=…&code=…).", "Ce n'est pas l'adresse de retour (http://127.0.0.1:%d/?state=…&code=…)."),
     "The app joins UntrashMesh and signs in on this NAS as the user you choose. It can confirm sign-ins and actions of that user.": ("Die App tritt UntrashMesh bei und meldet sich an diesem NAS als der Benutzer an, den du wählst. Sie kann Anmeldungen und Aktionen dieses Benutzers bestätigen.", "L'app rejoint UntrashMesh et se connecte sur ce NAS sous l'utilisateur que tu choisis. Elle peut confirmer les connexions et actions de cet utilisateur."),
+    "This link is used or expired. Open the Desk from the app again.": ("Dieser Link ist verbraucht oder abgelaufen. Öffne den Desk erneut aus der App.", "Ce lien est déjà utilisé ou expiré. Rouvre le Desk depuis l'app."),
     "The app reaches the Desk over UntrashMesh only.": ("Die App erreicht den Desk nur über UntrashMesh.", "L'app n'atteint le Desk que via UntrashMesh."),
     "The browser blocked the new tab.": ("Der Browser hat den neuen Tab blockiert.", "Le navigateur a bloqué le nouvel onglet."),
     "The buzzer plays one tone at a time: blocks must not overlap.": ("Der Summer spielt einen Ton zur Zeit: Blöcke dürfen sich nicht überlappen.", "Le buzzer joue un son à la fois : les blocs ne doivent pas se chevaucher."),
