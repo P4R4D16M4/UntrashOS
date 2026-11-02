@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+"""untrash-transfer - copy/move files and receive uploads for the Desk.
+
+  untrash-transfer run          JOB (JSON) on stdin; progress as JSON lines on stdout
+  untrash-transfer receive TMP DST LENGTH [UID]
+                                exactly LENGTH bytes from stdin into TMP, then TMP -> DST
+
+The Desk never writes bulk data itself.  A file it holds open for writing on
+a CIFS partner volume is flushed whenever any process forked from the Desk
+closes it (every subprocess, before exec).  While a copy keeps writing that
+flush never ends: the forked helpers and the Desk threads that started them
+hang in D state until the copy is done (untrash1, 2026-10-25).  This process
+holds those file descriptors instead and forks nothing.
+
+JOB = {"op": "copy"|"move", "items": [absolute paths], "dst": absolute dir,
+       "conflict": "rename"|"overwrite"|"skip", "uid": int|null, "gid": int,
+       "skip_names": [names never copied (recycle bins)]}
+Progress lines (at most about 3 per second):
+  {"total": N}  {"done": N, "files": N, "skipped": N, "current": NAME}
+  last line: {"state": "done"|"errors"|"cancelled", "done", "files", "skipped", "errors": [...]}
+SIGTERM cancels: the partly written file (NAME.untrash-part) is removed.
+receive exits 0 (stored), 3 (stdin ended early: aborted), 4 (cancelled).
+"""
+import json
+import os
+import shutil
+import signal
+import sys
+import time
+
+CANCEL = False
+CHUNK = int(os.environ.get("ZT_TRANSFER_CHUNK") or 1 << 20)
+DELAY = float(os.environ.get("ZT_TRANSFER_DELAY") or 0)    # PC tests: seconds per chunk
+
+
+def on_term(_sig, _frm):
+    global CANCEL
+    CANCEL = True
+
+
+class Cancelled(Exception):
+    pass
+
+
+def own(path, uid, gid, mode=0o777):
+    """New files and folders as uploads make them: the user's, group everyone."""
+    os.chmod(path, mode)
+    if uid is not None:
+        os.chown(path, uid, gid)
+
+
+def free_name(path):
+    """path, or "name (2).ext", "name (3).ext", ... if it exists (as the Desk)."""
+    if not os.path.lexists(path):
+        return path
+    d, n = os.path.split(path)
+    stem, ext = (n, "") if os.path.isdir(path) else os.path.splitext(n)
+    i = 2
+    while os.path.lexists(os.path.join(d, "%s (%d)%s" % (stem, i, ext))):
+        i += 1
+    return os.path.join(d, "%s (%d)%s" % (stem, i, ext))
+
+
+class Job:
+    def __init__(self, spec):
+        self.op = spec["op"]
+        self.uid, self.gid = spec.get("uid"), spec.get("gid", 500)
+        self.skip = set(spec.get("skip_names") or ())
+        self.done = self.files = self.skipped = 0
+        self.errors = []
+        self.current = ""
+        self.last = 0.0
+
+    def emit(self, force=False, **extra):
+        now = time.monotonic()
+        if not force and now - self.last < 0.3:
+            return
+        self.last = now
+        line = dict(done=self.done, files=self.files, skipped=self.skipped, current=self.current)
+        line.update(extra)
+        sys.stdout.write(json.dumps(line) + "\n")
+        sys.stdout.flush()
+
+    def err(self, msg):
+        if len(self.errors) < 20:
+            self.errors.append(msg)
+
+    def check(self):
+        if CANCEL:
+            raise Cancelled()
+
+    def size(self, p):
+        if os.path.islink(p):
+            return 0
+        if os.path.isfile(p):
+            return os.path.getsize(p)
+        t = 0
+        for d, _ds, fs in os.walk(p):
+            self.check()
+            for f in fs:
+                fp = os.path.join(d, f)
+                if not os.path.islink(fp):
+                    try:
+                        t += os.path.getsize(fp)
+                    except OSError:
+                        pass
+        return t
+
+    def copy_file(self, src, dst):
+        tmp = dst + ".untrash-part"
+        try:
+            with open(src, "rb") as fi, open(tmp, "wb") as fo:
+                while True:
+                    self.check()
+                    b = fi.read(CHUNK)
+                    if not b:
+                        break
+                    fo.write(b)
+                    self.done += len(b)
+                    self.emit()
+                    if DELAY:
+                        time.sleep(DELAY)
+            st = os.stat(src)
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+            own(tmp, self.uid, self.gid)
+            os.replace(tmp, dst)
+            self.files += 1
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def copy_tree(self, src, dst):
+        if os.path.islink(src):
+            self.err("%s: links are not copied" % os.path.basename(src))
+            return False
+        if os.path.isdir(src):
+            os.mkdir(dst)
+            own(dst, self.uid, self.gid)
+            ok = True
+            for e in sorted(os.listdir(src)):
+                if e in self.skip:
+                    continue
+                self.current = e
+                try:
+                    ok = self.copy_tree(os.path.join(src, e), os.path.join(dst, e)) and ok
+                except OSError as x:
+                    self.err("%s: %s" % (e, x.strerror or x))
+                    ok = False
+            return ok
+        self.copy_file(src, dst)
+        return True
+
+    def run(self, items, dfull, conflict):
+        total = sum(self.size(f) for f in items)
+        self.emit(force=True, total=total)
+        for src in items:
+            name = os.path.basename(src)
+            self.current = name
+            target = os.path.join(dfull, name)
+            if self.op == "move" and os.path.dirname(src) == dfull:
+                self.skipped += 1                    # moved onto itself: nothing to do
+                continue
+            if os.path.lexists(target):
+                if conflict == "skip":
+                    self.skipped += 1
+                    continue
+                if conflict == "rename" or target == src:
+                    target = free_name(target)
+                else:                                # overwrite: the old one goes
+                    if os.path.isdir(target) and not os.path.islink(target):
+                        shutil.rmtree(target)
+                    else:
+                        os.unlink(target)
+            try:
+                if self.op == "move":
+                    try:
+                        os.rename(src, target)       # same file system: instant
+                        self.done += self.size(target)
+                        self.files += 1
+                        continue
+                    except OSError as x:
+                        if x.errno != 18:            # EXDEV: other volume, copy + delete
+                            raise
+                if self.copy_tree(src, target) and self.op == "move":
+                    if os.path.isdir(src) and not os.path.islink(src):
+                        shutil.rmtree(src)
+                    else:
+                        os.unlink(src)
+            except OSError as x:
+                self.err("%s: %s" % (name, x.strerror or x))
+            self.emit()
+
+
+def cmd_run():
+    spec = json.load(sys.stdin)
+    job = Job(spec)
+    try:
+        job.run(spec["items"], spec["dst"], spec.get("conflict") or "rename")
+        state = "done" if not job.errors else "errors"
+    except Cancelled:
+        state = "cancelled"
+    except Exception as x:  # noqa: BLE001 - a job must end with a state
+        job.err(str(x))
+        state = "errors"
+    job.current = ""
+    job.emit(force=True, state=state, errors=job.errors)
+    return 0
+
+
+def cmd_receive(tmp, dst, length, uid=None):
+    left = int(length)
+    src = sys.stdin.buffer
+    try:
+        with open(tmp, "wb") as f:
+            while left:
+                if CANCEL:
+                    raise Cancelled()
+                b = src.read(min(left, CHUNK))
+                if not b:
+                    raise EOFError()
+                f.write(b)
+                left -= len(b)
+        own(tmp, int(uid) if uid not in (None, "") else None, 500)
+        os.replace(tmp, dst)
+        return 0
+    except (Cancelled, EOFError) as x:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        return 4 if isinstance(x, Cancelled) else 3
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def main(argv):
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if argv[1:2] == ["run"]:
+        return cmd_run()
+    if argv[1:2] == ["receive"] and len(argv) in (5, 6):
+        return cmd_receive(*argv[2:])
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

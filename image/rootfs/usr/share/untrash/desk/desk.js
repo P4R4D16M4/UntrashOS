@@ -14,7 +14,7 @@ let ME = null;
    shows "progress", a thin bar runs at the top and that button spins and is
    disabled (no double submit).  Background polls (status, activity) stay quiet. */
 let BUSY = 0, LASTBTN = null, LASTT = 0;
-const QUIET = /^(live|activity|overview|job|update)\b/;
+const QUIET = /^(live|activity|overview|job|update|transfers)\b/;
 document.addEventListener('click', e => { const b = e.target.closest('button, .ut-btn, [data-nav], .ut-dock__item, .fileline'); if (b) { LASTBTN = b; LASTT = performance.now(); } }, true);
 function busy(on, btn) {
   BUSY = Math.max(0, BUSY + (on ? 1 : -1));
@@ -178,6 +178,7 @@ const APPS = {
   settings: { name: 'Settings', icon: 'settings', w: 820, h: 580 },
   cloud: { name: 'Cloud', icon: 'backup', w: 820, h: 560 },
   downloads: { name: 'Downloads', icon: 'apps', w: 820, h: 560 },
+  transfers: { name: 'Transfers', icon: 'files', w: 880, h: 540, user: true },
   backup: { name: 'Backup', icon: 'raid', w: 860, h: 580 },
   updates: { name: 'Updates', icon: 'updates', w: 640, h: 460 },
   logs: { name: 'Logs', icon: 'logs', w: 860, h: 520 },
@@ -195,7 +196,7 @@ const APPS = {
 };
 /* the admin dock: two apps direct, the rest in categories that open a popup */
 const DOCK_ADMIN = ['overview', 'files',
-  { g: 'data', name: 'Data', apps: ['shares', 'storage', 'backup', 'cloud', 'downloads'] },
+  { g: 'data', name: 'Data', apps: ['shares', 'storage', 'transfers', 'backup', 'cloud', 'downloads'] },
   { g: 'net', name: 'Network', apps: ['network', 'mesh', 'adblock'] },
   { g: 'media', name: 'Media', apps: ['media', 'tv', 'sound'] },
   { g: 'system', name: 'System', apps: ['status', 'users', 'settings', 'updates', 'logs', 'terminal'] },
@@ -235,11 +236,12 @@ addEventListener('resize', closeDockPopup);
 
 function desk(st) {
   const apps = Object.keys(APPS).filter(k => (ME.admin || APPS[k].user) && !APPS[k].hidden);
-  const dock = ME.admin ? DOCK_ADMIN : ['files', 'tv', 'manual', 'account'];
+  const dock = ME.admin ? DOCK_ADMIN : ['files', 'transfers', 'tv', 'manual', 'account'];
   $('#app').innerHTML = `<div class="ut-desk" id="desk">
     <header class="ut-topbar"><span class="ut-topbar__item"><img src="/ut/assets/logo-mark-48.png" alt=""><span class="ut-topbar__title">Untrash<span style="color:var(--ut-teal)">OS</span></span></span>
       <span class="ut-topbar__item" id="active-title">${esc(st.hostname)}</span><div class="ut-topbar__spacer"></div>
       <span class="ut-topbar__item ut-activity" id="activity" aria-live="polite"></span>
+      <button class="ut-topbar__item ut-ops-btn" id="ops-btn" hidden></button>
       <span class="ut-topbar__item" id="raid-pill"></span>
       <button class="ut-topbar__item" id="user-btn" translate="no">${esc(ME.user)}</button><span class="ut-topbar__item" id="clock"></span></header>
     <nav class="ut-desktop-icons">${apps.filter(k => k !== 'account').slice(0, 6).map(k => `<button class="ut-desk-icon" data-app="${k}"><img src="${ICON(APPS[k].icon)}" alt="">${APPS[k].name}</button>`).join('')}</nav>
@@ -262,6 +264,8 @@ function desk(st) {
   };
   const tick = () => $('#clock') && ($('#clock').textContent = new Date().toLocaleString(UTI18N.locale, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }));
   tick(); setInterval(tick, 15000);
+  $('#ops-btn').onclick = () => openApp('transfers');
+  const ob = single(opsBadge); ob(); setInterval(ob, 4000);
   if (ME.admin) { const rp = single(raidPill), ab = single(activityBar); rp(); setInterval(rp, 60000); ab(); setInterval(ab, 5000); openApp('overview'); 
     api('update').then(u => { const r = u.release || {}; if (r.available && (r.download || {}).state === 'ready') toast('Update', UTI18N.tr('UntrashOS %s is downloaded and checked; install it under Updates.').replace('%s', r.available.version)); }).catch(() => { }); } else openApp('files');
 }
@@ -285,6 +289,20 @@ async function activityBar() {
     const a = (await api('activity')).activities;
     el.innerHTML = a.length ? a.map(x => `<span class="ut-act ut-act--${esc(x.kind)}" title="${esc(x.text)}"><i>${ACT_ICON[x.kind] || '•'}</i>${esc(x.text)}</span>`).join('')
       : '<span class="ut-act ut-act--idle"><i>●</i>Idle</span>';
+  } catch (e) { }
+}
+
+/* top bar: running transfers (copy/move, uploads, downloads) of this user, of all for admins */
+async function opsBadge() {
+  const el = $('#ops-btn'); if (!el || document.hidden) return;
+  try {
+    const run = (await apiRaw('transfers')).ops.filter(o => o.state === 'running' || o.state === 'paused');
+    el.hidden = !run.length;
+    if (!run.length) return;
+    const tot = run.reduce((a, o) => a + (o.total || 0), 0), done = run.reduce((a, o) => a + (o.total ? o.done : 0), 0);
+    const txt = UTI18N.tr(run.length === 1 ? '1 transfer' : '%s transfers').replace('%s', run.length) + (tot ? ' · ' + Math.floor(100 * done / tot) + ' %' : '');
+    el.innerHTML = `<i>⇅</i>${esc(txt)}`;
+    el.title = run.map(o => o.name).join('\n');
   } catch (e) { }
 }
 
@@ -492,17 +510,18 @@ function xferPanel() {
   if (!box) return;
   const live = XFER.filter(x => !x.gone);
   box.hidden = !live.length;
-  box.innerHTML = live.map((x, i) => {
+  box.innerHTML = `<div class="ut-xfer__head"><button class="ut-btn ut-btn--sm ut-btn--ghost" data-xall>All transfers …</button></div>` + live.map((x, i) => {
     const pct = x.total ? Math.min(100, Math.round(100 * x.done / x.total)) : (x.state === 'running' ? 0 : 100);
     const label = x.kind === 'up' ? UTI18N.tr('Upload') : UTI18N.tr(x.op === 'move' ? 'Move' : 'Copy');
-    const st = x.state === 'running' ? `${pct} %` : esc(UTI18N.tr({ done: 'done', errors: 'with errors', cancelled: 'cancelled' }[x.state] || x.state));
+    const st = x.state === 'running' ? `${pct} %` : esc(UTI18N.tr({ done: 'done', errors: 'with errors', cancelled: 'cancelled', paused: 'paused' }[x.state] || x.state));
     return `<div class="ut-xfer"><span class="ut-xfer__name"><b>${esc(label)}</b> <span translate="no">${esc(x.name || '')}</span></span>
       <div class="ut-progress" style="--v:${pct}%"><i></i></div><span class="ut-faint">${st}</span>
-      ${x.state === 'running' ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-xc="${i}">Cancel</button>` : `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-xd="${i}" aria-label="Close">✕</button>`}
+      ${x.state === 'running' || x.state === 'paused' ? `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-xc="${i}">Cancel</button>` : `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-xd="${i}" aria-label="Close">✕</button>`}
       ${(x.errors || []).length ? `<div class="ut-faint ut-xfer__err" translate="no">${x.errors.map(esc).join('<br>')}</div>` : ''}</div>`;
   }).join('');
   $$('[data-xc]', box).forEach(btn => btn.onclick = () => { const x = live[+btn.dataset.xc]; x.cancel && x.cancel(); });
   $$('[data-xd]', box).forEach(btn => btn.onclick = () => { live[+btn.dataset.xd].gone = true; xferPanel(); });
+  $('[data-xall]', box).onclick = () => openApp('transfers');
 }
 function uploadFile(share, path, file, dirs) {
   return new Promise((resolve, reject) => {
@@ -546,13 +565,14 @@ async function startTransfer(op, share, from, names, dst, conflict = 'rename') {
   XFER.push(x); xferPanel(); pollJobs();
 }
 const pollJobs = single(async () => {
-  while (XFER.some(x => x.kind === 'job' && x.state === 'running')) {
+  const live = x => x.kind === 'job' && (x.state === 'running' || x.state === 'paused');
+  while (XFER.some(live)) {
     try {
       const js = (await apiRaw('files/jobs')).jobs;
-      for (const x of XFER.filter(x => x.kind === 'job' && x.state === 'running')) {
+      for (const x of XFER.filter(live)) {
         const j = js.find(j => j.id === x.id); if (!j) { x.state = 'errors'; continue; }
         Object.assign(x, { total: j.total, done: j.done, state: j.state, errors: j.errors });
-        if (j.state !== 'running') {
+        if (j.state !== 'running' && j.state !== 'paused') {
           if (body('files')) render('files');
           if (j.state === 'done') setTimeout(() => { x.gone = true; xferPanel(); }, 4000);
         }
@@ -1445,6 +1465,61 @@ VIEWS.downloads = async (b, sel = 'list') => {
     bt_port: +$('#dlp', b).value || 6881, ratio: +$('#dlr', b).value, seed_min: +$('#dlt', b).value, dht: $('#dldht', b).checked, notify: $('#dln', b).checked } } }, 'downloads', 'settings'));
   clearTimeout(DLPOLL);
   if (sel === 'list' && d.items.some(x => x.status === 'active')) DLPOLL = setTimeout(() => { if (body('downloads')) render('downloads', 'list'); }, 3000);
+};
+
+/* transfers: copy/move jobs, uploads and downloads of the Desk, download service ------------- */
+const TRKIND = { copy: 'Copy', move: 'Move', upload: 'Upload', download: 'Download', service: 'Download service' };
+const TRSTATE = { running: 'running', paused: 'paused', done: 'done', errors: 'with errors', cancelled: 'cancelled',
+  active: 'loading', waiting: 'waiting', complete: 'done', error: 'Error', removed: 'removed' };
+const TRS = { sel: 'all', timer: null };
+const dur = s => s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.round(s % 3600 / 60) + ' min' : s >= 60 ? Math.round(s / 60) + ' min' : Math.max(1, Math.round(s)) + ' s';
+function trRow(o) {
+  const live = o.state === 'running' || o.state === 'paused' || o.state === 'active' || o.state === 'waiting';
+  const pct = o.total ? Math.min(100, Math.floor(100 * o.done / o.total)) : (live ? 0 : 100);
+  const eta = o.state === 'running' && o.rate > 0 && o.total > o.done ? ' · ' + UTI18N.tr('%s left').replace('%s', dur((o.total - o.done) / o.rate)) : '';
+  const btn = (act, label, cls = '') => `<button class="ut-btn ut-btn--sm ${cls}" data-tr="${act}:${esc(o.id)}">${esc(UTI18N.tr(label))}</button>`;
+  let acts = '';
+  if (o.kind === 'service') acts = (o.state === 'active' || o.state === 'waiting' ? btn('pause', 'Pause') : '') + (o.state === 'paused' ? btn('resume', 'Resume') : '') + btn('cancel', 'Remove', 'ut-btn--danger');
+  else if (live) acts = (o.kind === 'copy' || o.kind === 'move' ? (o.state === 'paused' ? btn('resume', 'Resume') : btn('pause', 'Pause')) : '') + btn('cancel', 'Cancel', 'ut-btn--danger');
+  else acts = `<button class="ut-btn ut-btn--sm ut-btn--ghost" data-tr="dismiss:${esc(o.id)}" aria-label="${esc(UTI18N.tr('Remove from the list'))}">✕</button>`;
+  const sub = [o.kind === 'download' ? (o.where === 'link' ? UTI18N.tr('via share link') : '') : o.where ? '→ ' + o.where : '', o.current && o.current !== o.name ? o.current : '',
+    ME.admin && o.user ? UTI18N.tr('by %s').replace('%s', o.user) : ''].filter(Boolean);
+  return `<div class="ut-tr${live ? '' : ' ut-tr--end'}"><div class="ut-tr__name"><b>${esc(UTI18N.tr(TRKIND[o.kind] || o.kind))}</b> <span translate="no">${esc(o.name)}</span>
+      ${sub.length ? `<div class="ut-faint" translate="no">${esc(sub.join(' · '))}</div>` : ''}</div>
+    <div class="ut-tr__bar"><div class="ut-progress${o.state === 'errors' || o.state === 'error' ? ' ut-progress--danger' : o.state === 'paused' ? ' ut-progress--warn' : ''}" style="--v:${pct}%"><i></i></div>
+      <span class="ut-faint">${o.total ? `${pct} % · ${size(o.done)} / ${size(o.total)}` : size(o.done)}${o.files > 1 ? ' · ' + UTI18N.tr('%s files').replace('%s', o.files) : ''}</span></div>
+    <div class="ut-tr__rate"><span>${esc(UTI18N.tr(TRSTATE[o.state] || o.state))}</span><span class="ut-faint">${o.state === 'running' || o.state === 'active' ? size(o.rate) + '/s' + eta : ''}</span></div>
+    <div class="ut-tr__acts">${acts}</div>
+    ${(o.errors || []).length ? `<div class="ut-faint ut-tr__err" translate="no">${o.errors.map(esc).join('<br>')}</div>` : ''}</div>`;
+}
+VIEWS.transfers = async (b, sel) => {
+  if (sel) TRS.sel = sel;
+  if (!$('#trlist', b)) {
+    const items = [['#', 'Transfers'], ['all', 'All'], ['copy', 'Copy and move'], ['upload', 'Uploads'], ['download', 'Downloads']];
+    if (ME.admin) items.push(['service', 'Download service']);
+    b.innerHTML = sidebar('transfers', items, TRS.sel) + `<div class="ut-window__main"><div id="trlist"><span class="ut-spinner"></span></div>
+      <div class="row" style="margin-top:12px"><button class="ut-btn ut-btn--sm" data-tr="dismiss:">Finished ones from the list</button></div>
+      <p class="ut-faint">Copying and moving run as their own process: the Desk stays responsive meanwhile. Pause holds a copy where it is; cancel removes the partly copied file.</p></div>`;
+    $$('[data-nav]', b).forEach(n => n.onclick = () => { $$('[data-nav]', b).forEach(x => x.removeAttribute('aria-current')); n.setAttribute('aria-current', 'page'); TRS.sel = n.dataset.nav; VIEWS.transfers(b); });
+    b.addEventListener('click', async e => {
+      const x = e.target.closest('[data-tr]'); if (!x) return;
+      const i = x.dataset.tr.indexOf(':'), action = x.dataset.tr.slice(0, i), id = x.dataset.tr.slice(i + 1);
+      try { await api('transfers/ctl', { id, action }); VIEWS.transfers(b); } catch (err) { fail(err); }
+    });
+    CLEANUP.transfers = () => clearTimeout(TRS.timer);
+  }
+  clearTimeout(TRS.timer);
+  let d;
+  try { d = await apiRaw('transfers' + (ME.admin && (TRS.sel === 'all' || TRS.sel === 'service') ? '?service=1' : '')); }
+  catch (e) { $('#trlist', b).innerHTML = `<div class="ut-callout ut-callout--danger">${esc(e.message)}</div>`; return; }
+  const svc = (d.service || []).map(x => ({ id: 'dl:' + x.gid, kind: 'service', name: x.name, state: x.status, total: x.size, done: x.done, rate: x.down,
+    errors: x.error ? [x.error] : [], files: 0 }));
+  const want = { all: () => true, copy: o => o.kind === 'copy' || o.kind === 'move', upload: o => o.kind === 'upload', download: o => o.kind === 'download', service: o => o.kind === 'service' }[TRS.sel] || (() => true);
+  const list = d.ops.concat(svc).filter(want);
+  const el = $('#trlist', b); if (!el) return;
+  el.innerHTML = list.length ? list.map(trRow).join('') : `<div class="empty">${esc(UTI18N.tr('No transfers.'))}</div>`;
+  const busy = list.some(o => o.state === 'running' || o.state === 'active' || o.state === 'paused');
+  TRS.timer = setTimeout(() => { if (body('transfers')) VIEWS.transfers(b); }, busy ? 1000 : 5000);
 };
 
 /* backup planner ---------------------------------------------------------------- */

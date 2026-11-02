@@ -34,6 +34,7 @@ test-run:
 	python3 image/tests/test_import_zyxel.py
 	python3 image/tests/test_untrash_config.py
 	python3 image/tests/test-desk-host.py
+	python3 image/tests/test-desk-mesh-host.py
 	python3 image/tests/test-backup-host.py
 	python3 image/tests/test-sound-host.py
 	@if command -v node >/dev/null; then node image/tests/test_sound_render.js; else echo "skip sound editor renderer (needs node)"; fi
@@ -41,3 +42,4 @@ test-run:
 	python3 image/tests/test_data_mount.py
 	python3 image/tests/test-update-host.py
 	python3 image/tests/test-mesh-host.py
+	python3 image/tests/test_mesh_endpoints.py
