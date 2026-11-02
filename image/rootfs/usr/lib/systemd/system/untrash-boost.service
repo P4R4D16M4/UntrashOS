@@ -1,0 +1,15 @@
+[Unit]
+Description=UntrashOS: RAM boost (swap on the ut-boost SSD)
+Documentation=man:untrash-storage
+# the SSD is found by its GPT partition label; untrash-memd reads /proc/swaps
+After=systemd-udev-trigger.service local-fs.target
+Before=untrash-memd.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/bin/udevadm settle --timeout=30
+ExecStart=/usr/sbin/untrash-storage boost-up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

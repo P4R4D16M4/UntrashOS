@@ -939,6 +939,17 @@ def main():
             check("delete needs DELETE", a.req("/api/raid/job", {"op": "delete", "md": "md9", "confirm": "LOESCHEN"})[0] == 400)
             a.req("/api/raid/job", {"op": "delete", "md": "md9", "confirm": "DELETE"})
             check("failed job reported", raid_wait()["state"] == "failed")
+            # RAM boost: setting it up erases the SSD, switching it off moves memory back first
+            check("boost-add needs FORMAT", a.req("/api/raid/job", {"op": "boost-add", "disks": ["disk3"]})[0] == 400)
+            st, _ = a.req("/api/raid/job", {"op": "boost-add", "disks": ["disk3"], "confirm": "FORMAT"})
+            check("boost-add job ran", st == 200 and raid_wait()["state"] == "done"
+                  and 'boost-add {"disks": ["disk3"]}' in open(r + "/storage-jobs.log").read())
+            check("boost-remove without confirmation", a.req("/api/raid/job", {"op": "boost-remove", "disks": ["disk3"]})[0] == 200
+                  and raid_wait()["state"] == "done")
+            os.makedirs(r + "/run/untrash", exist_ok=True)
+            with open(r + "/run/untrash/memd.json", "w") as f:
+                json.dump({"mode": "ssd", "targets": []}, f)
+            check("raid status carries the memd state", a.req("/api/raid")[1]["memd"]["mode"] == "ssd")
             check("overview hides md0/md1", all(x["name"] not in ("md0", "md1") for x in a.req("/api/overview")[1]["arrays"]))
             # passwords
             check("alice changes own password (old checked)", u.req("/api/password", {"old": PW, "password": "Neues-Pw-12"})[0] == 200)

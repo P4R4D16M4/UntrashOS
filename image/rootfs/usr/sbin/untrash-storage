@@ -24,6 +24,14 @@ stock flags, mount /i-data/<md-uuid8> or LVM vg_<uuid8>/lv_<rand8>.
     lv-extend     {"md", "lv", "size"}
     lv-delete     {"md", "lv"}
     rename        {"md", "lv"?, "name"}
+    boost-add     {"disks":[bay]}               one SSD becomes the RAM boost
+    boost-remove  {"disks":[bay]}               swapoff, the bay is free again
+  boost-up                       boot (untrash-boost.service): swapon the
+                                 RAM boost partition, if an SSD carries one
+
+RAM boost (v1.2): one SSD in any bay holds the GPT partition ut-boost
+(BOOST_GB, swap, priority BOOST_PRIO, discard); untrash-memd offloads cold
+memory to it.  That bay is no longer a RAID bay: at most 3 data disks.
 
 Never touches: USB disks, disks with UntrashOS partitions (ut-*), the array
 holding the running system (/.untrash slot file boot), anything mounted that
@@ -31,7 +39,9 @@ is not a volume of the array being changed.  One job at a time (lock file).
 
 Test environment (image/tests/test-storage-host.sh): ZT_STORAGE_DISKS
 "disk1=/dev/loop5,..." fixes the bays, ZT_STORAGE_MDNAMES / _MDFW / _MDSWAP
-the md names, ZT_STORAGE_IDATA, _STATE, _DB, _MAC, _RUN, ZT_STORAGE_NOSWAPON.
+the md names, ZT_STORAGE_IDATA, _STATE, _DB, _MAC, _RUN, ZT_STORAGE_NOSWAPON,
+ZT_STORAGE_ROTATIONAL "disk2,..." (bays that count as hard disks; loop
+devices on the PC are all non-rotational), ZT_STORAGE_SWAPS / _MEMINFO.
 """
 import fcntl
 import glob
@@ -78,6 +88,15 @@ MIN_DISKS = {"jbod": 2, "raid0": 2, "basic": 1, "raid1": 2, "raid5": 3, "raid6":
 MD_LEVEL = {"jbod": "linear", "raid0": "raid0", "basic": "raid1", "raid1": "raid1",
             "raid5": "raid5", "raid6": "raid6", "raid10": "raid10"}
 NEXT_LEVEL = {"basic": "raid1", "raid1": "raid5", "raid5": "raid6"}    # CheckChangeRaidLevelRule
+# RAM boost: 8 GB is plenty for 1 GB of RAM, and every swap page costs
+# kernel memory (swap_map + swap cgroup: ~6 MB for 8 GB); the rest of the
+# SSD stays unpartitioned (wear levelling reserve).
+BOOST_LABEL = "ut-boost"
+BOOST_GB = 8
+BOOST_MIN_GB = 4
+BOOST_PRIO = 100
+SWAPS = E("ZT_STORAGE_SWAPS", "/proc/swaps")
+MEMINFO = E("ZT_STORAGE_MEMINFO", "/proc/meminfo")
 
 
 class Fail(Exception):
@@ -192,7 +211,7 @@ def mounted_devs():
         p = line.split()
         if len(p) > 1 and p[0].startswith("/dev/"):
             out.setdefault(os.path.realpath(p[0]), []).append(p[1].replace("\\040", " "))
-    for line in rd("/proc/swaps").splitlines()[1:]:
+    for line in rd(SWAPS).splitlines()[1:]:
         p = line.split()
         if p:
             out.setdefault(os.path.realpath(p[0]), []).append("[swap]")
@@ -339,6 +358,8 @@ def is_mounted(mnt):
 def disk_role(dev, arrays, mounts):
     """free / member / system / foreign / busy (+ detail)."""
     parts = partitions(dev)
+    if any(partlabel(p) == BOOST_LABEL for p in parts):
+        return "boost", "RAM boost"
     for p in parts:
         if partlabel(p).startswith("ut-"):
             return "system", "UntrashOS partitions"
@@ -383,7 +404,7 @@ def status():
         role, detail = disk_role(dev, arrays, mounts)
         for p in partitions(dev):
             part2bay[p] = bay
-        disks.append({"bay": bay, "dev": dev, "size": sectors(dev) * 512,
+        disks.append({"bay": bay, "dev": dev, "size": sectors(dev) * 512, "ssd": not rotational(dev),
                       "model": rd("/sys/block/%s/device/model" % sysname(dev)), "role": role, "detail": detail})
     free = [d["bay"] for d in disks if d["role"] in ("free", "foreign")]
     hmd = host_md()
@@ -440,8 +461,12 @@ def status():
                                 for p, s in sorted(mem.items())],
                     "host": md == hmd, "volumes": vols, "actions": acts,
                     "next_level": NEXT_LEVEL.get(level, "")})
+    boost = boost_state(b)
     return {"disks": disks, "arrays": out, "free": free, "levels": MIN_DISKS, "max_gb": MAX_VOL_GB,
-            "busy": job_running()}
+            "busy": job_running(), "boost": boost,
+            "boost_candidates": [] if boost else [d["bay"] for d in disks if d["bay"] in free and d["ssd"]
+                                                  and d["size"] >= BOOST_MIN_GB * 10 ** 9],
+            "boost_gb": BOOST_GB, "bay_num": BAY_NUM}
 
 
 def job_running():
@@ -1083,9 +1108,120 @@ def op_rename(req):
     raise Fail("Volume not found.")
 
 
+# ------------------------------------------------------------- RAM boost
+
+def rotational(dev):
+    fake = E("ZT_STORAGE_ROTATIONAL")
+    if fake is not None:
+        b = bays()
+        return dev in [b.get(x) for x in fake.split(",") if x]
+    return rd("/sys/block/%s/queue/rotational" % sysname(dev), "1") != "0"
+
+
+def swaps():
+    """{realpath: (size, used) in bytes} of the active swap areas."""
+    out = {}
+    for line in rd(SWAPS).splitlines()[1:]:
+        p = line.split()
+        if len(p) >= 4 and p[2].isdigit() and p[3].isdigit():
+            out[os.path.realpath(p[0])] = (int(p[2]) * 1024, int(p[3]) * 1024)
+    return out
+
+
+def boost_part(dev):
+    return next((p for p in partitions(dev) if partlabel(p) == BOOST_LABEL), None)
+
+
+def boost_state(b=None):
+    """The RAM boost SSD: {"bay", "dev", "part", "size", "active", "used"}."""
+    sw = swaps()
+    for bay, dev in sorted((b or bays()).items()):
+        p = boost_part(dev) if os.path.exists(dev) else None
+        if p:
+            size, used = sw.get(os.path.realpath(p), (sectors(p) * 512, 0))
+            return {"bay": bay, "dev": dev, "part": p, "size": size, "used": used,
+                    "active": os.path.realpath(p) in sw}
+    return None
+
+
+def boost_swapon(p):
+    if E("ZT_STORAGE_NOSWAPON"):
+        log("swapon %s skipped (test)" % p)
+        return True
+    return run(["swapon", "--discard", "--priority", str(BOOST_PRIO), p], check=False).returncode == 0
+
+
+def op_boost_add(req):
+    if len(req.get("disks") or []) != 1:
+        raise Fail("Choose exactly one SSD for the RAM boost.")
+    cur = boost_state()
+    if cur:
+        raise Fail("The SSD in %s already is the RAM boost." % cur["bay"])
+    dev = need_free_disks(req)[0]
+    bay = req["disks"][0]
+    if rotational(dev):
+        raise Fail("%s is a hard disk. The RAM boost needs an SSD." % bay)
+    size = sectors(dev) * 512
+    if size < BOOST_MIN_GB * 10 ** 9:
+        raise Fail("The SSD in %s is too small (at least %d GB)." % (bay, BOOST_MIN_GB))
+    mib = min(BOOST_GB * 10 ** 9 // 2 ** 20, size // 2 ** 20 - 2)    # decimal GB, as the Desk shows sizes
+    run(["wipefs", "-a", dev])
+    run(["sgdisk", "-Z", dev], check=False)
+    run(["sgdisk", "-a", "2048", "-n", "1:0:+%dM" % mib, "-t", "1:8200", "-c", "1:" + BOOST_LABEL, dev])
+    settle(dev)
+    p = part(dev, 1)
+    run(["mkswap", "-L", BOOST_LABEL, p])
+    if not boost_swapon(p):
+        raise Fail("swapon %s failed." % p)
+    log("RESULT OK %s %d MiB" % (bay, mib))
+
+
+def op_boost_remove(req):
+    cur = boost_state()
+    names = req.get("disks") or []
+    if not cur or names != [cur["bay"]]:
+        raise Fail("%s is not the RAM boost." % (names[0] if names else "?"))
+    if cur["active"]:
+        # swapoff moves every page back into RAM or the other swap areas
+        mem = {}
+        for line in rd(MEMINFO).splitlines():
+            k, _, v = line.partition(":")
+            if v.split():
+                mem[k] = int(v.split()[0]) * 1024
+        other = sum(sz - u for d, (sz, u) in swaps().items() if d != os.path.realpath(cur["part"]))
+        room = mem.get("MemAvailable", 0) * 0.8 + other
+        if cur["used"] > room:
+            raise Fail("%d MB are offloaded to the SSD right now, more than fits back into RAM. "
+                       "Stop apps or restart the NAS, then try again." % (cur["used"] // 2 ** 20))
+        if not E("ZT_STORAGE_NOSWAPON"):
+            run(["swapoff", cur["part"]])
+    run(["wipefs", "-a", cur["part"]], check=False)
+    run(["sgdisk", "-Z", cur["dev"]], check=False)
+    run(["wipefs", "-a", cur["dev"]], check=False)
+    settle(cur["dev"])
+    log("RESULT OK %s free" % cur["bay"])
+
+
+def boost_up():
+    """Boot: activate the RAM boost partition (no job lock, no confirmation)."""
+    cur = boost_state()
+    if not cur:
+        log("no RAM boost SSD")
+        return 0
+    if cur["active"]:
+        log("RAM boost %s already active" % cur["part"])
+        return 0
+    if IMP.blkid(cur["part"]).get("TYPE") != "swap":
+        run(["mkswap", "-L", BOOST_LABEL, cur["part"]])
+    ok = boost_swapon(cur["part"])
+    log("RAM boost %s on %s: %s" % (cur["part"], cur["bay"], "active" if ok else "swapon failed"))
+    return 0 if ok else 1
+
+
 OPS = {"create": op_create, "repair": op_repair, "add-disks": op_add_disks, "change-level": op_change_level,
        "add-spare": op_add_spare, "remove-spare": op_remove_spare, "expand": op_expand, "delete": op_delete,
-       "lv-create": op_lv_create, "lv-extend": op_lv_extend, "lv-delete": op_lv_delete, "rename": op_rename}
+       "lv-create": op_lv_create, "lv-extend": op_lv_extend, "lv-delete": op_lv_delete, "rename": op_rename,
+       "boost-add": op_boost_add, "boost-remove": op_boost_remove}
 
 
 def main():
@@ -1096,6 +1232,8 @@ def main():
     if a[:1] == ["leds"]:
         leds()
         return 0
+    if a[:1] == ["boost-up"]:
+        return boost_up()
     if len(a) == 3 and a[0] == "run" and a[1] in OPS:
         req = json.loads(a[2])
         os.makedirs(RUN, exist_ok=True)
