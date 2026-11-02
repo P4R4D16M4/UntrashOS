@@ -1,0 +1,9 @@
+#untrash-admin textarea { width: 100%; max-width: 640px; font-family: monospace; }
+#untrash-admin table { border-collapse: collapse; margin: 8px 0 16px; }
+#untrash-admin th, #untrash-admin td { padding: 6px 12px 6px 0; text-align: left; vertical-align: top; }
+#untrash-admin th { color: var(--color-text-maxcontrast); font-weight: normal; }
+#untrash-admin .untrash-mono { font-family: monospace; color: var(--color-text-maxcontrast); }
+#untrash-admin .untrash-feed input[type=text] { width: 360px; }
+#untrash-admin .untrash-ok { color: var(--color-success); }
+#untrash-admin .untrash-err { color: var(--color-error); }
+#untrash-admin .untrash-msg:empty { display: none; }

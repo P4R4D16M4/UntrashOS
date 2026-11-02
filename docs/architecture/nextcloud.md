@@ -1,7 +1,11 @@
 # Nextcloud companion (concept)
 
-Status: phase 1 (NAS side) implemented on the PC, 2026-11-02; contract in
-`cloud-api.md`. Not run on hardware yet.
+Status (2026-11-03):
+- Phase 1 (NAS side) and the Desk UI are done on the PC.
+- Phase 2 (the Nextcloud app `nextcloud/untrash`) is tested against a real
+  Nextcloud 25 in Docker.
+- The contract is in `cloud-api.md`.
+- Nothing has run on NAS hardware yet.
 
 Decision 2026-11-02: UntrashOS gets a companion for **existing Nextcloud
 installations**, as a release of its own. The reference installation is
@@ -101,7 +105,8 @@ directory).
 - The server-side parts (storage backend, background job, notifications,
   dashboard, settings) use APIs present from 25 to current.
 - The directory needs Ed25519 in PHP (`sodium_crypto_sign_verify_detached`,
-  ext-sodium). Check that it is there on the reference installation.
+  ext-sodium). info.xml declares it; the official Docker image of Nextcloud 25
+  has it. Not checked yet on the reference installation.
 - The Files UI changed with Nextcloud 28 (new Vue Files app). File-sidebar
   integration therefore needs two code paths (≤27, ≥28) and comes last.
 
@@ -116,11 +121,29 @@ directory).
      (pass-through).
    - Open: the Desk UI (invite a Nextcloud, choose its shares), a hardware
      run (fanotify on the A9 and the stock ext4 volumes).
-2. Nextcloud app, minimum: join (paste the invitation), directory
-   (`/v1/sync`), storage backend, feed → cache update, admin settings.
-   Tested with Docker `nextcloud:25` and the current stable image against the
-   PC test mode of the NAS services. `image/tests/mesh-directory-ref` is the
-   reference behaviour of the directory.
+2. **Done (2026-11-03): the Nextcloud app `nextcloud/untrash`**, PHP 7.4+,
+   Nextcloud 25 to 31.
+   - Join: admin settings page or `occ untrash:join`.
+   - Directory `POST <dir>/v1/sync`, with the merge rules of untrash-mesh.
+   - Canonical JSON (`Canon.php`) is checked against Python.
+   - Change feed: `occ untrash:feed` as a long-poll service, plus a
+     background job every 5 minutes. Each path is updated with
+     `getUpdater()->update/remove` on every WebDAV external storage whose URL
+     is the NAS and whose folder is `webdav/<share>`. A rescan does one
+     recursive scan.
+   - Test: `make test-nextcloud APACHEROOT=…` with Docker
+     `nextcloud:25-apache` and the real NAS services (untrash-mesh,
+     untrash-cloudlink, Apache WebDAV), 20 checks.
+   - Decided instead of an own storage backend: the built-in WebDAV backend
+     is used, and the app only finds its mounts. That is less code, and an
+     existing mount keeps working without the app.
+   - Open:
+     - the background job itself (only `occ untrash:feed` is tested);
+     - newer Nextcloud versions (28+);
+     - user-created external storages (only admin mounts are followed);
+     - UI texts are English only;
+     - a self-signed NAS certificate can only be accepted with "check the
+       HTTPS certificate" off, there is no pinning yet.
 3. Dashboard widget, bin restore, backup state, mesh server member.
 4. File sidebar (two UI paths), "load URL to NAS".
 5. App store publication (needs a Nextcloud app signing certificate and the
@@ -128,13 +151,16 @@ directory).
 
 ## To verify in the prototype
 
-- Does the file-cache update for a single path work on an external storage
-  with per-user credentials from a background job, which has no session?
-  If not, the feed job needs a service credential (read-only) from the NAS.
+- **Answered 2026-11-03.** A file-cache update for a single path works
+  without a session for mounts whose credentials are stored: global, user
+  entered, or log-in credentials saved in the database. Mounts with "log-in
+  credentials, save in session" are skipped. Each storage id (one per
+  credential) is updated once, through a user who has it mounted
+  (`oc_mounts.mount_id` = external storage id).
 - Does `files_trashbin` handle deletions on external storage? This decides
   whether the NAS bin needs its own restore UI in Nextcloud.
-- The exact `files_external` backend registration API for third-party apps
-  in 25 and in the current version.
+- ~~The `files_external` backend registration API~~: not needed, the
+  built-in WebDAV backend is used.
 - fanotify filesystem marks on the stock-takeover ext4 volumes (untested
   on hardware), and the CPU cost on the A9 during large copies.
 - Thumbnails/previews: Nextcloud generates them on its own host from the

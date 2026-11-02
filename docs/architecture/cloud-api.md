@@ -120,7 +120,7 @@ The UntrashApp can use the same endpoint with its own node key (planned).
   TLS certificate;
 - or `http://<NAS>:5002/untrash-cloudlink` on the LAN or over the mesh.
 
-Apache passes it to `127.0.0.1:7342`. WebDAV must be switched on: the cloud
+Apache passes it to the service on the loopback interface (port 7342). WebDAV must be switched on: the cloud
 needs it for the files anyway. The service runs only while a cloud is linked.
 
 ### Signed requests

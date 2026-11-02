@@ -1,4 +1,4 @@
-.PHONY: help test i18n docs-check
+.PHONY: help test i18n docs-check test-nextcloud
 
 # UntrashOS: the device-independent part.  Images are built by a firmware
 # repository (e.g. ZyxelUntrash) that has this repository as a submodule and
@@ -10,9 +10,16 @@ help:
 	@echo "  make test         PC tests (no root) [BOARD_ROOTFS=<board>/rootfs]"
 	@echo "  make i18n         write design/i18n/*.json from tools/i18n"
 	@echo "  make docs-check   privacy check of the docs"
+	@echo "  make test-nextcloud APACHEROOT=<dir> [NC_IMAGE=nextcloud:25-apache]"
+	@echo "                    the Nextcloud app against a real Nextcloud (Docker, sudo -n)"
 
 i18n:
 	python3 tools/i18n/build.py
+
+NC_IMAGE ?= nextcloud:25-apache
+test-nextcloud:
+	@test -n "$(APACHEROOT)" || { echo "APACHEROOT=<unpacked apache2-bin libapr1 libaprutil1 debs> needed"; exit 1; }
+	python3 nextcloud/tests/test_nextcloud_docker.py $(APACHEROOT) $(NC_IMAGE)
 
 docs-check:
 	@python3 tools/check_public_docs.py
