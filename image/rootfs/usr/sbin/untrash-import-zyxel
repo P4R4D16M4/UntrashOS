@@ -41,6 +41,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 STATE_DIR = "/etc/untrash/zyxel"           # persistent (/etc overlay)
 STATE_CONFIG = STATE_DIR + "/stock-config"  # copy of the imported /etc/zyxel
@@ -62,6 +63,14 @@ ACCESS_RW, ACCESS_RO, ACCESS_DENY = "rw", "ro", "deny"
 # smb_user.passwd "LM:NT"; LM "X"*32 = no LM hash (smbpasswd convention; the
 # installer's way C writes only the NT hash)
 SMB_HASH = r"(?:[0-9A-Fa-f]{32}|X{32}):[0-9A-Fa-f]{32}"
+
+
+def smbpasswd_line(name, uid, lm, nt, now=None):
+    """smbpasswd line for `pdbedit -i`; same as untrash_auth.smbpasswd_line.
+    LCT must be a real time: LCT-00000000 means "must change password at next
+    logon" and Samba then refuses every SMB login of the user."""
+    lct = int(time.time() if now is None else now)
+    return "%s:%d:%s:%s:[U          ]:LCT-%08X:" % (name, uid, lm.upper(), nt.upper(), lct)
 
 
 def log(msg):
@@ -792,7 +801,7 @@ def cmd_apply(args):
             run(["usermod", "-a", "-G", "sudo", uname], check=False)    # web terminal / SSH
         if re.fullmatch(SMB_HASH, pw or ""):
             lm, nt = pw.split(":")
-            smbpw.append("%s:%d:%s:%s:[U          ]:LCT-00000000:" % (uname, uid, lm.upper(), nt.upper()))
+            smbpw.append(smbpasswd_line(uname, uid, lm, nt))
     with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, delete=False) as f:
         f.write("\n".join(smbpw) + "\n")
         tmp = f.name

@@ -137,6 +137,17 @@ def main():
         print(("ok   " if cond else "FAIL ") + what)
         failures += 0 if cond else 1
 
+    # tdbsam import: LCT-00000000 = "must change password at next logon",
+    # Samba then refuses every SMB login (STATUS_PASSWORD_MUST_CHANGE).
+    sys.path.insert(0, os.path.join(HERE, "..", "rootfs", "usr", "lib", "untrash", "pylib"))
+    import untrash_auth
+    for fn, label in ((tool.smbpasswd_line, "import"), (untrash_auth.smbpasswd_line, "desk")):
+        line = fn("alice", 504, "x" * 32, "ab" * 16, now=0x6900AABB)
+        expect(line == "alice:504:%s:%s:[U          ]:LCT-6900AABB:" % ("X" * 32, "AB" * 16),
+               "smbpasswd line (%s) carries the given LCT" % label)
+        lct = int(re.search(r"LCT-([0-9A-F]{8}):$", fn("bob", 505, "X" * 32, "cd" * 16)).group(1), 16)
+        expect(lct > 0, "smbpasswd line (%s) never writes LCT-00000000" % label)
+
     # LVM occasionally writes a warning before its otherwise successful
     # stdout report.  It must never be interpreted as a VG/LV name.
     original_run = tool.run

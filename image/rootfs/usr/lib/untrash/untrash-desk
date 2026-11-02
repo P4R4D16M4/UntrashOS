@@ -231,7 +231,7 @@ def smb_set_password(name, uid, pw):
         c.commit()
     finally:
         c.close()
-    line = "%s:%d:%s:%s:[U          ]:LCT-00000000:\n" % (name, uid, "X" * 32, nt)
+    line = untrash_auth.smbpasswd_line(name, uid, "X" * 32, nt) + "\n"
     if TEST:
         SYSLOG.append(["pdbedit-import", name])
         return

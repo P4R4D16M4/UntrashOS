@@ -11,6 +11,7 @@ import hmac
 import os
 import struct
 import subprocess
+import time
 
 PDBEDIT = os.environ.get("ZT_PDBEDIT", "pdbedit")
 SHADOW = os.environ.get("ZT_SHADOW", "/etc/shadow")
@@ -42,6 +43,15 @@ def md4(data):
 
 def nt_hash(password):
     return md4(password.encode("utf-16-le")).hex().upper()
+
+
+def smbpasswd_line(name, uid, lm, nt, now=None):
+    """One smbpasswd line for `pdbedit -i smbpasswd:FILE`.  LCT is the time
+    the password was last set; LCT-00000000 makes Samba treat the password
+    as "must change at next logon" (STATUS_PASSWORD_MUST_CHANGE), which
+    refuses every SMB login of that user."""
+    lct = int(time.time() if now is None else now)
+    return "%s:%d:%s:%s:[U          ]:LCT-%08X:" % (name, uid, lm.upper(), nt.upper(), lct)
 
 
 def smb_nt_hash(user):
