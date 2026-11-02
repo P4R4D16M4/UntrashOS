@@ -804,7 +804,8 @@ def render_webdav(s, root, out):
             "DefaultRuntimeDir /run/untrash-webdav", "User www-data", "Group www-data",
             "ErrorLog syslog:daemon", "LogLevel warn", "TraceEnable off", "Timeout 300", "KeepAlive On"]
     for mod in ("mpm_event", "authz_core", "authz_user", "authn_core", "auth_basic", "authnz_external",
-                "alias", "mime", "dav", "dav_fs", "dav_lock", "setenvif", "ssl", "socache_shmcb", "dir", "autoindex"):
+                "alias", "mime", "dav", "dav_fs", "dav_lock", "setenvif", "ssl", "socache_shmcb", "dir", "autoindex",
+                "proxy", "proxy_http"):
         conf.append("LoadModule %s_module /usr/lib/apache2/modules/mod_%s.so" % (mod, mod))
     conf += ["TypesConfig /etc/mime.types", "Listen %d" % WEBDAV_PORT, "Listen %d" % WEBDAV_TLS_PORT,
              "<VirtualHost *:%d>" % WEBDAV_TLS_PORT, "  SSLEngine on",
@@ -841,6 +842,13 @@ def render_webdav(s, root, out):
             conf.append("  Require all denied")
         conf.append("</Location>")
         n += 1
+    if wd["active"]:
+        # Nextcloud companion: untrash-cloudlink (127.0.0.1:7342) behind the WebDAV
+        # ports, so a cloud reaches it with the same host, port and TLS as the
+        # files; it answers only requests signed by a linked cloud member
+        conf += ["", "# untrash-cloudlink (docs/architecture/cloud-api.md)",
+                 "ProxyPass /untrash-cloudlink/ http://127.0.0.1:7342/ timeout=180",
+                 "<Location /untrash-cloudlink/>", "  Require all granted", "</Location>"]
     wp = s["services"]["webpublish"]
     port = int(wp["port"])
     if wp["active"] and port not in (80, WEBDAV_PORT, WEBDAV_TLS_PORT):
