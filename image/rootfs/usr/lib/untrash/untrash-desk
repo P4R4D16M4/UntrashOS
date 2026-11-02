@@ -1669,10 +1669,11 @@ def power(req):
 STORAGE = os.environ.get("ZT_STORAGE_TOOL", "/usr/sbin/untrash-storage")
 RAIDJOB = {"state": "idle", "op": "", "log": []}
 RAID_OPS = ("create", "repair", "add-disks", "change-level", "add-spare", "remove-spare", "expand", "delete",
-            "lv-create", "lv-extend", "lv-delete", "rename")
+            "lv-create", "lv-extend", "lv-delete", "rename", "boost-add", "boost-remove")
 # typed confirmation: partitioning disks erases them, deleting erases a volume
 RAID_CONFIRM = {"create": "FORMAT", "repair": "FORMAT", "add-disks": "FORMAT",
-                "change-level": "FORMAT", "add-spare": "FORMAT", "delete": "DELETE", "lv-delete": "DELETE"}
+                "change-level": "FORMAT", "add-spare": "FORMAT", "delete": "DELETE", "lv-delete": "DELETE",
+                "boost-add": "FORMAT"}
 
 
 def raid_status():
@@ -1683,6 +1684,10 @@ def raid_status():
     st.setdefault("disks", [])
     st.setdefault("arrays", [])
     st["job"] = {"state": RAIDJOB["state"], "op": RAIDJOB["op"], "log": RAIDJOB["log"][-300:]}
+    try:        # RAM boost: what untrash-memd does with it (mode ssd/zswap/off)
+        st["memd"] = json.load(open(R + "/run/untrash/memd.json"))
+    except (OSError, ValueError):
+        st["memd"] = None
     return st
 
 

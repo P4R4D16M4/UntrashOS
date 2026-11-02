@@ -948,7 +948,7 @@ VIEWS.shares = async (b, sel) => {
 /* storage ---------------------------------------------------------------- */
 const LEVELS = { basic: 'Basic (1 disk)', jbod: 'JBOD', raid0: 'RAID 0', raid1: 'RAID 1', raid5: 'RAID 5', raid6: 'RAID 6', raid10: 'RAID 10' };
 const RSTATE = { Normal: ['ut-pill--ok', 'healthy'], Degraded: ['ut-pill--danger', 'degraded'], Resyncing: ['ut-pill--warn', 'resyncing'], Crashed: ['ut-pill--danger', 'failed'] };
-const ROLE = { free: 'free', foreign: 'free (old data)', member: 'in the RAID', system: 'UntrashOS', busy: 'used' };
+const ROLE = { free: 'free', foreign: 'free (old data)', member: 'in the RAID', system: 'UntrashOS', busy: 'used', boost: 'RAM boost' };
 let RAIDPOLL = null;
 const diskPick = (s, list) => list.length ? list.map(n => { const d = s.disks.find(x => x.bay === n) || {};
   return `<label class="row"><input type="checkbox" data-disk="${esc(n)}"> ${esc(n)} · ${gb(d.size || 0)} ${esc(d.model || '')}${d.role === 'foreign' ? ' <span class="ut-pill ut-pill--warn">' + esc(d.detail) + '</span>' : ''}</label>`; }).join('')
@@ -986,10 +986,51 @@ function raidCreate(st) {
     <div class="ut-field"><label>RAID type</label><select class="ut-select" id="rl">${Object.entries(LEVELS).map(([k, v]) => `<option value="${k}">${esc(UTI18N.tr(v))} · ${esc(UTI18N.tr('ab ' + (st.levels ? st.levels[k] : '') + ' disk(s)'))}</option>`).join('')}</select></div>
     <div class="ut-field"><label>Disks</label>${diskPick(st, st.free || [])}</div>
     <div id="rlvm" hidden>${field('rv', 'First volume: name', 'Volume1')}${field('rs', 'Size in GB (empty = everything)', '', 'inputmode=numeric')}</div>
+    ${st.boost ? `<p class="ut-faint">${esc(UTI18N.tr('%s is the RAM boost: at most %s data disks.').replace('%s', st.boost.bay).replace('%s', (st.bay_num || 4) - 1))}</p>` : ''}
     <p class="ut-faint">Same format as the Zyxel firmware (GPT, md0/md1, metadata 1.2, ext4): after “Back to stock” the stock firmware reads the volume.</p>${confirmField('FORMAT')}`,
     onOk: s => raidRun('create', { name: $('#rn', s).value.trim(), type: $('#rt', s).value, level: $('#rl', s).value, disks: picked(s),
       volume: $('#rv', s).value.trim(), size: $('#rs', s).value.trim() ? $('#rs', s).value.trim() + 'G' : 'max' }, s) });
   const s = $$('.ut-scrim').pop(); $('#rt', s).onchange = () => { $('#rlvm', s).hidden = $('#rt', s).value !== 'lvm'; };
+}
+/* RAM boost (untrash-storage boost-add/off, untrash-memd): one SSD in any bay as memory extension */
+const MEMD_MODE = { ssd: 'Cold memory goes to the SSD.', zswap: 'Cold memory is only compressed in RAM right now.', off: 'Offloading is paused.' };
+const boostFacts = st => `<ul style="margin:6px 0;padding-left:18px">
+  <li>Needs an SSD in a free bay; hard disks are not offered. The SSD is erased.</li>
+  <li>${esc(UTI18N.tr('%s GB of it are used; the rest stays free and spares the SSD.').replace('%s', st.boost_gb || 8))}</li>
+  <li>${esc(UTI18N.tr('The bay no longer counts for RAID: at most %s data disks remain.').replace('%s', (st.bay_num || 4) - 1))}</li>
+  <li>It helps when many apps and jobs run at once. When the RAM is enough, nothing gets faster.</li>
+  <li>Do not pull the SSD while the boost is on: switch it off first.</li></ul>
+  <p class="ut-faint">Need more storage space instead? With UntrashMesh a second NAS shares its volumes with this one as partner volumes, with up to 4 more disks.</p>`;
+function boostCard(st, busy) {
+  const bo = st.boost, m = st.memd || {};
+  if (bo) {
+    const used = bo.size ? Math.round(100 * bo.used / bo.size) : 0;
+    return `<div class="ut-card" style="margin-bottom:10px">
+      <div class="row"><b>${esc(UTI18N.tr('SSD in %s').replace('%s', bo.bay))}</b> <span class="ut-faint">${gb(bo.size)}</span>
+        <span class="ut-pill ${bo.active ? 'ut-pill--ok' : 'ut-pill--warn'}">${bo.active ? 'active' : 'inactive'}</span></div>
+      ${bo.active ? `<div class="ut-progress" style="--v:${used}%"><i></i></div><span class="ut-faint">${esc(UTI18N.tr('%s of %s used').replace('%s', gb(bo.used)).replace('%s', gb(bo.size)))}</span>`
+        : '<p class="ut-faint">The SSD is in place but not in use. A restart switches the boost on again.</p>'}
+      ${bo.active && m.mode ? `<div class="ut-faint">${esc(UTI18N.tr(MEMD_MODE[m.mode] || m.mode))}</div>` : ''}
+      <div class="row" style="margin-top:6px">${busy ? '' : '<button class="ut-btn ut-btn--sm" id="boff">Switch off</button>'}</div></div>`;
+  }
+  const c = st.boost_candidates || [];
+  return `<div class="ut-card" style="margin-bottom:10px">
+    <div class="row"><span style="flex:1">The NAS has 1 GB of RAM. With the boost it moves memory that is not in use right now to an SSD and keeps the RAM free for what runs.</span>
+      ${c.length && !busy ? '<button class="ut-btn ut-btn--sm ut-btn--primary" id="bon">Set up</button>' : ''}</div>
+    ${boostFacts(st)}
+    ${c.length ? '' : '<div class="ut-callout"><div>No free SSD: put an SSD into a free bay (not part of a volume).</div></div>'}</div>`;
+}
+function boostOn(st) {
+  const c = st.boost_candidates || [];
+  dialog({ kind: 'danger', title: 'Set up RAM boost', ok: 'Set up',
+    body: `<p>Choose the SSD:</p>${diskPick(st, c).replace(/type="checkbox"/g, 'type="radio" name="bssd"')}${boostFacts(st)}${confirmField('FORMAT')}`,
+    onOk: s => raidRun('boost-add', { disks: picked(s) }, s) });
+  const s = $$('.ut-scrim').pop(); const r = $$('[data-disk]', s); if (r.length === 1) r[0].checked = true;
+}
+function boostOff(st) {
+  dialog({ title: 'Switch off RAM boost', ok: 'Switch off',
+    body: `<p>${esc(UTI18N.tr('The NAS moves what is offloaded back into RAM. Then the SSD in %s is erased and free again.').replace('%s', st.boost.bay))}</p>`,
+    onOk: () => raidRun('boost-remove', { disks: [st.boost.bay] }) });
 }
 const ACTLABEL = { repair: 'Repair', 'add-disks': 'Add disks', 'change-level': 'Change RAID type', 'add-spare': 'Spare disk', 'remove-spare': 'Remove spare',
   expand: 'Extend', 'lv-create': 'Create volume', 'lv-extend': 'Enlarge volume', 'lv-delete': 'Delete volume', delete: 'Delete' };
@@ -1014,6 +1055,8 @@ VIEWS.storage = async b => {
       ${a.type === 'lvm' ? `<div class="ut-faint">Free in the disk group: ${gb(a.vg_free)}</div>` : ''}
       <div class="row" style="margin-top:6px">${busy ? '' : a.actions.map(x => `<button class="ut-btn ut-btn--sm${x === 'delete' || x === 'lv-delete' ? ' ut-btn--danger' : ''}" data-act="${i}:${x}">${esc(ACTLABEL[x] || x)}</button>`).join(' ')}</div></div>`; }).join('')
     : '<div class="ut-card empty">Not an internal volume.</div>'}
+    <div class="ut-section-title">RAM boost</div>
+    ${boostCard(st, busy)}
     <div class="ut-section-title">Drive</div>
     <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Disk</th><th>Bay</th><th class="num">Size</th><th>Model</th><th>SMART</th><th>Temp.</th><th>Role</th></tr></thead><tbody>
     ${s.disks.map(d => { const r = role[d.name]; return `<tr><td>${esc(d.name)}${d.usb ? ' <span class="ut-pill ut-pill--plain">USB</span>' : ''}</td><td>${esc(r ? r.bay : '')}</td><td class="num">${gb(d.size)}</td><td>${esc(d.model)}</td>
@@ -1025,6 +1068,8 @@ VIEWS.storage = async b => {
     <p class="ut-faint">Volumes in the Zyxel firmware format: after “Back to stock” they stay readable.</p></div>`;
   iscsiPanel(b);
   const nb = $('#rnew', b); if (nb) nb.onclick = () => raidCreate(st);
+  const bon = $('#bon', b); if (bon) bon.onclick = () => boostOn(st);
+  const bof = $('#boff', b); if (bof) bof.onclick = () => boostOff(st);
   $$('[data-act]', b).forEach(x => x.onclick = () => { const [i, act] = x.dataset.act.split(':'); raidAction(st, st.arrays[+i], act); });
   $$('[data-ren]', b).forEach(x => x.onclick = () => { const [i, id] = x.dataset.ren.split(':'); const a = st.arrays[+i];
     dialog({ title: 'Rename', ok: 'Save', body: field('nn', 'New name', (a.volumes.find(v => v.id === id) || {}).name || ''),

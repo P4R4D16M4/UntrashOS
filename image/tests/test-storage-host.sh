@@ -9,7 +9,8 @@
 # add/remove, failed disk + repair, adding a disk, LVM disk group with
 # vg_info_area + lv_<id> (create/extend/delete/rename), delete (shares on the
 # volume leave the stock database), refusals (UntrashOS disk, busy disk,
-# wrong counts) and that user data survives every step.
+# wrong counts), the RAM boost SSD (only SSDs, one bay, not a RAID bay,
+# swapoff only when it fits back) and that user data survives every step.
 set -Eeuo pipefail
 [[ -n "${ZT_IN_NS:-}" ]] || exec unshare -m --propagation private env ZT_IN_NS=1 "$0" "$@"
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
@@ -185,5 +186,32 @@ job change-level "{\"md\":\"$M\",\"level\":\"raid6\",\"disks\":[\"disk4\"]}"
 check "raid6, 4 disks, Normal" "[ \$(lvl $M) = raid6 ] && [ \$(cat /sys/block/$M/md/raid_disks) = 4 ] && [ \$(stat_ $M) = Normal ]"
 data_ok raid6
 job delete "{\"md\":\"$M\"}"
+
+echo "--- RAM boost: one SSD in any bay, at most 3 data disks left"
+for m in md110 md111; do for i in 1 2 3 4 5; do mdadm --stop /dev/$m >/dev/null 2>&1 && break; sleep 1; done; done
+for d in "$D1" "$D2" "$D3" "$D4"; do mdadm --zero-superblock "${d}p1" "${d}p2" "${d}p3" >/dev/null 2>&1 || true; wipefs -aq "$d"; partprobe "$d"; done; sleep 1
+export ZT_STORAGE_ROTATIONAL=disk2      # loop disks are all non-rotational: disk2 plays the hard disk
+check "SSD bays are boost candidates, the hard disk is not" "[ \"\$(q 'sorted(d[\"boost_candidates\"])')\" = \"['disk1', 'disk3', 'disk4']\" ]"
+job boost-add '{"disks":["disk2"]}' fail
+job boost-add '{"disks":["disk1","disk3"]}' fail
+job boost-add '{"disks":["disk3"]}'
+check "ut-boost swap partition, 8 GiB at most" "[ \"\$(blkid -o value -s PARTLABEL ${D3}p1)\" = ut-boost ] && blkid -o value -s TYPE ${D3}p1 | grep -qx swap && [ \$(cat /sys/class/block/$(basename $D3)p1/size) -le \$((8 * 2097152)) ] && [ ! -e ${D3}p2 ]"
+check "disk3 = boost, not free, no more candidates" "q \"[x['role'] for x in d['disks'] if x['bay']=='disk3'][0] == 'boost' and 'disk3' not in d['free'] and d['boost_candidates'] == [] and d['boost']['bay'] == 'disk3'\" | grep -qx True"
+job boost-add '{"disks":["disk4"]}' fail
+job create '{"level":"raid5","disks":["disk1","disk2","disk3"],"name":"X"}' fail
+check "boot: boost-up finds the partition" "python3 '$ST' boost-up | grep -q 'swapon ${D3}p1 skipped'"
+job create '{"level":"raid5","disks":["disk1","disk2","disk4"],"name":"R5B"}'
+M=$(md_of)
+check "raid5 on the 3 other bays, boost untouched" "[ \$(cat /sys/block/$M/md/raid_disks) = 3 ] && [ \"\$(blkid -o value -s PARTLABEL ${D3}p1)\" = ut-boost ] && ! mdadm --detail /dev/md110 | grep -q $(basename $D3)"
+job delete "{\"md\":\"$M\"}"
+# switching off: what is offloaded must fit back into RAM (+ other swap)
+printf 'Filename Type Size Used Priority\n%s partition 8386556 2000000 100\n' "${D3}p1" >"$W/swaps"
+printf 'MemTotal: 1000000 kB\nMemAvailable: 300000 kB\n' >"$W/meminfo"
+ZT_STORAGE_SWAPS="$W/swaps" ZT_STORAGE_MEMINFO="$W/meminfo" job boost-remove '{"disks":["disk3"]}' fail
+printf 'Filename Type Size Used Priority\n%s partition 8386556 100000 100\n' "${D3}p1" >"$W/swaps"
+ZT_STORAGE_SWAPS="$W/swaps" ZT_STORAGE_MEMINFO="$W/meminfo" job boost-remove '{"disks":["disk4"]}' fail
+ZT_STORAGE_SWAPS="$W/swaps" ZT_STORAGE_MEMINFO="$W/meminfo" job boost-remove '{"disks":["disk3"]}'
+check "disk3 free again, no partitions, boost candidate again" "[ ! -e ${D3}p1 ] && q \"'disk3' in d['free'] and 'disk3' in d['boost_candidates'] and d['boost'] is None\" | grep -qx True"
+unset ZT_STORAGE_ROTATIONAL
 
 [ $fail = 0 ] && echo "ALL OK" || { echo "FAILURES"; exit 1; }

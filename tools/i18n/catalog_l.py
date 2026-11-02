@@ -1,0 +1,30 @@
+# UntrashOS UI catalog, part L: English source -> (German, French), texts
+# added with 1.2: RAM boost (an SSD as memory extension).
+T = {
+    "%s GB of it are used; the rest stays free and spares the SSD.": ("Davon werden %s GB genutzt; der Rest bleibt frei und schont die SSD.", "%s Go en sont utilisés ; le reste reste libre et ménage le SSD."),
+    "%s is the RAM boost: at most %s data disks.": ("%s ist der RAM-Boost: höchstens %s Datenplatten.", "%s est le boost de RAM : %s disques de données au plus."),
+    "Choose the SSD": ("Wähle die SSD", "Choisis le SSD"),
+    "Cold memory goes to the SSD.": ("Kalter Speicher wandert auf die SSD.", "La mémoire froide part sur le SSD."),
+    "Cold memory is only compressed in RAM right now.": ("Kalter Speicher wird gerade nur im RAM komprimiert.", "La mémoire froide est seulement compressée en RAM pour l'instant."),
+    "Do not pull the SSD while the boost is on: switch it off first.": ("Die SSD nicht ziehen, solange der Boost an ist: erst ausschalten.", "Ne retire pas le SSD tant que le boost est actif : désactive-le d'abord."),
+    "It helps when many apps and jobs run at once. When the RAM is enough, nothing gets faster.": ("Es hilft, wenn viele Apps und Aufträge gleichzeitig laufen. Reicht der RAM, wird nichts schneller.", "Cela aide quand beaucoup d'apps et de tâches tournent en même temps. Quand la RAM suffit, rien ne va plus vite."),
+    "Need more storage space instead? With UntrashMesh a second NAS shares its volumes with this one as partner volumes, with up to 4 more disks.": ("Eher mehr Speicherplatz gebraucht? Mit UntrashMesh gibt ein zweites NAS seine Volumes als Partner-Volumes für dieses frei, mit bis zu 4 weiteren Platten.", "Plutôt besoin de plus d'espace ? Avec UntrashMesh, un second NAS partage ses volumes avec celui-ci comme volumes partenaires, avec jusqu'à 4 disques de plus."),
+    "Needs an SSD in a free bay; hard disks are not offered. The SSD is erased.": ("Braucht eine SSD in einem freien Schacht; Festplatten werden nicht angeboten. Die SSD wird gelöscht.", "Nécessite un SSD dans une baie libre ; les disques durs ne sont pas proposés. Le SSD est effacé."),
+    "No free SSD: put an SSD into a free bay (not part of a volume).": ("Keine freie SSD: Setze eine SSD in einen freien Schacht (nicht Teil eines Volumes).", "Aucun SSD libre : mets un SSD dans une baie libre (hors volume)."),
+    "Offloading is paused.": ("Das Auslagern pausiert.", "Le déchargement est en pause."),
+    "RAM boost": ("RAM-Boost", "Boost de RAM"),
+    "SSD in %s": ("SSD in %s", "SSD dans %s"),
+    "Set up RAM boost": ("RAM-Boost einrichten", "Configurer le boost de RAM"),
+    "Switch off RAM boost": ("RAM-Boost ausschalten", "Désactiver le boost de RAM"),
+    "The NAS has 1 GB of RAM. With the boost it moves memory that is not in use right now to an SSD and keeps the RAM free for what runs.": ("Das NAS hat 1 GB RAM. Mit dem Boost lagert es Speicher, der gerade nicht gebraucht wird, auf eine SSD aus und hält den RAM frei für das, was läuft.", "Le NAS a 1 Go de RAM. Avec le boost, il déplace la mémoire inutilisée sur un SSD et garde la RAM libre pour ce qui tourne."),
+    "The NAS moves what is offloaded back into RAM. Then the SSD in %s is erased and free again.": ("Das NAS holt das Ausgelagerte zurück in den RAM. Danach wird die SSD in %s gelöscht und ist wieder frei.", "Le NAS ramène en RAM ce qui a été déchargé. Ensuite, le SSD dans %s est effacé et de nouveau libre."),
+    "The SSD is in place but not in use. A restart switches the boost on again.": ("Die SSD steckt, wird aber nicht genutzt. Ein Neustart schaltet den Boost wieder ein.", "Le SSD est en place mais pas utilisé. Un redémarrage réactive le boost."),
+    "The bay no longer counts for RAID: at most %s data disks remain.": ("Der Schacht fällt für RAID weg: Es bleiben höchstens %s Datenplatten.", "La baie ne compte plus pour le RAID : il reste %s disques de données au plus."),
+    # untrash-storage job messages
+    "Choose exactly one SSD for the RAM boost.": ("Wähle genau eine SSD für den RAM-Boost.", "Choisis exactement un SSD pour le boost de RAM."),
+    "The SSD in %s already is the RAM boost.": ("Die SSD in %s ist bereits der RAM-Boost.", "Le SSD dans %s est déjà le boost de RAM."),
+    "%s is a hard disk. The RAM boost needs an SSD.": ("%s ist eine Festplatte. Der RAM-Boost braucht eine SSD.", "%s est un disque dur. Le boost de RAM nécessite un SSD."),
+    "The SSD in %s is too small (at least %d GB).": ("Die SSD in %s ist zu klein (mindestens %d GB).", "Le SSD dans %s est trop petit (au moins %d Go)."),
+    "%s is not the RAM boost.": ("%s ist nicht der RAM-Boost.", "%s n'est pas le boost de RAM."),
+    "%d MB are offloaded to the SSD right now, more than fits back into RAM. Stop apps or restart the NAS, then try again.": ("Gerade sind %d MB auf die SSD ausgelagert, mehr als zurück in den RAM passt. Beende Apps oder starte das NAS neu und versuche es dann noch einmal.", "%d Mo sont déchargés sur le SSD en ce moment, plus que la RAM ne peut reprendre. Arrête des apps ou redémarre le NAS, puis réessaie."),
+}
