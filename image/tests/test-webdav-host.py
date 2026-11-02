@@ -21,7 +21,9 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import http.server
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = os.path.join(HERE, "..", "rootfs")
@@ -71,7 +73,7 @@ def main():
                            env=env, stdout=subprocess.PIPE, text=True)
         check("render", r.returncode == 0 and "webdav" in r.stdout)
         conf = open(root + "/etc/untrash/webdav/httpd.conf").read()
-        p1, p2 = free_port(), free_port()
+        p1, p2, p3 = free_port(), free_port(), free_port()
         run = W + "/run"
         os.makedirs(run)
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=t",
@@ -85,7 +87,8 @@ def main():
                 .replace("Listen 5002", "Listen 127.0.0.1:%d" % p1).replace("Listen 5003", "Listen 127.0.0.1:%d" % p2)
                 .replace("<VirtualHost *:5003>", "<VirtualHost *:%d>" % p2).replace("User www-data\nGroup www-data\n", "")
                 .replace("ServerRoot /etc/apache2", "ServerRoot " + W).replace("ErrorLog syslog:daemon", "ErrorLog " + W + "/error.log")
-                .replace("TypesConfig /etc/mime.types", "TypesConfig /dev/null"))
+                .replace("TypesConfig /etc/mime.types", "TypesConfig /dev/null")
+                .replace("http://127.0.0.1:7342/", "http://127.0.0.1:%d/" % p3))
         open(W + "/httpd.conf", "w").write(conf)
         aenv = dict(os.environ, LD_LIBRARY_PATH=ar + "/usr/lib/x86_64-linux-gnu")
         ap = ar + "/usr/sbin/apache2"
@@ -95,6 +98,21 @@ def main():
             print(r.stdout)
             return
         srv = subprocess.Popen([ap, "-DFOREGROUND", "-f", W + "/httpd.conf"], env=aenv)
+        # stand-in for untrash-cloudlink: echoes the path and Authorization it got
+        seen = []
+
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+        echo = http.server.HTTPServer(("127.0.0.1", p3), Echo)
+        threading.Thread(target=echo.serve_forever, daemon=True).start()
         try:
             for _ in range(50):
                 try:
@@ -130,6 +148,10 @@ def main():
             check("guestplus closed (guest only, anonymous off)", req("PROPFIND", "/webdav/guestplus/", "admin", headers=pf)[0] in (401, 403))
             check("https port: alice PROPFIND 207", req("PROPFIND", "/webdav/mixed/", "alice", tls=True, headers=pf)[0] == 207)
             check("outside /webdav denied", req("GET", "/", "admin")[0] in (401, 403))
+            st, _b = req("GET", "/untrash-cloudlink/v1/changes?since=x&wait=1", tls=True,
+                         headers={"Authorization": "UntrashCloud node=1"})
+            check("https /untrash-cloudlink/ reaches cloudlink as /v1/... with the Authorization header",
+                  st == 200 and seen == [("/v1/changes?since=x&wait=1", "UntrashCloud node=1")])
         finally:
             srv.terminate()
             srv.wait()

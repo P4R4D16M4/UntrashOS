@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Reference cloud member (the Nextcloud side of docs/architecture/cloud-api.md)
+for the PC tests: joins a mesh with a cloud invitation and serves the
+directory (POST <dir>/v1/sync).  The real one is the Nextcloud app; it must
+answer the same way.
+
+  mesh-directory-ref join INVITATION   (env ZT_MESH_DIR_URL = its own URL)
+  mesh-directory-ref run PORT          (env ZT_DIR_TEST_YOU: the IP it reports)
+  mesh-directory-ref sign METHOD PATH [BODY]
+                                       Authorization header for untrash-cloudlink
+
+State and rules come from untrash-mesh itself (ZT_MESH_DIR, ZT_SIG): the
+same roster and record checks, so the directory stores only what members
+signed.
+"""
+import hashlib
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import secrets
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOOL = os.path.join(HERE, "..", "rootfs", "usr", "lib", "untrash", "untrash-mesh")
+os.environ.setdefault("ZT_MESH_KIND", "cloud")
+os.environ.setdefault("ZT_MESH_FAKE_WG", os.path.join(os.environ.get("ZT_MESH_DIR", "/nonexistent"), "wg.json"))
+os.environ.setdefault("ZT_MESH_ENDPOINTS", "")
+_spec = importlib.util.spec_from_loader("untrash_mesh", importlib.machinery.SourceFileLoader("untrash_mesh", TOOL))
+mesh = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(mesh)
+NONCES = {}
+LOCK = threading.Lock()
+
+
+class Dir(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def answer(self, code, obj=None):
+        body = json.dumps(obj or {}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path != "/v1/sync":
+            return self.answer(404)
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 1 << 20)))
+            assert isinstance(req, dict)
+        except (ValueError, AssertionError):
+            return self.answer(400)
+        # signed data first (a roster with a member we do not know yet), then the sender
+        mesh.merge(req.get("items"))
+        st = mesh.state()
+        if mesh.identity()[0] not in mesh.members(st):      # this cloud was removed
+            mesh.jsave("book.json", {})
+            return self.answer(403)
+        m = mesh.members(st).get(req.get("from"))
+        now = time.time()
+        if not m or not isinstance(req.get("ts"), int) or abs(now - req["ts"]) > 120 or not mesh.verify(req, m["pub"]):
+            return self.answer(403)
+        with LOCK:
+            for k in [k for k, t in NONCES.items() if t < now]:
+                del NONCES[k]
+            if req.get("nonce") in NONCES:
+                return self.answer(403)
+            NONCES[req.get("nonce")] = now + 300
+        have = req.get("have") if isinstance(req.get("have"), dict) else {}
+        out = [r for n, r in mesh.book().items() if r.get("seq", 0) > have.get(n, 0)]
+        if (st.get("roster") or {}).get("seq", 0) > (req.get("roster") or 0):
+            out.insert(0, st["roster"])
+        self.answer(200, {"items": out, "you": os.environ.get("ZT_DIR_TEST_YOU") or self.client_address[0]})
+
+
+def sign_header(method, path, body=b""):
+    nid = mesh.identity()[0]
+    ts, nonce = str(int(time.time())), secrets.token_hex(16)
+    msg = "\n".join(["UTCL1", method, path, ts, nonce, hashlib.sha256(body).hexdigest()]).encode()
+    with tempfile.TemporaryDirectory() as d:
+        open(d + "/m", "wb").write(msg)
+        mesh.run([mesh.ZT_SIG, "sign", mesh.path("node.sec"), d + "/m", d + "/s"])
+        sig = open(d + "/s", "rb").read().hex()
+    return "UntrashCloud node=%s, ts=%s, nonce=%s, sig=%s" % (nid, ts, nonce, sig)
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["join"] and len(a) == 2:
+        print(json.dumps(mesh.cmd_join(a[1])))
+    elif a[:1] == ["run"] and len(a) == 2:
+        http.server.ThreadingHTTPServer(("127.0.0.1", int(a[1])), Dir).serve_forever()
+    elif a[:1] == ["sign"] and len(a) in (3, 4):
+        print(sign_header(a[1], a[2], a[3].encode() if len(a) == 4 else b""))
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1837,13 +1837,15 @@ VIEWS.mesh = async b => {
     $('#mcreate', b).onclick = () => save('mesh/create', { name: $('#mnew', b).value }, 'mesh');
     $('#mjoin', b).onclick = () => save('mesh/join', { invitation: $('#minv', b).value }, 'mesh');
   } else {
+    const host = u => { try { return new URL(u).host; } catch (e) { return u || ''; } };
     const rows = m.members.map(x => `<tr><td><b translate="no">${esc(x.name)}</b>${x.self ? ' <span class="ut-pill ut-pill--plain">' + esc(UTI18N.tr('this NAS')) + '</span>' : ''}
-        <div class="ut-faint mono" translate="no">${esc(x.name)}.mesh · ${esc(x.address)}</div></td>
-      <td>${x.role === 'admin' ? 'Admin' : 'Member'} · ${x.kind === 'app' ? 'App' : 'NAS'}${x.kind === 'app' ? `<div class="ut-faint">${x.user ? esc(UTI18N.tr('signs in as %s').replace('%s', x.user)) : esc(UTI18N.tr('not linked to a user'))}</div>` : ''}</td>
+        <div class="ut-faint mono" translate="no">${x.kind === 'cloud' ? esc(host(x.dir)) : esc(x.name) + '.mesh · ' + esc(x.address)}</div></td>
+      <td>${x.role === 'admin' ? 'Admin' : 'Member'} · ${x.kind === 'app' ? 'App' : x.kind === 'cloud' ? 'Nextcloud' : 'NAS'}${x.kind === 'app' ? `<div class="ut-faint">${x.user ? esc(UTI18N.tr('signs in as %s').replace('%s', x.user)) : esc(UTI18N.tr('not linked to a user'))}</div>` : ''}${x.kind === 'cloud' ? `<div class="ut-faint">${(x.shares || []).length ? esc(UTI18N.tr('follows %s').replace('%s', x.shares.join(', '))) : esc(UTI18N.tr('follows no share here'))}</div>` : ''}</td>
       <td><span class="ut-pill ${x.online ? 'ut-pill--ok' : ''}">${x.online ? 'online' : 'not reachable'}</span>
         <div class="ut-faint" translate="no">${esc(x.endpoint || (x.endpoints || [])[0] || '')}</div></td>
       <td class="ut-faint">${x.self ? '' : ago(x.handshake || x.seen)}</td>
       <td class="ut-rowbtns">${x.kind === 'app' ? `<button class="ut-btn ut-btn--sm" data-mlink="${esc(x.node)}" data-mname="${esc(x.name)}" data-muser="${esc(x.user || '')}">Link…</button>`
+        : x.kind === 'cloud' ? `<button class="ut-btn ut-btn--sm" data-mcl="${esc(x.node)}" data-mname="${esc(x.name)}">Shares…</button>`
         : !x.self ? `<button class="ut-btn ut-btn--sm" data-mshare="${esc(x.node)}" data-mname="${esc(x.name)}">Share…</button>` : ''}${m.admin && !x.self ? ` <button class="ut-btn ut-btn--sm ut-btn--ghost" data-mrm="${esc(x.node)}" data-mname="${esc(x.name)}">Remove</button>` : ''}
         ${(m.offers || {})[x.node] && Object.keys(m.offers[x.node]).length ? `<div class="ut-faint" translate="no">${esc(Object.entries(m.offers[x.node]).map(([k, v]) => k + (v === 'ro' ? ' (r)' : ' (rw)')).join(', '))}</div>` : ''}</td></tr>`).join('');
     const pvs = (m.partner_volumes || []).map(v => `<tr><td><b translate="no">${esc(v.share)}</b> <span class="ut-faint">@ <span translate="no">${esc(v.partner)}</span></span><div class="ut-faint mono" translate="no">${esc(v.path)}</div></td>
@@ -1851,7 +1853,7 @@ VIEWS.mesh = async b => {
       <td><span class="ut-pill ${v.mounted ? 'ut-pill--ok' : ''}">${v.mounted ? esc(UTI18N.tr('mounted')) : esc(UTI18N.tr('partner not reachable'))}</span></td>
       <td class="ut-faint">${v.mounted ? gb(v.free) + ' ' + esc(UTI18N.tr('free')) : ''}</td></tr>`).join('');
     b.innerHTML = `<div class="ut-window__main ut-mesh"><div class="row"><img src="${ICON('mesh')}" alt="" style="width:40px;height:40px"><h2 style="margin:0">UntrashMesh <span translate="no">${esc(m.mesh.name)}</span></h2>
-        <span class="ut-spacer"></span><button class="ut-btn" id="mpair">Pair the UntrashApp</button>${m.admin ? ' <button class="ut-btn ut-btn--primary" id="minvite">Invite a device</button>' : ''}</div>
+        <span class="ut-spacer"></span><button class="ut-btn" id="mpair">Pair the UntrashApp</button>${m.admin ? ' <button class="ut-btn" id="mcloud">Connect a Nextcloud</button> <button class="ut-btn ut-btn--primary" id="minvite">Invite a device</button>' : ''}</div>
       ${me}
       <div class="ut-section-title">Members</div>
       <div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Role</th><th>State</th><th>Last contact</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
@@ -1860,7 +1862,7 @@ VIEWS.mesh = async b => {
       <div class="ut-section-title">Partner volumes</div>
       ${pvs ? `<div class="ut-table-wrap"><table class="ut-table"><tbody>${pvs}</tbody></table></div><p class="ut-faint">Partner volumes appear under Storage; under Shares you can make shares on them for your own users.</p>`
         : '<p class="ut-faint">No member shares anything with this NAS yet. A member offers shares with Share… in its own Desk.</p>'}
-      <p class="ut-faint">Members reach each other at <span class="mono">name.mesh</span>, for example shares at <span class="mono" translate="no">\\\\${esc(m.members.find(x => !x.self)?.name || 'nas')}.mesh</span>, the Desk at <span class="mono" translate="no">http://${esc(m.members.find(x => !x.self)?.name || 'nas')}.mesh</span>. Over the internet the router needs UPnP or a forwarding of UDP port 51820 on at least one side.</p>
+      <p class="ut-faint">Members reach each other at <span class="mono">name.mesh</span>, for example shares at <span class="mono" translate="no">\\\\${esc(m.members.find(x => !x.self && x.kind === 'nas')?.name || 'nas')}.mesh</span>, the Desk at <span class="mono" translate="no">http://${esc(m.members.find(x => !x.self && x.kind === 'nas')?.name || 'nas')}.mesh</span>. Over the internet the router needs UPnP or a forwarding of UDP port 51820 on at least one side.</p>
       <div class="row" style="margin-top:12px"><button class="ut-btn ut-btn--ghost ut-btn--danger" id="mleave">Leave the mesh</button></div></div>`;
     const inv = $('#minvite', b);
     if (inv) inv.onclick = async () => {
@@ -1886,6 +1888,37 @@ VIEWS.mesh = async b => {
             <details><summary>Show as text</summary><textarea class="ut-textarea mono" rows="4" readonly translate="no">${esc(r.invitation)}</textarea></details>`, onOk: () => render('mesh') });
         } });
     };
+    // Nextcloud companion (docs/architecture/cloud-api.md)
+    const cloudShares = async cur => {
+      const sh = (await api('shares')).shares.filter(s => s.enabled && s.present);
+      return sh.length ? `<div class="ut-table-wrap"><table class="ut-table"><tbody>${sh.map(s => `<tr><td><label class="ut-switch"><input type="checkbox" data-mcs="${esc(s.name)}"${cur.includes(s.name) ? ' checked' : ''}><i></i><span translate="no">${esc(s.name)}</span></label></td></tr>`).join('')}</tbody></table></div>`
+        : '<p class="ut-faint">This NAS has no shares yet.</p>';
+    };
+    const picked = d => $$('[data-mcs]', d).filter(e => e.checked).map(e => e.dataset.mcs);
+    const mc = $('#mcloud', b);
+    if (mc) mc.onclick = async () => {
+      const dav = ((await api('settings')).services || {}).webdav || {};
+      dialog({ title: 'Connect a Nextcloud', ok: 'Create the invitation',
+        body: `<p>A Nextcloud with the UntrashOS app becomes a member of this mesh. It keeps the mesh's address book at its internet address, so members that lost each other find each other again. From this NAS it learns which files changed, so it never has to scan the shares and the disks can sleep.</p>
+          <p class="ut-faint">It reads the files over WebDAV with each user's own rights. Choose the shares it may follow:</p>
+          ${await cloudShares([])}
+          ${dav.active ? '' : '<div class="ut-callout ut-callout--warn">WebDAV is off. Nextcloud reaches the files over WebDAV: switch it on under Settings → Services.</div>'}`,
+        onOk: async d => {
+          const r = await api('mesh/cloud-invite', { shares: picked(d), hours: 24 });
+          const dd = dialog({ title: 'Connect a Nextcloud', ok: 'Done', onOk: () => render('mesh'),
+            body: `<p>In Nextcloud open <b>Administration settings → UntrashOS</b> and paste this invitation. It works once, until ${ago(r.expires)}.</p>
+              <p class="ut-faint">While it joins, Nextcloud must reach this NAS: in the same network, or over the internet when the router allows UPnP.</p>
+              <textarea class="ut-textarea mono" rows="5" readonly translate="no" id="mcinv">${esc(r.invitation)}</textarea>
+              <div class="row" style="margin-top:8px"><button class="ut-btn ut-btn--sm" id="mccopy">Copy</button></div>` });
+          $('#mccopy', dd).onclick = () => { $('#mcinv', dd).select(); navigator.clipboard ? navigator.clipboard.writeText(r.invitation).then(() => toast('Copied', '')) : document.execCommand('copy'); };
+        } });
+    };
+    $$('[data-mcl]', b).forEach(x => x.onclick = async () => {
+      const cur = (m.members.find(y => y.node === x.dataset.mcl) || {}).shares || [];
+      dialog({ title: UTI18N.tr('Shares for %s').replace('%s', x.dataset.mname), ok: 'Save',
+        body: `<p>The shares <b translate="no">${esc(x.dataset.mname)}</b> may follow on this NAS. It learns which files changed in them; the files themselves it reads over WebDAV with each user's rights.</p>${await cloudShares(cur)}`,
+        onOk: d => save('mesh/cloud-link', { node: x.dataset.mcl, shares: picked(d) }, 'mesh') });
+    });
     $$('[data-mlink]', b).forEach(x => x.onclick = async () => dialog({ title: UTI18N.tr('Link %s').replace('%s', x.dataset.mname), ok: 'Save',
       body: `<p>The Desk user this app signs in as on this NAS. Without a link the app is only a mesh member here.</p><div class="ut-field"><label for="mlu">Signs in as</label>${await userSel('mlu', x.dataset.muser, true)}</div>`,
       onOk: d => save('mesh/app-link', { node: x.dataset.mlink, user: $('#mlu', d).value }, 'mesh') }));
@@ -1906,7 +1939,7 @@ VIEWS.mesh = async b => {
       dialog({ title: 'Mirror a volume', ok: 'Ask the partner',
         body: `<p>A member keeps a complete copy of the volume (RAID 1 over UntrashMesh). Its admin must agree and choose where the copy goes; it needs as much free space as the volume is large.</p>
           <label class="ut-field"><span class="ut-label">Volume</span><select class="ut-select" id="mmv">${vols.map(v => `<option value="${esc(v.id)}" translate="no">${esc(v.label)} (${gb(v.size)})</option>`).join('')}</select></label>
-          <label class="ut-field"><span class="ut-label">Partner</span><select class="ut-select" id="mmn">${m.members.filter(x => !x.self && x.kind !== 'app').map(x => `<option value="${esc(x.node)}" translate="no">${esc(x.name)}</option>`).join('')}</select></label>
+          <label class="ut-field"><span class="ut-label">Partner</span><select class="ut-select" id="mmn">${m.members.filter(x => !x.self && x.kind === 'nas').map(x => `<option value="${esc(x.node)}" translate="no">${esc(x.name)}</option>`).join('')}</select></label>
           <p class="ut-faint">The mirror starts with the next restart of this NAS. Writes go to the volume first and to the partner as fast as the line allows; while the partner is not reachable, the changes are kept and sent later. The volume of the running system cannot be mirrored.</p>`,
         onOk: d => save('mesh/mirror-start', { volume: $('#mmv', d).value, node: $('#mmn', d).value }, 'mesh') });
     };

@@ -375,6 +375,23 @@ def mesh_post(op, req):
         if not re.fullmatch(r"[0-9a-f]{16}", str(req.get("node") or "")):
             raise Fail("Unknown member.")
         return mesh_run("app-link", req["node"], name)
+    if op in ("cloud-invite", "cloud-link"):
+        # Nextcloud companion (docs/architecture/cloud-api.md): the shares the
+        # cloud may follow; the files themselves stay WebDAV with user rights
+        local = {x["name"] for x in shares() if x["enabled"] and x["present"]}
+        names = req.get("shares")
+        if not isinstance(names, list) or not all(isinstance(n, str) and n in local for n in names):
+            raise Fail("Choose shares of this NAS.")
+        if op == "cloud-invite":
+            if not names:
+                raise Fail("Choose at least one share.")
+            h = int(req.get("hours") or 24)
+            if not 1 <= h <= 168:
+                raise Fail("Valid for 1 to 168 hours.")
+            return mesh_run("invite-cloud", h, json.dumps(sorted(names)))
+        if not re.fullmatch(r"[0-9a-f]{16}", str(req.get("node") or "")):
+            raise Fail("Unknown member.")
+        return mesh_run("cloud-link", req["node"], json.dumps(sorted(names)))
     if op in ("mirror-decline", "mirror-stop"):
         return mesh_run(op, mirror_id(req))
     raise Fail("Unknown.", 404)
@@ -3775,6 +3792,8 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/mesh/leave": lambda req: mesh_post("leave", req), "/api/mesh/rename": lambda req: mesh_post("rename", req),
               "/api/mesh/share": lambda req: mesh_post("share", req),
               "/api/mesh/pair": lambda req: mesh_post("pair", req), "/api/mesh/app-link": lambda req: mesh_post("app-link", req),
+              "/api/mesh/cloud-invite": lambda req: mesh_post("cloud-invite", req),
+              "/api/mesh/cloud-link": lambda req: mesh_post("cloud-link", req),
               "/api/users/signin": signin_reset, "/api/processes/kill": process_kill, "/api/office/settings": office_save,
               "/api/mesh/mirror-start": lambda req: mesh_post("mirror-start", req),
               "/api/mesh/mirror-accept": lambda req: mesh_post("mirror-accept", req),

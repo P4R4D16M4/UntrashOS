@@ -20,6 +20,11 @@
                                       mirrored device to mount, or {"error"}
   untrash-mesh invite HOURS USER      an invitation for the UntrashApp, linked to Desk USER
   untrash-mesh app-link NODE USER     link an app member to a Desk user ("" = unlink)
+  untrash-mesh invite-cloud HOURS SHARES
+                                      an invitation for a Nextcloud (cloud member),
+                                      SHARES = JSON list of the share names it may
+                                      follow through untrash-cloudlink
+  untrash-mesh cloud-link NODE SHARES change those shares ([] = none)
   untrash-mesh run                    the daemon (untrash-mesh.service)
 
 Co-op mode: a node offers some of its shares to a member, read-only or
@@ -61,7 +66,17 @@ request arrive (WireGuard's endpoint of that peer).  WireGuard roaming does
 the rest: a packet from a new address updates the endpoint at once.
 
 Sync: HTTP JSON on the mesh address, port 7340, only from mesh addresses of
-members (WireGuard guarantees the source address of a peer).  Join: HTTP on
+members (WireGuard guarantees the source address of a peer).
+
+Cloud members (a Nextcloud with the untrash app, docs/architecture/
+cloud-api.md) have no WireGuard link of their own: they are the mesh's
+directory.  A cloud member has a stable public HTTPS address ("dir" in the
+roster); every node pushes its record there and pulls the others' records
+from there, with requests signed by its node key.  When the members lost
+each other (all endpoints changed at once, a phone on mobile data), the
+directory still knows where everyone is.  It only ever stores signed
+records, so it cannot redirect anyone; it learns the endpoints, which is why
+it should be a server of the mesh's own people.  Join: HTTP on
 port 7341, open only while an invitation is pending, every message bound to
 the invitation's one-time secret (HMAC-SHA256).
 
@@ -329,6 +344,11 @@ def own_record(st, extra=()):
         # by hand: the external address goes last, peers try it after the rest
         # (a phone on mobile data has nothing else; untrash1, 2026-10-31)
         public = public + ["%s:%d" % (up["ext"], WG_PORT)]
+    for v in (st.get("dirseen") or {}).values():
+        # the public IP a directory saw: WireGuard there only with a forwarded port, so it goes last
+        if v.get("ip") and now - v.get("t", 0) < 86400 and router_public(v["ip"]) \
+                and not any(p.rsplit(":", 1)[0].strip("[]") == v["ip"] for p in public):
+            public.append(("[%s]:%d" if ":" in v["ip"] else "%s:%d") % (v["ip"], WG_PORT))
     eps = list(dict.fromkeys(local_endpoints() + public + list(extra)))
     cur = book().get(nid)
     name = st.get("name") or default_name()      # never None vs "": that made a new record every tick (untrash-2)
@@ -398,7 +418,7 @@ def wg_apply(st):
     want = {}
     bk = book()
     for k, m in members(st).items():
-        if k == nid:
+        if k == nid or not m.get("wg"):          # cloud members have no WireGuard link
             continue
         rec = bk.get(k) or {}
         want[m["wg"]] = {"addr": address(mesh["id"], m["pub"]), "eps": rec.get("ep") or m.get("ep") or []}
@@ -475,6 +495,8 @@ def hosts_apply(st):
     if mesh:
         bk, used = book(), set()
         for k, m in sorted(members(st).items(), key=lambda x: x[1].get("added", 0)):
+            if not m.get("wg"):
+                continue
             name = (bk.get(k) or {}).get("name") or m.get("name") or k[:8]
             base, i = name, 2
             while name in used:
@@ -510,6 +532,8 @@ def sync_with(k, items, st):
     have = {n: r.get("seq", 0) for n, r in book().items()}
     if st.get("roster") and st["roster"] not in items:
         items = [st["roster"]] + list(items)          # a roster change a member missed comes along
+    if m.get("kind") == "cloud":
+        return dir_sync(k, m, items, have, st)
     body = json.dumps({"items": items, "have": have, "roster": (st.get("roster") or {}).get("seq", 0)}).encode()
     try:
         hdr = {"Content-Type": "application/json"}
@@ -529,6 +553,58 @@ def sync_with(k, items, st):
     if fresh:
         forward(fresh, skip=k)
     return True
+
+
+def dir_url_ok(url):
+    return isinstance(url, str) and len(url) <= 300 and re.fullmatch(r"https?://[^\s/?#]+(/[^\s?#]*)?", url) is not None
+
+
+def dir_sync(k, m, items, have, st):
+    """Sync with a cloud member: HTTPS to its directory, the request signed by
+    this node's key (no WireGuard address to vouch for us there).  The answer
+    names our public IP as the directory saw it."""
+    if not dir_url_ok(m.get("dir")):
+        return False
+    nid = identity()[0]
+    req = sign({"items": items, "have": have, "roster": (st.get("roster") or {}).get("seq", 0), "from": nid,
+                "ts": int(time.time()), "nonce": secrets.token_hex(16)})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(m["dir"].rstrip("/") + "/v1/sync", data=json.dumps(req).encode(),
+                                                           headers={"Content-Type": "application/json"}), timeout=15) as r:
+            ans = json.load(r)
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+    if not isinstance(ans, dict):
+        return False
+    fresh = merge(ans.get("items"))
+    with LOCK:
+        s2 = state()
+        seen = {"t": int(time.time())}
+        try:
+            seen["ip"] = str(ipaddress.ip_address(str(ans.get("you") or "").strip("[]")))
+        except ValueError:
+            pass
+        s2.setdefault("dirseen", {})[k] = seen
+        jsave("mesh.json", s2)
+    if fresh:
+        forward(fresh, skip=k)
+    return True
+
+
+def dir_recover(st, nid):
+    """Members without a handshake for 3 minutes: ask the directories where
+    they are now (and tell them where we are)."""
+    clouds = [k for k, m in members(st).items() if m.get("kind") == "cloud"]
+    if not clouds:
+        return
+    peers = wg_peers()
+    now = time.time()
+    lost = [k for k, m in members(st).items()
+            if k != nid and m.get("wg") and now - (peers.get(m["wg"]) or {}).get("handshake", 0) > 180]
+    if lost:
+        rec = book().get(nid)
+        for k in clouds:
+            sync_with(k, [rec] if rec else [], st)
 
 
 def forward(items, skip=None, extra=None, wait=False):
@@ -681,7 +757,7 @@ def default_name():
     return n if NAME_RE.match(n) else "untrash"
 
 
-def cmd_invite(hours=24, app_user=None):
+def cmd_invite(hours=24, app_user=None, cloud=None):
     """An invitation; with APP_USER one for the UntrashApp, linked on this
     node to that Desk user when the app joins (docs/architecture/app-api.md)."""
     with LOCK:
@@ -691,7 +767,12 @@ def cmd_invite(hours=24, app_user=None):
             raise SystemExit("only an admin of a mesh can invite")
         sec, iid = secrets.token_hex(16), secrets.token_hex(4)
         exp = int(time.time() + 3600 * float(hours))
-        st.setdefault("invites", {})[iid] = dict({"secret": sec, "exp": exp}, **({"app": app_user} if app_user else {}))
+        inv = {"secret": sec, "exp": exp}
+        if app_user:
+            inv["app"] = app_user
+        if cloud is not None:
+            inv["cloud"] = cloud
+        st.setdefault("invites", {})[iid] = inv
         jsave("mesh.json", st)
         if not E("ZT_MESH_JOIN_HOST"):
             upnp_refresh(True)                  # open the join port before the text leaves this NAS
@@ -701,7 +782,8 @@ def cmd_invite(hours=24, app_user=None):
         if E("ZT_MESH_JOIN_HOST"):
             hostlist = [E("ZT_MESH_JOIN_HOST")]
     return {"invitation": b64(dict({"v": PROTO, "i": iid, "s": sec, "m": st["mesh"]["id"], "n": st["mesh"]["name"],
-                                    "h": hostlist, "p": JOIN_PORT, "e": exp}, **({"k": "app"} if app_user else {}))),
+                                    "h": hostlist, "p": JOIN_PORT, "e": exp},
+                                   **({"k": "app"} if app_user else {"k": "cloud"} if cloud is not None else {}))),
             "expires": exp}
 
 
@@ -720,7 +802,9 @@ def cmd_join(text):
         nid, pub, wg = identity()
         st["name"] = st.get("name") or default_name()
         req = {"i": inv["i"], "node": nid, "pub": pub, "wg": wg, "name": st["name"], "kind": E("ZT_MESH_KIND", "nas"),
-               "ep": local_endpoints()}          # ZT_MESH_KIND=app: PC test stand-in for the UntrashApp
+               "ep": local_endpoints()}          # ZT_MESH_KIND=app|cloud: PC test stand-in for the app or a Nextcloud
+        if req["kind"] == "cloud":
+            req.update(dir=E("ZT_MESH_DIR_URL", ""), wg="", ep=[])
         req["mac"] = mac(inv["s"], req)
     last, ans, until = None, None, time.time() + float(E("ZT_MESH_JOIN_WAIT", "30"))
     while ans is None:                     # its join port may open a moment after the invitation
@@ -780,17 +864,26 @@ class JoinHandler(http.server.BaseHTTPRequestHandler):
                 return self.send_error(403)
             if not (isinstance(req.get("pub"), str) and len(req["pub"]) == 64 and node_id(req["pub"]) == req.get("node")):
                 return self.send_error(400)
+            if ("cloud" in inv) != (req.get("kind") == "cloud") or ("cloud" in inv and not dir_url_ok(req.get("dir"))):
+                return self.send_error(403)        # a cloud only on a cloud invitation, always with its directory URL
             del st["invites"][req["i"]]           # one use only
             nid = identity()[0]
             ros = dict(st["roster"])
             ms = dict(ros["members"])
-            ms[req["node"]] = {"pub": req["pub"], "wg": str(req.get("wg", ""))[:64], "name": safe_name(req.get("name")),
-                               "role": "member", "kind": "app" if req.get("kind") == "app" or inv.get("app") else "nas",
+            kind = "cloud" if "cloud" in inv else "app" if req.get("kind") == "app" or inv.get("app") else "nas"
+            ms[req["node"]] = {"pub": req["pub"], "wg": "" if kind == "cloud" else str(req.get("wg", ""))[:64],
+                               "name": safe_name(req.get("name")), "role": "member", "kind": kind,
                                "added": int(time.time()), "ep": [str(e)[:80] for e in (req.get("ep") or [])][:8]}
+            if kind == "cloud":
+                ms[req["node"]]["dir"] = req["dir"]
             ros.update(members=ms, seq=ros["seq"] + 1, by=nid)
             ros.pop("sig", None)
             st["roster"] = sign(ros)
             jsave("mesh.json", st)
+            if kind == "cloud":
+                clouds = jload("clouds.json", {})
+                clouds[req["node"]] = {"shares": inv["cloud"], "t": int(time.time())}
+                jsave("clouds.json", clouds)
             if inv.get("app"):
                 apps = jload("apps.json", {})
                 apps[req["node"]] = {"user": inv["app"], "t": int(time.time())}
@@ -806,6 +899,8 @@ class JoinHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
         log("%s joined" % ms[req["node"]]["name"])
         threading.Thread(target=forward, args=([st["roster"]],), daemon=True).start()
+        if kind == "cloud":
+            cloudlink_kick()
 
 
 def cmd_app_link(node, user):
@@ -831,6 +926,48 @@ def apps_prune(st):
         keep = {k: v for k, v in apps.items() if (members(st).get(k) or {}).get("kind") == "app"}
         if keep != apps:
             jsave("apps.json", keep)
+
+
+def cloud_shares(spec):
+    try:
+        shares = json.loads(spec) if isinstance(spec, str) else spec
+    except ValueError:
+        shares = None
+    if not isinstance(shares, list) or not all(isinstance(x, str) and SHARE_RE.match(x) for x in shares):
+        raise SystemExit("shares: a JSON list of share names")
+    return sorted(set(shares))
+
+
+def cmd_cloud_link(node, spec):
+    """The shares a cloud member may follow through untrash-cloudlink (this
+    node only; the file access itself stays WebDAV with the users' rights)."""
+    shares = cloud_shares(spec)
+    with LOCK:
+        m = members().get(node)
+        if not m or m.get("kind") != "cloud":
+            raise SystemExit("not a cloud member of this mesh")
+        clouds = jload("clouds.json", {})
+        clouds[node] = {"shares": shares, "t": int(time.time())}
+        jsave("clouds.json", clouds)
+    cloudlink_kick()
+    return status()
+
+
+def clouds_prune(st):
+    with LOCK:
+        clouds = jload("clouds.json", {})
+        keep = {k: v for k, v in clouds.items() if (members(st).get(k) or {}).get("kind") == "cloud"}
+        if keep != clouds:
+            jsave("clouds.json", keep)
+            cloudlink_kick()
+
+
+def cloudlink_kick():
+    """untrash-cloudlink reads clouds.json; it runs only while a cloud is linked."""
+    if _TESTDIR:
+        return
+    subprocess.run(["systemctl", "--no-block", "restart" if jload("clouds.json", {}) else "stop", "untrash-cloudlink.service"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def safe_name(n):
@@ -889,6 +1026,10 @@ def cmd_leave():
                 o.update(state="stopped", sent=True)   # mounted directly from the next start on
         jsave("mirrors_out.json", outs)
         jsave("apps.json", {})
+        jsave("clouds.json", {})
+        st.pop("dirseen", None)
+        jsave("mesh.json", st)
+    cloudlink_kick()
     for mp in sorted(h for h in mounted() if h.startswith(PDATA + "/")):
         unmount(mp)
     jsave("volumes.json", {})
@@ -920,6 +1061,7 @@ def status():
     out["offers"] = {n: {k: sh["mode"] for k, sh in o.get("shares", {}).items()} for n, o in jload("offers.json", {}).items()}
     out["partner_volumes"] = [dict(v, path=k) for k, v in sorted(jload("volumes.json", {}).items())]
     out["mirrors"], out["mirror_copies"] = mirrors_status()
+    clouds = jload("clouds.json", {})
     if st.get("mesh"):
         out["address"] = address(st["mesh"]["id"], pub)
         now, apps = time.time(), jload("apps.json", {})
@@ -929,8 +1071,13 @@ def status():
                                    "address": address(st["mesh"]["id"], m["pub"]), "self": k == nid,
                                    "endpoints": rec.get("ep", []), "seq": rec.get("seq"), "seen": rec.get("time"),
                                    "handshake": p.get("handshake") or None, "endpoint": p.get("endpoint"),
-                                   "online": k == nid or bool(p.get("handshake") and now - p["handshake"] < 180),
+                                   "online": k == nid or bool(p.get("handshake") and now - p["handshake"] < 180)
+                                   or now - ((st.get("dirseen") or {}).get(k) or {}).get("t", 0) < 600,
                                    "user": (apps.get(k) or {}).get("user") if m.get("kind") == "app" else None})
+            if m.get("kind") == "cloud":
+                # "last contact" of a cloud: this node's last exchange with its directory
+                out["members"][-1].update(dir=m.get("dir"), shares=(clouds.get(k) or {}).get("shares", []),
+                                          handshake=((st.get("dirseen") or {}).get(k) or {}).get("t"))
     return out
 
 
@@ -1662,7 +1809,7 @@ def serve(handler, host, port):
 def cmd_run():
     log("running")
     sync_srv = join_srv = None
-    last_full = last_upnp = 0
+    last_full = last_upnp = last_dir = 0
     upnp_join = False
     while True:
         try:
@@ -1687,6 +1834,10 @@ def cmd_run():
             partner_volumes(st)
             mirrors_tick(st)
             apps_prune(st)
+            clouds_prune(st)
+            if time.time() - last_dir > float(E("ZT_MESH_DIR_EVERY", "60")):
+                dir_recover(st, nid)
+                last_dir = time.time()
             if not sync_srv:
                 host = "127.0.0.1" if E("ZT_MESH_ADDRMAP") else address(st["mesh"]["id"], pub)
                 try:
@@ -1747,6 +1898,10 @@ def main():
             out = cmd_create(a[1])
         elif a[:1] == ["invite"] and len(a) <= 3:
             out = cmd_invite(a[1] if len(a) >= 2 else 24, a[2] if len(a) == 3 else None)
+        elif a[:1] == ["invite-cloud"] and len(a) == 3:
+            out = cmd_invite(a[1], cloud=cloud_shares(a[2]))
+        elif a[:1] == ["cloud-link"] and len(a) == 3:
+            out = cmd_cloud_link(a[1], a[2])
         elif a[:1] == ["app-link"] and len(a) == 3:
             out = cmd_app_link(a[1], a[2])
         elif a[:1] == ["join"] and len(a) == 2:

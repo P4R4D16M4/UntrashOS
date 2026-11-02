@@ -1,0 +1,15 @@
+[Unit]
+Description=UntrashOS: change feed and status for linked Nextcloud servers (untrash-cloudlink)
+ConditionKernelCommandLine=!untrash.installer=1
+After=untrash-data.service untrash-mesh.service
+
+[Service]
+# runs only while untrash-mesh has a cloud linked (clouds.json; cloud-link restarts it)
+ExecCondition=/bin/grep -q "\"shares\"" /etc/untrash/mesh/clouds.json
+ExecStart=/usr/lib/untrash/untrash-cloudlink run
+Slice=untrash-background.slice
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
