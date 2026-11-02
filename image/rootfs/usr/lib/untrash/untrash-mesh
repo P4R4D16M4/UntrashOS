@@ -1075,7 +1075,9 @@ def status():
                                    or now - ((st.get("dirseen") or {}).get(k) or {}).get("t", 0) < 600,
                                    "user": (apps.get(k) or {}).get("user") if m.get("kind") == "app" else None})
             if m.get("kind") == "cloud":
-                out["members"][-1].update(dir=m.get("dir"), shares=(clouds.get(k) or {}).get("shares", []))
+                # "last contact" of a cloud: this node's last exchange with its directory
+                out["members"][-1].update(dir=m.get("dir"), shares=(clouds.get(k) or {}).get("shares", []),
+                                          handshake=((st.get("dirseen") or {}).get(k) or {}).get("t"))
     return out
 
 

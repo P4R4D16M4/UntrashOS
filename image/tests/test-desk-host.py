@@ -683,6 +683,31 @@ def main():
             check("co-op: unknown member refused", a.req("/api/mesh/share", {"node": "x", "shares": {}})[0] == 400)
             check("co-op: unknown share refused", a.req("/api/mesh/share", {"node": "0" * 16, "shares": {"nope": "ro"}})[0] == 400)
             check("co-op: bad right refused", a.req("/api/mesh/share", {"node": "0" * 16, "shares": {"mixed": "admin"}})[0] == 400)
+            # Nextcloud companion: a cloud invitation names the shares the cloud may follow
+            local = sorted(x["name"] for x in a.req("/api/shares")[1]["shares"] if x["enabled"] and x["present"])
+            check("cloud: no share refused", a.req("/api/mesh/cloud-invite", {"shares": []})[0] == 400)
+            check("cloud: unknown share refused", a.req("/api/mesh/cloud-invite", {"shares": ["nope"]})[0] == 400
+                  and a.req("/api/mesh/cloud-invite", {"shares": "mixed"})[0] == 400)
+            check("cloud: users get 403", u.req("/api/mesh/cloud-invite", {"shares": local[:1]})[0] == 403
+                  and u.req("/api/mesh/cloud-link", {"node": "0" * 16, "shares": []})[0] == 403)
+            st, cj = a.req("/api/mesh/cloud-invite", {"shares": local[:1], "hours": 24})
+            civ = json.loads(base64.urlsafe_b64decode(cj.get("invitation", "") + "=" * (-len(cj.get("invitation", "")) % 4)) or b"{}")
+            mst = json.load(open(r + "/etc/untrash/mesh/mesh.json"))
+            check("cloud: invitation marked for a cloud, with its shares", st == 200 and civ.get("k") == "cloud"
+                  and any(i.get("cloud") == local[:1] for i in mst["invites"].values()))
+            check("cloud: bad hours refused", a.req("/api/mesh/cloud-invite", {"shares": local[:1], "hours": 999})[0] == 400)
+            check("cloud: a NAS member cannot be linked as a cloud", a.req("/api/mesh/cloud-link", {"node": mst["roster"]["by"], "shares": []})[0] == 400)
+            cn = "c" * 16                       # as untrash-mesh's join adds a cloud
+            mst["roster"]["members"][cn] = {"pub": "ab" * 32, "wg": "", "name": "nextcloud", "role": "member", "kind": "cloud",
+                                           "dir": "https://cloud.example.org/apps/untrash/mesh", "added": 2}
+            json.dump(mst, open(r + "/etc/untrash/mesh/mesh.json", "w"))
+            st, mj = a.req("/api/mesh/cloud-link", {"node": cn, "shares": local[:2][::-1]})
+            mc = [x for x in mj.get("members", []) if x["node"] == cn]
+            check("cloud: shares changed, shown with kind and directory", st == 200 and mc and mc[0]["kind"] == "cloud"
+                  and mc[0]["shares"] == local[:2] and mc[0]["dir"].startswith("https://cloud.example.org"))
+            check("cloud: unknown share in cloud-link refused", a.req("/api/mesh/cloud-link", {"node": cn, "shares": ["nope"]})[0] == 400)
+            del mst["roster"]["members"][cn]
+            json.dump(mst, open(r + "/etc/untrash/mesh/mesh.json", "w"))
             # off-site mirror (test-mesh-host.py has the DRBD part)
             check("mirror: volumes say which one holds the running system", all(v.get("host") is False for v in a.req("/api/storage")[1]["volumes"] if v["kind"] == "intern"))
             check("mirror: unknown member refused", a.req("/api/mesh/mirror-start", {"volume": "aaaa0001", "node": "x"})[0] == 400)
