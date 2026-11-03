@@ -17,6 +17,8 @@ health.  The fanotify feed itself needs root: test_cloudlink_fanotify_root.py.
 import json
 import os
 import shutil
+import base64
+import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -206,6 +208,37 @@ try:
     check("TLS pin in a's signed record (= openssl SPKI sha256)", wait(lambda: jf(NODES["a"]["dir"] + "/state/book.json")
                                                                        .get(na, {}).get("tls") == "sha256//" + der))
     check("... and it reaches the directory", wait(lambda: jf(CD + "/state/book.json").get(na, {}).get("tls") == "sha256//" + der))
+
+    # ---------------------------------------------------------------- the cloud as a tunnel peer (cloud-api.md §4)
+    ckey = base64.b64encode(hashlib.sha256(b"cloud-wg").digest()).decode()
+    caddr = [m for m in cli("a", "status")["members"] if m["node"] == nc][0]["address"]
+    ref("tunnel", ckey, "203.0.113.5:51820")
+
+    def cpeer(n):
+        return jf(NODES[n]["dir"] + "/wg.json").get("peers", {}).get(ckey)
+    check("tunnel key in the cloud's record: a WireGuard peer on a, its address only, its public endpoint", wait(
+        lambda: (cpeer("a") or {}).get("allowed") == caddr + "/128" and cpeer("a")["eps"] == ["203.0.113.5:51820"], 20))
+    check("... on nas-b too (record through the directory)", wait(lambda: cpeer("b") is not None, 20))
+    check("... and nextcloud.mesh in /etc/hosts", wait(lambda: "nextcloud.mesh" in open(NODES["a"]["dir"] + "/hosts").read()))
+    check("status: the cloud's tunnel state (no handshake yet)", wait(lambda: [m for m in cli("a", "status")["members"]
+                                                                            if m["node"] == nc][0].get("tunnel", False) is None))
+    rr = urllib.request.Request("http://127.0.0.1:%d/v1/offer" % BASE, method="POST", headers={"Content-Type": "application/json"},
+                                data=json.dumps({"from": nc, "user": "x", "password": "y",
+                                                 "shares": [{"name": "Evil", "mode": "rw"}]}).encode())
+    try:
+        code = urllib.request.urlopen(rr, timeout=5).status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    check("a cloud cannot offer shares (co-op) over its tunnel", code == 403 and nc not in jf(NODES["a"]["dir"] + "/state/partners.json"))
+    ref("tunnel", "not-a-key", "203.0.113.5:51820")
+    check("a malformed key in the record: no peer", wait(lambda: cpeer("a") is None and len(
+        jf(NODES["a"]["dir"] + "/wg.json").get("peers", {})) == 1, 20))
+    ref("tunnel", ckey, "203.0.113.5:51820")
+    wait(lambda: cpeer("a") is not None, 20)
+    ref("tunnel", "", "")
+    check("tunnel off (record without wg): the peer goes, the cloud stays a member", wait(
+        lambda: cpeer("a") is None and cpeer("b") is None and any(m["node"] == nc for m in cli("a", "status")["members"]), 20))
+    check("... and its .mesh name goes", wait(lambda: "nextcloud.mesh" not in open(NODES["a"]["dir"] + "/hosts").read()))
 
     # ---------------------------------------------------------------- cloudlink
     R = os.path.join(W, "root")

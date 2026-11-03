@@ -46,17 +46,25 @@
 		const rows = s.members.map(m => `<tr><td><b>${esc(m.name)}</b>${m.self ? ' ' + esc(T('(this Nextcloud)')) : ''}<div class="untrash-mono">${esc(m.node)}</div></td>
 			<td>${m.kind === 'cloud' ? 'Nextcloud' : m.kind === 'app' ? 'App' : 'NAS'}${m.role === 'admin' ? ' · ' + esc(T('admin')) : ''}</td>
 			<td class="untrash-mono">${esc((m.endpoints || []).join(', '))}</td><td>${when(m.seen)}</td></tr>`).join('');
+		const now = Date.now() / 1000;
+		const meshBase = m => m.address ? 'http://[' + m.address + ']:5002/untrash-cloudlink' : '';
 		const nas = s.members.filter(m => m.kind !== 'cloud' && m.kind !== 'app').map(m => {
 			const f = m.feed || {}, l = f.last || null;
+			const up = m.tunnel && now - m.tunnel < 180;
+			const tun = !s.tunnel ? '' : `<p>${up ? `<span class="untrash-ok">${esc(T('Tunnel connected'))}</span>`
+				+ (f.base !== meshBase(m) ? ` <button class="untrash-meshaddr">${esc(T('Use the mesh address'))}</button>` : '')
+				: `<span class="untrash-err">${esc(T('Tunnel: no connection from this NAS yet'))}</span>`}</p>`;
 			return `<div class="untrash-feed" data-node="${esc(m.node)}"><h4>${esc(m.name)}</h4>
 				<p><input type="text" class="untrash-base" value="${esc(f.base || '')}" placeholder="http://NAS:5002/untrash-cloudlink">
 				${m.pinned && /^https:/i.test(f.base || '') ? `<input type="checkbox" class="untrash-verify" checked hidden><span class="untrash-ok">${esc(T('HTTPS key pinned through the mesh'))}</span>`
 					: `<label><input type="checkbox" class="untrash-verify"${f.verify === false ? '' : ' checked'}> ${esc(T('check the HTTPS certificate'))}</label>`}</p>
 				<p><button class="untrash-save">${esc(T('Save'))}</button> <button class="untrash-test"${f.base ? '' : ' disabled'}>${esc(T('Test'))}</button>
-				<span class="${l && !l.ok ? 'untrash-err' : 'untrash-ok'}">${l ? esc(l.ok ? T('last round {time}: {changes} changes', { time: when(l.t), changes: l.changes }) : l.error) : ''}</span></p></div>`;
+				<span class="${l && !l.ok ? 'untrash-err' : 'untrash-ok'}">${l ? esc(l.ok ? T('last round {time}: {changes} changes', { time: when(l.t), changes: l.changes }) : l.error) : ''}</span></p>${tun}</div>`;
 		}).join('');
 		b.innerHTML = `<p>${esc(T('Member of {mesh} as {name}.', { mesh: s.mesh.name, name: s.name }))} ${esc(T('Directory address:'))} <span class="untrash-mono">${esc(s.dir)}</span></p>
 			<table><thead><tr><th>${esc(T('Member'))}</th><th>${esc(T('Kind'))}</th><th>${esc(T('Endpoints'))}</th><th>${esc(T('Record from'))}</th></tr></thead><tbody>${rows}</tbody></table>
+			<p>${s.tunnel ? esc(T('Tunnel: this server is a WireGuard peer of the mesh at {endpoints}. The NAS connect to it, so it reaches them at their mesh address.', { endpoints: s.tunnel.endpoints.join(', ') }))
+				: esc(T('No tunnel: this server reaches a NAS only at the address entered below. With the helper untrash-cloud-wg on this server it reaches a NAS behind a router without a port forward (see the app README).'))}</p>
 			<h3>${esc(T('Change feed'))}</h3>
 			<p class="settings-hint">${esc(T('For each NAS, the address of its WebDAV port with /untrash-cloudlink. External storages (WebDAV) whose URL is that NAS and whose folder is webdav/<share> are then updated path by path; set their "Check for changes" to "Never". The changes arrive every 5 minutes with the background jobs, or within seconds while "occ untrash:feed" runs as a service.'))}</p>
 			${nas || '<p>' + esc(T('No NAS in the mesh.')) + '</p>'}
@@ -65,6 +73,11 @@
 			const node = d.dataset.node;
 			d.querySelector('.untrash-save').onclick = async () => {
 				try { render(await call('nas', { node, base: d.querySelector('.untrash-base').value, verify: d.querySelector('.untrash-verify').checked })); msg(T('Saved.'), true); } catch (e) { msg(e.message); }
+			};
+			const ma = d.querySelector('.untrash-meshaddr');
+			if (ma) ma.onclick = async () => {
+				const m = s.members.find(x => x.node === node);
+				try { render(await call('nas', { node, base: meshBase(m), verify: true })); msg(T('Saved.'), true); } catch (e) { msg(e.message); }
 			};
 			d.querySelector('.untrash-test').onclick = async () => {
 				try { const i = await call('test', { node }); msg(T('Reached {nas} (UntrashOS {version}), shares: {shares}', { nas: i.nas, version: i.version, shares: (i.shares || []).map(x => x.name).join(', ') }), true); } catch (e) { msg(e.message); }

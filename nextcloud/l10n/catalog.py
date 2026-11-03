@@ -74,4 +74,13 @@ T = {
     "check the HTTPS certificate": ("HTTPS-Zertifikat prüfen", "vérifier le certificat HTTPS"),
     "last round {time}: {changes} changes": ("letzte Runde {time}: {changes} Änderungen", "dernier passage {time} : {changes} modifications"),
     "not linked there": ("dort nicht verbunden", "pas relié là-bas"),
+    "Tunnel connected": ("Tunnel verbunden", "Tunnel connecté"),
+    "Use the mesh address": ("Mesh-Adresse verwenden", "Utiliser l'adresse du mesh"),
+    "Tunnel: no connection from this NAS yet": ("Tunnel: noch keine Verbindung von diesem NAS", "Tunnel : pas encore de connexion de ce NAS"),
+    "Tunnel: this server is a WireGuard peer of the mesh at {endpoints}. The NAS connect to it, so it reaches them at their mesh address.":
+        ("Tunnel: Dieser Server ist unter {endpoints} ein WireGuard-Partner des Mesh. Die NAS verbinden sich zu ihm, so erreicht er sie unter ihrer Mesh-Adresse.",
+         "Tunnel : ce serveur est un pair WireGuard du mesh à {endpoints}. Les NAS se connectent à lui : il les joint à leur adresse du mesh."),
+    "No tunnel: this server reaches a NAS only at the address entered below. With the helper untrash-cloud-wg on this server it reaches a NAS behind a router without a port forward (see the app README).":
+        ("Kein Tunnel: Dieser Server erreicht ein NAS nur unter der unten eingetragenen Adresse. Mit dem Hilfsdienst untrash-cloud-wg auf diesem Server erreicht er ein NAS hinter einem Router ohne Portweiterleitung (siehe README der App).",
+         "Pas de tunnel : ce serveur ne joint un NAS qu'à l'adresse saisie ci-dessous. Avec l'assistant untrash-cloud-wg sur ce serveur, il joint un NAS derrière un routeur sans redirection de port (voir le README de l'app)."),
 }

@@ -1,0 +1,255 @@
+#!/usr/bin/python3
+"""untrash-cloud-wg - the Nextcloud server as a WireGuard peer of UntrashMesh.
+
+  untrash-cloud-wg            the service: a round every 30 s
+  untrash-cloud-wg --once     one round
+  untrash-cloud-wg --down     no tunnel any more: the app's record without a
+                              key, interface and firewall rules gone
+
+The Nextcloud app "untrash" is the mesh member (node key, roster, directory);
+it runs as the web server user and cannot make network interfaces.  This
+helper runs as root next to it (docs/architecture/cloud-api.md §4):
+
+- it keeps a WireGuard key of its own (/var/lib/untrash-cloud-wg/wg.key) and
+  hands the public key and this server's public endpoint to the app
+  (occ untrash:tunnel sync), which signs them into its own mesh record; the
+  NAS members fetch that record from the directory and connect to this
+  server, so a NAS behind a home router needs no forwarded port;
+- the answer names this node's mesh address and the NAS members (WireGuard
+  key, mesh address); the helper applies them to the interface ut-mesh: one
+  /128 per NAS, no endpoints (the NAS connect out, WireGuard roaming learns
+  where they are);
+- kernel WireGuard when the kernel has it, else wireguard-go (an OpenVZ
+  container has only /dev/net/tun);
+- ip6tables: on ut-mesh only answers to connections this server opened (and
+  ICMPv6) come in, so the NAS members do not reach this server's services.
+  Nextcloud then reaches each NAS at http://[<mesh address>]:5002 (WebDAV,
+  /untrash-cloudlink).
+
+Options: --occ CMD (default: runuser -u www-data -- php /var/www/nextcloud/occ),
+--endpoint IP:PORT (default: the source address of the default route, if it
+is public, and --port), --port 51820, --state DIR, --wireguard-go PATH,
+--no-firewall, --every SECONDS.
+Test hook: UT_CLOUDWG_FAKE=<file>: no ip/wg/ip6tables; the interface and
+peers go into that JSON file, handshakes are read from it.
+Python 3.8 and the standard library only (Ubuntu 20.04).
+"""
+import argparse
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+IFACE = "ut-mesh"
+CHAIN = "UNTRASH-MESH-IN"
+FAKE = os.environ.get("UT_CLOUDWG_FAKE")
+WG_GO = None          # the wireguard-go process, when this helper started one
+
+
+def log(msg):
+    print("untrash-cloud-wg: " + msg, file=sys.stderr, flush=True)
+
+
+def run(cmd, check=True, input=None):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, input=input)
+    if check and r.returncode:
+        raise RuntimeError("%s: %s" % (" ".join(cmd[:4]), (r.stderr or r.stdout).strip()[:300]))
+    return r.stdout
+
+
+def quiet(cmd):
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def fake_load():
+    try:
+        return json.load(open(FAKE))
+    except (OSError, ValueError):
+        return {}
+
+
+def fake_save(d):
+    json.dump(d, open(FAKE, "w"), indent=1)
+
+
+# ------------------------------------------------------------ key and endpoint
+
+def keys(state):
+    """(private key file, public key); made once."""
+    os.makedirs(state, mode=0o700, exist_ok=True)
+    f = os.path.join(state, "wg.key")
+    if not os.path.exists(f):
+        key = base64.b64encode(os.urandom(32)).decode() if FAKE else run(["wg", "genkey"]).strip()
+        with open(os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+            fh.write(key + "\n")
+    key = open(f).read().strip()
+    pub = (base64.b64encode(hashlib.sha256(key.encode()).digest()).decode() if FAKE
+           else run(["wg", "pubkey"], input=key + "\n").strip())
+    return f, pub
+
+
+def public_endpoint(port):
+    """This server's address toward the internet, when it is a public one."""
+    if FAKE:
+        return None
+    try:
+        src = json.loads(run(["ip", "-j", "route", "get", "1.1.1.1"]))[0]["prefsrc"]
+        ip = ipaddress.ip_address(src)
+    except (RuntimeError, ValueError, KeyError, IndexError):
+        return None
+    return "%s:%d" % (ip, port) if ip.is_global else None
+
+
+# ------------------------------------------------------------ the app
+
+def occ(cmd, *args):
+    out = run(shlex.split(cmd) + ["--no-ansi"] + list(args), check=False)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError("occ: %s" % out.strip()[-300:])
+
+
+# ------------------------------------------------------------ interface
+
+def handshakes():
+    if FAKE:
+        return {k: p.get("handshake", 0) for k, p in fake_load().get("peers", {}).items()}
+    if not quiet(["ip", "link", "show", IFACE]):
+        return {}
+    out = {}
+    for line in run(["wg", "show", IFACE, "latest-handshakes"], check=False).splitlines():
+        f = line.split()
+        if len(f) == 2 and f[1].isdigit():
+            out[f[0]] = int(f[1])
+    return out
+
+
+def iface_up(wg_go):
+    """ut-mesh exists afterwards: kernel WireGuard, else wireguard-go."""
+    global WG_GO
+    if quiet(["ip", "link", "show", IFACE]):
+        return
+    if quiet(["ip", "link", "add", IFACE, "type", "wireguard"]):
+        return
+    if WG_GO and WG_GO.poll() is None:
+        WG_GO.terminate()
+    # -f: in the foreground, as a child of this service (systemd stops both)
+    WG_GO = subprocess.Popen([wg_go, "-f", IFACE], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    for _ in range(50):
+        if quiet(["ip", "link", "show", IFACE]):
+            return
+        time.sleep(0.1)
+    raise RuntimeError("wireguard-go did not make %s" % IFACE)
+
+
+def apply(r, keyfile, port, wg_go, firewall):
+    want = {p["wg"]: p["address"] + "/128" for p in r["peers"]}
+    if FAKE:
+        d = fake_load()
+        old = d.get("peers", {})
+        d["iface"] = {"address": r["address"], "prefix": r["prefix"], "port": port, "firewall": firewall}
+        d["peers"] = {w: {"allowed": a, "handshake": (old.get(w) or {}).get("handshake", 0)} for w, a in want.items()}
+        fake_save(d)
+        return
+    iface_up(wg_go)
+    run(["wg", "set", IFACE, "private-key", keyfile, "listen-port", str(port)])
+    if r["address"] not in run(["ip", "-6", "addr", "show", "dev", IFACE]):
+        run(["ip", "-6", "addr", "add", "%s/48" % r["address"], "dev", IFACE])
+    run(["ip", "link", "set", IFACE, "mtu", "1380", "up"])
+    for w, a in want.items():
+        run(["wg", "set", IFACE, "peer", w, "allowed-ips", a], check=False)
+    for w in handshakes():
+        if w not in want:
+            run(["wg", "set", IFACE, "peer", w, "remove"], check=False)
+    if firewall:
+        firewall_on()
+
+
+def firewall_on():
+    """Inbound on ut-mesh: answers and ICMPv6 only."""
+    if not quiet(["ip6tables", "-n", "-L", CHAIN]):
+        run(["ip6tables", "-N", CHAIN])
+        for rule in (["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+                     ["-p", "ipv6-icmp", "-j", "ACCEPT"], ["-j", "DROP"]):
+            run(["ip6tables", "-A", CHAIN] + rule)
+    if not quiet(["ip6tables", "-C", "INPUT", "-i", IFACE, "-j", CHAIN]):
+        run(["ip6tables", "-I", "INPUT", "-i", IFACE, "-j", CHAIN])
+
+
+def down():
+    global WG_GO
+    if FAKE:
+        if os.path.exists(FAKE):
+            os.remove(FAKE)
+        return
+    quiet(["ip", "link", "del", IFACE])
+    if WG_GO and WG_GO.poll() is None:
+        WG_GO.terminate()
+    WG_GO = None
+    while quiet(["ip6tables", "-D", "INPUT", "-i", IFACE, "-j", CHAIN]):
+        pass
+    quiet(["ip6tables", "-F", CHAIN])
+    quiet(["ip6tables", "-X", CHAIN])
+
+
+# ------------------------------------------------------------ rounds
+
+def round_(a, keyfile, pub, ep):
+    r = occ(a.occ, "untrash:tunnel", "sync", "--key", pub, "--endpoint", ep, "--handshakes", json.dumps(handshakes()))
+    if "error" in r:
+        raise RuntimeError(r["error"])
+    if not r.get("mesh"):
+        down()                     # not (or no longer) in a mesh
+        return r
+    apply(r, keyfile, a.port, a.wireguard_go, a.firewall)
+    return r
+
+
+def main():
+    p = argparse.ArgumentParser(description="the Nextcloud server as a WireGuard peer of UntrashMesh")
+    p.add_argument("--occ", default="runuser -u www-data -- php /var/www/nextcloud/occ")
+    p.add_argument("--endpoint")
+    p.add_argument("--port", type=int, default=51820)
+    p.add_argument("--state", default="/var/lib/untrash-cloud-wg")
+    p.add_argument("--wireguard-go", default="/usr/local/sbin/wireguard-go")
+    p.add_argument("--no-firewall", dest="firewall", action="store_false")
+    p.add_argument("--every", type=float, default=30)
+    p.add_argument("--once", action="store_true")
+    p.add_argument("--down", action="store_true")
+    a = p.parse_args()
+    if a.down:
+        print(json.dumps(occ(a.occ, "untrash:tunnel", "off")))
+        down()
+        return 0
+    keyfile, pub = keys(a.state)
+    ep = a.endpoint or public_endpoint(a.port)
+    if not ep:
+        log("no public address found: give --endpoint IP:PORT")
+        return 2
+    signal.signal(signal.SIGTERM, lambda *x: sys.exit(0))
+    try:
+        while True:
+            try:
+                r = round_(a, keyfile, pub, ep)
+                if a.once:
+                    print(json.dumps(r))
+                    return 0
+            except (RuntimeError, OSError) as e:
+                log("error: %s" % e)
+                if a.once:
+                    return 1
+            time.sleep(a.every)
+    finally:
+        if WG_GO and WG_GO.poll() is None:     # the interface goes with it; the record stays (a restart is no "off")
+            WG_GO.terminate()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

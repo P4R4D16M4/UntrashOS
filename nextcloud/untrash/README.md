@@ -37,6 +37,53 @@ storage support* for the feed.
      database, or log-in credentials saved in the database). Mounts with
      credentials that exist only in the session are skipped by the feed.
 
+## NAS behind a router: the tunnel
+
+A Nextcloud on the internet cannot reach a NAS at home by its LAN address.
+Do not forward the WebDAV port: that would put the users' passwords on the
+internet. Instead, make this server a WireGuard peer of the mesh. The NAS
+connect out to it, so nothing is forwarded at home. Contract:
+`cloud-api.md` §4.
+
+What the server needs:
+- root;
+- `wireguard-tools`;
+- kernel WireGuard, or `wireguard-go` in `/usr/local/sbin` (for example an
+  OpenVZ container with `/dev/net/tun`);
+- UDP 51820 open in the server's firewall, and in the hoster's firewall
+  if it has one;
+- Python 3.8 or newer.
+
+Setup:
+
+```
+install -m 755 nextcloud/server/untrash-cloud-wg /usr/local/sbin/
+install -m 644 nextcloud/server/untrash-cloud-wg.service /etc/systemd/system/
+untrash-cloud-wg --once          # one round: prints the peers, or the error
+systemctl enable --now untrash-cloud-wg
+```
+
+- The helper finds the public address from the default route. Behind NAT,
+  give it with `--endpoint IP:51820` (edit `ExecStart`).
+- Nextcloud in another path: `--occ "runuser -u www-data -- php /path/occ"`.
+- Within about 10 minutes every NAS has the new record and connects. The
+  settings page then shows **Tunnel connected** per NAS. **Use the mesh
+  address** sets the feed address to `http://[<mesh address>]:5002/untrash-cloudlink`.
+- External storage through the tunnel, one per share:
+
+  ```
+  occ files_external:create /Photos dav password::password \
+      -c host='[<NAS mesh address>]:5002' -c root=webdav/Photos -c secure=false
+  occ files_external:option <id> filesystem_check_changes 0
+  ```
+
+  Add the credentials in the settings, or with `-c user=… -c password=…`
+  for a global mount. `occ untrash:status` lists each NAS's `address`.
+  Plain HTTP is right here: WireGuard encrypts it.
+- `untrash-cloud-wg --down` ends the tunnel: the NAS drop the peer.
+
+## Feed timing
+
 The background jobs apply the changes every 5 minutes. For changes within
 seconds, run the feed as a service under the web server user:
 
@@ -63,6 +110,7 @@ WantedBy=multi-user.target
 | `occ untrash:status` | membership, members, feed state (JSON) |
 | `occ untrash:nas NODE URL [--insecure]` | feed address of a NAS |
 | `occ untrash:feed [--once] [--wait S]` | apply the change feed (loop, or one round) |
+| `occ untrash:tunnel sync\|off` | the tunnel helper's interface (cloud-api.md §4) |
 
 ## Translations
 

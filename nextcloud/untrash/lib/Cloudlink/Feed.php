@@ -118,6 +118,13 @@ class Feed {
         });
     }
 
+    /** Host names case-insensitively, IP addresses by value (fd00::1 = fd00:0::1, the mesh addresses). */
+    private static function sameHost(string $a, string $b): bool {
+        $pa = @inet_pton($a);
+        $pb = @inet_pton($b);
+        return ($pa !== false && $pb !== false) ? $pa === $pb : strcasecmp($a, $b) === 0;
+    }
+
     /**
      * Storages of the external mounts on this NAS share: WebDAV backend, host
      * = the NAS, remote folder webdav/<share>.  One storage per distinct
@@ -141,7 +148,7 @@ class Feed {
             $h = (string)($o['host'] ?? '');
             $h = parse_url(strpos($h, '://') === false ? 'http://' . $h : $h, PHP_URL_HOST) ?: '';
             $rootPath = trim(rawurldecode((string)($o['root'] ?? '')), '/');
-            if (strcasecmp(trim($h, '[]'), $host) === 0 && $rootPath === 'webdav/' . $share) {
+            if (self::sameHost(trim($h, '[]'), $host) && $rootPath === 'webdav/' . $share) {
                 $ids[] = $c->getId();
             }
         }
