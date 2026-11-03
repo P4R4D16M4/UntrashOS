@@ -135,12 +135,18 @@ WireGuard peer.
   `set` on a current wireguard-go; the control socket itself answers.
   The helper therefore speaks the WireGuard UAPI itself for wireguard-go,
   and uses `wg` only for kernel WireGuard.
+- **Hardware-proven 2026-11-03** with 1.2-rc2 (v1.2 5ab93cc) on the dev
+  NAS:
+  - WireGuard handshake with the server, no port forward at home; the
+    hoster's firewall lets UDP 51820 through;
+  - ping to the NAS mesh address takes 24 ms;
+  - untrash-cloudlink over `http://[<mesh address>]:5002`: unsigned 401,
+    a signed feed round OK (both linked shares reported for a rescan).
+  - The NAS needs WebDAV switched on: untrash-cloudlink is reached
+    through the WebDAV Apache.
 - Open:
-  - the NAS side (record key) needs a new release candidate on the
-    hardware. 1.2-rc1 ignores the cloud's key, so there is no handshake
-    yet.
-  - Then: a handshake, the hoster's firewall for UDP 51820, the feed and
-    a WebDAV external storage over the mesh address.
+  - a WebDAV external storage over the mesh address;
+  - the second NAS (still 1.1).
 
 ## Version range
 
