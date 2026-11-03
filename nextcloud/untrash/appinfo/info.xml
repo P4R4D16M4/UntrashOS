@@ -8,9 +8,10 @@
 
 * **Directory:** members keep their signed address records here, at the stable internet address of this Nextcloud, and find each other again after their addresses changed.
 * **Change feed:** a linked UntrashOS NAS tells this Nextcloud which files changed in its shares. External storages (WebDAV) on that NAS are updated path by path instead of being scanned, so the NAS disks can sleep.
+* **Tunnel (optional):** with the root helper untrash-cloud-wg, this server is also a WireGuard peer of the mesh. The NAS connect out to it, so it reaches their WebDAV shares and change feed with no port forwarded at home.
 
 Contract: docs/architecture/cloud-api.md in the UntrashOS repository.]]></description>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
     <licence>agpl</licence>
     <author>UntrashOS</author>
     <namespace>Untrash</namespace>
@@ -29,6 +30,7 @@ Contract: docs/architecture/cloud-api.md in the UntrashOS repository.]]></descri
         <command>OCA\Untrash\Command\Status</command>
         <command>OCA\Untrash\Command\Feed</command>
         <command>OCA\Untrash\Command\Nas</command>
+        <command>OCA\Untrash\Command\Tunnel</command>
     </commands>
     <settings>
         <admin>OCA\Untrash\Settings\Admin</admin>

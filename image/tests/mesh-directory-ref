@@ -8,6 +8,10 @@ answer the same way.
   mesh-directory-ref run PORT          (env ZT_DIR_TEST_YOU: the IP it reports)
   mesh-directory-ref sign METHOD PATH [BODY]
                                        Authorization header for untrash-cloudlink
+  mesh-directory-ref tunnel WGKEY EP,...
+                                       the cloud as a tunnel peer: its own record
+                                       with WireGuard key and endpoints
+                                       ("" "" = directory only again)
 
 State and rules come from untrash-mesh itself (ZT_MESH_DIR, ZT_SIG): the
 same roster and record checks, so the directory stores only what members
@@ -33,6 +37,9 @@ os.environ.setdefault("ZT_MESH_ENDPOINTS", "")
 _spec = importlib.util.spec_from_loader("untrash_mesh", importlib.machinery.SourceFileLoader("untrash_mesh", TOOL))
 mesh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mesh)
+_identity = mesh.identity
+# like the Nextcloud app: no WireGuard key in its records until "tunnel" names one
+mesh.identity = lambda: _identity()[:2] + ("",)
 NONCES = {}
 LOCK = threading.Lock()
 
@@ -91,12 +98,27 @@ def sign_header(method, path, body=b""):
     return "UntrashCloud node=%s, ts=%s, nonce=%s, sig=%s" % (nid, ts, nonce, sig)
 
 
+def tunnel(wg, eps):
+    """A new own record (seq + 1) naming the tunnel key and endpoints; the
+    NAS members pull it from this directory (cloud-api.md §4)."""
+    nid, pub, _ = mesh.identity()
+    st = mesh.state()
+    cur = mesh.book().get(nid) or {}
+    rec = mesh.sign({"type": "node", "proto": mesh.PROTO, "node": nid, "pub": pub, "wg": wg,
+                     "name": st.get("name") or "nextcloud", "ep": [e for e in eps.split(",") if e],
+                     "seq": cur.get("seq", 0) + 1, "time": int(time.time())})
+    mesh.merge([rec])
+    return rec
+
+
 def main():
     a = sys.argv[1:]
     if a[:1] == ["join"] and len(a) == 2:
         print(json.dumps(mesh.cmd_join(a[1])))
     elif a[:1] == ["run"] and len(a) == 2:
         http.server.ThreadingHTTPServer(("127.0.0.1", int(a[1])), Dir).serve_forever()
+    elif a[:1] == ["tunnel"] and len(a) == 3:
+        print(json.dumps(tunnel(a[1], a[2])))
     elif a[:1] == ["sign"] and len(a) in (3, 4):
         print(sign_header(a[1], a[2], a[3].encode() if len(a) == 4 else b""))
     else:

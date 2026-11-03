@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashMesh tunnel of this Nextcloud server (WireGuard)
+Documentation=file:///usr/local/sbin/untrash-cloud-wg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/untrash-cloud-wg
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

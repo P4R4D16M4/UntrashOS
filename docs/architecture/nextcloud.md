@@ -5,6 +5,8 @@ Status (2026-11-03):
 - Phase 2 (the Nextcloud app `nextcloud/untrash`) is tested against a real
   Nextcloud 25 in Docker.
 - The contract is in `cloud-api.md`.
+- The tunnel (the Nextcloud server as a WireGuard peer, `cloud-api.md` §4)
+  is done on the PC.
 - Nothing has run on NAS hardware yet.
 
 Decision 2026-11-02: UntrashOS gets a companion for **existing Nextcloud
@@ -92,9 +94,53 @@ directory).
   anyone. Done in `untrash-mesh` (phase 1).
 - **File access.**
   - LAN: direct WebDAV.
-  - Over the internet: the NAS's WebDAV TLS port, or later a WireGuard link
-    of the Nextcloud host. That needs root on the host, so it is a separate
-    small agent and not part of the PHP app.
+  - Over the internet: the Nextcloud host as a WireGuard peer of the mesh
+    (done on the PC, below). A port forward of the WebDAV TLS port was
+    rejected on 2026-11-03: it would put the users' passwords on the
+    internet.
+
+### 4. The tunnel (done on the PC, 2026-11-03)
+
+The user's Nextcloud is on a rented server, and the NAS is behind a home
+router. The directory worked, but the feed address from the invitation was
+the NAS's LAN address. User decision: **variant B**, the server becomes a
+WireGuard peer.
+- Contract: `cloud-api.md` §4.
+- The key is in the cloud's own signed record, not in the roster: there is
+  no new invitation and no admin action.
+- `untrash-mesh`: a cloud with a key in its record is a peer (`/128`, the
+  record's endpoints, keepalive 25) with a `.mesh` name. Each directory is
+  asked at least every 10 minutes. A cloud cannot send co-op offers or
+  mirror requests.
+- App 0.4.0:
+  - `occ untrash:tunnel sync|off`;
+  - the mesh address and tunnel handshake per member in the status;
+  - settings page: **Tunnel connected**, and **Use the mesh address** for
+    the feed;
+  - external storages are matched by IP value (`fd00::1` = `fd00:0::1`).
+- Root helper `nextcloud/server/untrash-cloud-wg` with a systemd unit:
+  kernel WireGuard or wireguard-go, ip6tables (answers only).
+- Tests:
+  - `test-cloudlink-host.py`: record key, peer on both NAS, malformed key,
+    off, no offers from a cloud;
+  - `test_nextcloud_docker.py` (31 checks): helper (fake WireGuard) against
+    a real Nextcloud; PHP and the NAS agree on the mesh address.
+- On the reference server (OpenVZ, Ubuntu 20.04), since 2026-11-03:
+  - wireguard-go 0.0.20250522, built statically from the official tag
+    with Go 1.27.3 (checksum against go.dev, `go mod verify`);
+  - App 0.4.0 and `untrash-cloud-wg.service` are running: `ut-mesh` with
+    its mesh address, ip6tables answers-only, UDP 51820;
+  - peers: both NAS.
+- Lesson: the `wg` of Ubuntu 20.04 (1.0.20200513) hangs after every
+  `set` on a current wireguard-go; the control socket itself answers.
+  The helper therefore speaks the WireGuard UAPI itself for wireguard-go,
+  and uses `wg` only for kernel WireGuard.
+- Open:
+  - the NAS side (record key) needs a new release candidate on the
+    hardware. 1.2-rc1 ignores the cloud's key, so there is no handshake
+    yet.
+  - Then: a handshake, the hoster's firewall for UDP 51820, the feed and
+    a WebDAV external storage over the mesh address.
 
 ## Version range
 

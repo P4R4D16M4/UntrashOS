@@ -20,8 +20,12 @@ Nextcloud directory and learns its IP there; a forged sync is refused;
 external storage (WebDAV, "check for changes: never") updated by
 occ untrash:feed: a new file appears only after the feed, a deleted one
 disappears, a change in a subfolder changes the etags up to the mount;
-the admin settings page answers; removing the cloud on the NAS ends the
-directory (403, address book cleared).
+the admin settings page answers; the tunnel (cloud-api.md §4): the root
+helper nextcloud/server/untrash-cloud-wg (fake WireGuard) gets the NAS as
+its peer with the mesh address PHP computes (= the NAS's), the NAS gets the
+Nextcloud as a peer from its signed record, handshakes reach the status,
+--down takes it back; removing the cloud on the NAS ends the directory
+(403, address book cleared).
 """
 import base64
 import json
@@ -165,7 +169,7 @@ try:
                 ZT_MESH_SYNC_PORT=str(sp), ZT_MESH_JOIN_PORT=str(jp), ZT_MESH_HOSTS=nasdir + "/hosts", ZT_MESH_TICK="0.5",
                 ZT_MESH_DIR_EVERY="1", ZT_UPNPC="/nonexistent", ZT_MESH_SMB=nasdir + "/smb.conf", ZT_MESH_PDATA=nasdir + "/p",
                 ZT_MESH_FAKE_MOUNT=nasdir + "/m.json", ZT_MESH_FAKE_ACCOUNTS=nasdir + "/a.json", ZT_MESH_FAKE_DRBD=nasdir + "/d.json",
-                ZT_MESH_HOST_MNT=nasdir + "/nohost", ZT_MESH_TLS_CERT=W + "/nas.crt")
+                ZT_MESH_HOST_MNT=nasdir + "/nohost", ZT_MESH_TLS_CERT=W + "/nas.crt", ZT_MESH_DIR_PULL="2")
 
     def mesh(*a):
         r = subprocess.run([MESH] + list(a), env=nenv, stdout=subprocess.PIPE, text=True)
@@ -281,6 +285,47 @@ try:
     open(feed, "a").write(share + "/cron.jpg\n")
     docker("exec", "-u", "www-data", NAME, "php", "-f", "/var/www/html/cron.php")
     check("background job (cron.php) applies the feed", "cron.jpg" in nc_dav("NAS"))
+
+    # ---------------------------------------------------------------- tunnel (cloud-api.md §4)
+    helper_env = dict(os.environ, UT_CLOUDWG_FAKE=W + "/cloud-wg.json")
+
+    def helper(*a):
+        r = subprocess.run([os.path.join(HERE, "..", "server", "untrash-cloud-wg"), "--occ",
+                            "sudo -n docker exec -u www-data %s php occ" % NAME, "--state", W + "/cwg",
+                            "--endpoint", "203.0.113.9:51820"] + list(a), env=helper_env, stdout=subprocess.PIPE, text=True)
+        try:
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return {"error": r.stdout}
+    out = occ("untrash:tunnel", "sync", "--key", "not-a-key", "--endpoint", "203.0.113.9:51820", check=False)
+    check("occ untrash:tunnel refuses a malformed key", '"error"' in out)
+    ms = {m["node"]: m for m in mesh("status")["members"]}
+    r = helper("--once")
+    check("helper round: the NAS is its peer, with the mesh address PHP computes (= the NAS's own)",
+          [(p["node"], p["wg"], p["address"]) for p in r.get("peers", [])] == [(nas["node"], nas["wg"], ms[nas["node"]]["address"])]
+          and r.get("address") == ms[nid]["address"])
+    fk = jf(W + "/cloud-wg.json")
+    check("... applied: interface with that address, one /128 per NAS, firewall on",
+          fk.get("iface", {}).get("address") == ms[nid]["address"] and fk["iface"]["firewall"] is True
+          and fk.get("peers") == {nas["wg"]: {"allowed": ms[nas["node"]]["address"] + "/128", "handshake": 0}})
+    ckey = json.loads(occ("untrash:status"))["tunnel"]["wg"]
+
+    def nas_peer():
+        return jf(nasdir + "/wg.json").get("peers", {}).get(ckey)
+    check("the NAS gets the Nextcloud as a WireGuard peer from its signed record (its address, its public endpoint)",
+          wait(lambda: (nas_peer() or {}).get("allowed") == ms[nid]["address"] + "/128"
+               and nas_peer()["eps"] == ["203.0.113.9:51820"], 30))
+    fk["peers"][nas["wg"]]["handshake"] = int(time.time())
+    json.dump(fk, open(W + "/cloud-wg.json", "w"))
+    helper("--once")
+    st = json.loads(occ("untrash:status"))
+    check("a handshake reaches the status (settings page: tunnel connected)", [m for m in st["members"]
+          if m["node"] == nas["node"]][0]["tunnel"] == fk["peers"][nas["wg"]]["handshake"])
+    check("... with the NAS's mesh address for the feed", [m for m in st["members"] if m["node"] == nas["node"]][0]["address"]
+          == ms[nas["node"]]["address"])
+    helper("--down")
+    check("--down: the NAS drops the peer, the Nextcloud stays a member", wait(lambda: nas_peer() is None, 30)
+          and json.loads(occ("untrash:status"))["tunnel"] is None and any(m["node"] == nid for m in mesh("status")["members"]))
 
     # settings page and controller (admin session)
     import http.cookiejar

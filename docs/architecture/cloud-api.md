@@ -58,8 +58,9 @@ The answer, the `mac` check and the roster check are the same as in
 `app-api.md` §2. In the roster, the cloud has `"kind": "cloud"`,
 `"wg": ""` and its `"dir"`. Its record keeps `ep: []`.
 
-Cloud members get **no WireGuard peer** and no `<name>.mesh` name. They are
-reached only over `dir`.
+A cloud joins **without a WireGuard key**: it gets no WireGuard peer and no
+`<name>.mesh` name, and it is reached only over `dir`. It can become a
+tunnel peer later through its own record (§4).
 
 Only the inviting NAS stores the share link (`clouds.json`). Another NAS
 links the cloud with `untrash-mesh cloud-link NODE '[...]'`. When an admin
@@ -108,6 +109,8 @@ endpoints, so it should be the server of people who are in the mesh anyway.
 - Every 60 s, when a WireGuard member has had no handshake for 180 s, it
   pushes its own record and pulls the others'.
 - Anti-entropy picks the cloud like any other member.
+- At least every 10 minutes anyway (`ZT_MESH_DIR_PULL`), so a cloud's
+  own new record (§4) reaches every NAS.
 - The `you` IP becomes the NAS's last-resort endpoint `<ip>:51820`, if it is
   public. That endpoint only works when port 51820 is forwarded to the NAS.
 
@@ -214,3 +217,76 @@ changes itself.
   event's folder is resolved with `open_by_handle_at`.
 - The service runs as root.
 - Partner volumes (CIFS) cannot be marked. Their shares have `feed: false`.
+
+## 4. The cloud as a tunnel peer
+
+A Nextcloud on the internet cannot reach a NAS behind a home router. A port
+forward for WebDAV would put the users' passwords on the internet, so
+UntrashOS does not do that. Instead the Nextcloud server can also be a
+**WireGuard peer** of the mesh. It has a fixed public address, so the NAS
+members connect out to it, and no port is forwarded at home. Nextcloud then
+reaches each NAS inside the tunnel:
+- WebDAV: `http://[<NAS mesh address>]:5002/webdav/<share>`;
+- the feed: `http://[<NAS mesh address>]:5002/untrash-cloudlink`.
+
+Plain HTTP is enough there: WireGuard encrypts it, and only the NAS's key
+can answer from its mesh address.
+
+**Key in the cloud's own record** (user decision 2026-11-03). The cloud signs
+a new own record (`seq` + 1) with:
+- `wg`: its WireGuard public key (44 characters of base64, 32 bytes);
+- `ep`: 1 to 4 public endpoints, `IPv4:port` or `[IPv6]:port`.
+
+The roster keeps `"wg": ""` for the cloud. It needs no new invitation and no
+admin action. The NAS members take the key from the record because the
+cloud's node key, which the roster vouches for, signs it. They take it only
+for kind `cloud`; NAS and app members keep the roster's key. A record
+without `wg`, or with a malformed one, means no tunnel. The peer is the
+cloud's own mesh address (`/128`), so the key opens nothing else.
+
+**NAS side** (`untrash-mesh`):
+- WireGuard peer with `allowed-ips <cloud address>/128`, the record's
+  endpoints, `persistent-keepalive 25`. The keepalive keeps the home
+  router's NAT open, so the server can always answer.
+- `<name>.mesh` in `/etc/hosts`.
+- `status` gives the cloud a `tunnel` field: the last handshake, `null`
+  before the first one, `false` without a tunnel.
+- A cloud cannot offer shares (`/v1/offer`) or mirrors (`/v1/mirror`): the
+  NAS answers `403`.
+
+**Server side.** The PHP app runs as the web server user and cannot make
+network interfaces. A small root helper next to it,
+`nextcloud/server/untrash-cloud-wg` (Python 3.8, standard library only), runs
+the interface `ut-mesh`:
+- kernel WireGuard, or `wireguard-go` where the kernel has none (an OpenVZ
+  container with `/dev/net/tun`);
+- its own WireGuard key in `/var/lib/untrash-cloud-wg/wg.key`;
+- the endpoint is the source address of its default route when that is
+  public, or `--endpoint`.
+
+Every 30 s it runs one round:
+
+```
+occ untrash:tunnel sync --key <wg public> --endpoint <ip:port> --handshakes '{<peer key>: <unix>}'
+→ {"mesh", "address", "prefix", "peers": [{"node", "name", "wg", "address"}]}
+```
+
+- When the key or endpoint changed, the app signs a new own record.
+- `peers` are the roster's NAS members (with their roster keys). Apps and
+  other clouds are not peers.
+- The helper sets the address (`/48`), one `/128` per NAS and no endpoints:
+  the NAS connect out, and WireGuard roaming learns where they are.
+- The app keeps the handshakes for its settings page. It writes them only
+  when a peer came up or went down, or every 5 minutes.
+- `"mesh": null` (the cloud left, or was removed): the helper takes the
+  interface down.
+- `ip6tables` on `ut-mesh`: only answers to connections the server opened,
+  plus ICMPv6, come in. The NAS members do not reach the server's own
+  services.
+- `untrash-cloud-wg --down` (or `occ untrash:tunnel off`) signs a record
+  without `wg`, and the NAS drop the peer.
+
+The mesh address is computed the same way on both sides:
+`fd` + 5 bytes of `sha256("untrash-mesh:" + mesh id)` + 2 zero bytes +
+8 bytes of `sha256(node public key)`. `test_nextcloud_docker.py` checks that
+PHP and the NAS agree.

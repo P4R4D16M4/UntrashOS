@@ -11,6 +11,7 @@ use OCP\Http\Client\IClientService;
 use OCP\IL10N;
 use OCP\IURLGenerator;
 use OCP\Lock\ILockingProvider;
+use OCP\Lock\LockedException;
 use OCP\Security\ICrypto;
 
 /**
@@ -21,11 +22,17 @@ use OCP\Security\ICrypto;
  * signed is ever stored.
  *
  * State lives in the app data folder "mesh" (node.json with the secret key
- * encrypted by Nextcloud, mesh.json, book.json, nas.json, nonces.json); every
- * read-modify-write holds the lock "untrash/mesh".
+ * encrypted by Nextcloud, mesh.json, book.json, nas.json, nonces.json,
+ * tunnel.json); every read-modify-write holds the lock "untrash/mesh".
+ *
+ * Tunnel (cloud-api.md §4): a root helper on this server (untrash-cloud-wg)
+ * runs the WireGuard interface; this app only puts the helper's public key
+ * and endpoint into its own signed record and tells the helper which NAS
+ * members to accept as peers.
  */
 class Mesh {
     public const PROTO = 1;
+    public const WG_RE = '#^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$#';
     private const LOCK = 'untrash/mesh';
 
     private IAppData $appData;
@@ -76,7 +83,18 @@ class Mesh {
     }
 
     public function locked(callable $fn) {
-        $this->locking->acquireLock(self::LOCK, ILockingProvider::LOCK_EXCLUSIVE);
+        // the database locking provider does not wait: a directory sync or the tunnel helper may hold it a moment
+        for ($i = 0; ; $i++) {
+            try {
+                $this->locking->acquireLock(self::LOCK, ILockingProvider::LOCK_EXCLUSIVE);
+                break;
+            } catch (LockedException $e) {
+                if ($i >= 100) {
+                    throw $e;
+                }
+                usleep(100000);
+            }
+        }
         try {
             return $fn();
         } finally {
@@ -127,6 +145,17 @@ class Mesh {
 
     public static function members($roster): array {
         return ($roster instanceof \stdClass && ($roster->members ?? null) instanceof \stdClass) ? get_object_vars($roster->members) : [];
+    }
+
+    /** The mesh address of a member: the mesh's ULA /48 and 64 bits of its key (untrash-mesh address()). */
+    public static function address(string $meshId, string $pubHex): string {
+        $p = hash('sha256', 'untrash-mesh:' . $meshId, true);
+        return (string)inet_ntop("\xfd" . substr($p, 0, 5) . "\0\0" . substr(hash('sha256', (string)hex2bin($pubHex), true), 0, 8));
+    }
+
+    public static function prefix(string $meshId): string {
+        $p = hash('sha256', 'untrash-mesh:' . $meshId, true);
+        return inet_ntop("\xfd" . substr($p, 0, 5) . str_repeat("\0", 10)) . '/48';
     }
 
     private static function admins($roster): array {
@@ -329,9 +358,8 @@ class Mesh {
             $this->save('mesh.json', (object)['mesh' => (object)['id' => $inv->m, 'name' => (string)($inv->n ?? ''), 'joined' => time()],
                                               'name' => $name, 'roster' => $roster]);
             $this->save('book.json', new \stdClass());
-            $own = $this->sign((object)['type' => 'node', 'proto' => self::PROTO, 'node' => $nid, 'pub' => $pub, 'wg' => '',
-                                        'name' => $name, 'ep' => [], 'seq' => 1, 'time' => time()]);
-            $this->mergeLocked(array_merge(is_array($ans->items ?? null) ? $ans->items : [], [$own]));
+            $this->mergeLocked(is_array($ans->items ?? null) ? $ans->items : []);
+            $this->ownRecordLocked();
             // the inviting NAS: its change feed on the WebDAV port of the address the invitation named;
             // HTTPS (5003) when its record pins its TLS key, plain HTTP (5002) for an older NAS
             $nas = new \stdClass();
@@ -357,6 +385,86 @@ class Mesh {
         return is_string($pin) && preg_match('#^sha256//[A-Za-z0-9+/]{43}=$#', $pin) ? $pin : null;
     }
 
+    // ------------------------------------------------------------ tunnel (cloud-api.md §4)
+
+    /** This cloud's record, signed again with seq + 1: name, tunnel key and endpoints (caller holds the lock). */
+    private function ownRecordLocked(): void {
+        $st = $this->load('mesh.json', null);
+        if (!$st || !isset($st->mesh)) {
+            return;
+        }
+        [$nid, $pub] = $this->identity();
+        $t = $this->load('tunnel.json', new \stdClass());
+        $cur = $this->load('book.json', new \stdClass())->$nid ?? null;
+        $this->mergeLocked([$this->sign((object)['type' => 'node', 'proto' => self::PROTO, 'node' => $nid, 'pub' => $pub,
+                                                 'wg' => (string)($t->wg ?? ''), 'name' => (string)$st->name,
+                                                 'ep' => array_values((array)($t->ep ?? [])),
+                                                 'seq' => (int)($cur->seq ?? 0) + 1, 'time' => time()])]);
+    }
+
+    /**
+     * The helper's round (occ untrash:tunnel sync): its WireGuard public key
+     * and public endpoints ("" and [] = no tunnel), the last handshake per
+     * peer key.  A changed key or endpoint goes into a new own record, which
+     * the NAS members fetch from this directory.  Returns what the helper
+     * applies: this node's mesh address, the mesh prefix and the NAS members
+     * as peers (their roster keys: the cloud needs no apps or other clouds).
+     */
+    public function tunnelSync(string $wg, array $eps, array $handshakes): array {
+        if ($wg !== '' && !preg_match(self::WG_RE, $wg)) {
+            throw new MeshException('not a WireGuard public key');
+        }
+        $eps = array_values(array_unique(array_filter($eps, function ($e) {
+            return is_string($e) && strlen($e) <= 80 && preg_match('#^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-fA-F:.]+\]):\d{1,5}$#', $e);
+        })));
+        if (count($eps) > 4 || ($wg === '') !== !$eps) {
+            throw new MeshException('a key needs 1 to 4 endpoints (host:port, [v6]:port), and endpoints a key');
+        }
+        return $this->locked(function () use ($wg, $eps, $handshakes) {
+            $t = $this->load('tunnel.json', new \stdClass());
+            $now = time();
+            if (($t->wg ?? '') !== $wg || array_values((array)($t->ep ?? [])) !== $eps) {
+                $t->wg = $wg;
+                $t->ep = $eps;
+                $t->hs = new \stdClass();
+                $this->save('tunnel.json', $t);
+                $this->ownRecordLocked();
+            }
+            $st = $this->load('mesh.json', null);
+            $out = ['mesh' => null, 'address' => null, 'prefix' => null, 'peers' => []];
+            if (!$st || !isset($st->mesh) || !isset(self::members($st->roster ?? null)[$this->identity()[0]])) {
+                return $out;                          // not (or no longer) in a mesh: no peers
+            }
+            $book = $this->load('book.json', new \stdClass());
+            $hs = new \stdClass();
+            $out = ['mesh' => $st->mesh->id, 'address' => self::address($st->mesh->id, $this->identity()[1]),
+                    'prefix' => self::prefix($st->mesh->id), 'peers' => []];
+            foreach (self::members($st->roster) as $k => $m) {
+                $k = (string)$k;
+                if (($m->kind ?? 'nas') !== 'nas' || !preg_match(self::WG_RE, (string)($m->wg ?? ''))) {
+                    continue;
+                }
+                $out['peers'][] = ['node' => $k, 'name' => $book->$k->name ?? $m->name ?? $k, 'wg' => $m->wg,
+                                   'address' => self::address($st->mesh->id, $m->pub)];
+                if (is_int($handshakes[$m->wg] ?? null) && $handshakes[$m->wg] > 0) {
+                    $hs->$k = $handshakes[$m->wg];
+                }
+            }
+            // the handshakes are only for the settings page: saved when a peer came up or went down, or every 5 minutes
+            $up = function ($h) use ($now) {
+                return array_keys(array_filter((array)$h, function ($x) use ($now) {
+                    return $now - $x < 180;
+                }));
+            };
+            if ($wg !== '' && ($up($hs) != $up($t->hs ?? []) || $now - (int)($t->t ?? 0) > 300)) {
+                $t->hs = $hs;
+                $t->t = $now;
+                $this->save('tunnel.json', $t);
+            }
+            return $out;
+        });
+    }
+
     public function leave(): void {
         $this->locked(function () {
             foreach (['mesh.json', 'book.json', 'nas.json', 'nonces.json'] as $f) {
@@ -373,7 +481,9 @@ class Mesh {
         $st = $this->load('mesh.json', null);
         $book = $this->load('book.json', new \stdClass());
         $nas = $this->load('nas.json', new \stdClass());
+        $t = $this->load('tunnel.json', new \stdClass());
         $out = ['node' => $nid, 'dir' => $this->dirUrl(), 'mesh' => $st->mesh ?? null, 'name' => $st->name ?? null, 'members' => [],
+                'tunnel' => ($t->wg ?? '') !== '' ? ['wg' => $t->wg, 'endpoints' => $t->ep, 'reported' => $t->t ?? null] : null,
                 // an admin removed this cloud on a NAS: it no longer serves the directory
                 'removed' => $st && isset($st->mesh) && !isset(self::members($st->roster ?? null)[$nid])];
         foreach (self::members($st->roster ?? null) as $k => $m) {
@@ -384,6 +494,8 @@ class Mesh {
                                  'role' => $m->role ?? 'member', 'self' => $k === $nid, 'endpoints' => $rec->ep ?? [],
                                  'seen' => $rec->time ?? null,
                                  'pinned' => isset($rec->tls),
+                                 'address' => isset($st->mesh->id) ? self::address($st->mesh->id, $m->pub) : null,
+                                 'tunnel' => $t->hs->$k ?? null,
                                  'feed' => $n ? ['base' => $n->base, 'verify' => $n->verify, 'last' => $n->last ?? null] : null];
         }
         return $out;

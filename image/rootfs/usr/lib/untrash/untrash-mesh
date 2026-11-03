@@ -76,7 +76,11 @@ from there, with requests signed by its node key.  When the members lost
 each other (all endpoints changed at once, a phone on mobile data), the
 directory still knows where everyone is.  It only ever stores signed
 records, so it cannot redirect anyone; it learns the endpoints, which is why
-it should be a server of the mesh's own people.  Join: HTTP on
+it should be a server of the mesh's own people.  A cloud may also be a
+tunnel peer: its own signed record then carries its WireGuard key and its
+public endpoint (a server with a fixed address, untrash-cloud-wg), and the
+NAS members connect to it, so the Nextcloud reaches their WebDAV and
+untrash-cloudlink inside the mesh with no port forwarded at home.  Join: HTTP on
 port 7341, open only while an invitation is pending, every message bound to
 the invitation's one-time secret (HMAC-SHA256).
 
@@ -84,7 +88,7 @@ State: /etc/untrash/mesh/ (node.sec/.pub, wg.key, mesh.json, book.json).
 Test hooks: ZT_MESH_DIR, ZT_MESH_FAKE_WG (no ip/wg; peers in a JSON file),
 ZT_MESH_ADDRMAP (JSON mesh address -> host:port for sync), ZT_MESH_JOIN_HOST,
 ZT_MESH_SYNC_PORT, ZT_MESH_JOIN_PORT, ZT_MESH_ENDPOINTS (own endpoints),
-ZT_SIG, ZT_MESH_TLS_CERT.
+ZT_SIG, ZT_MESH_TLS_CERT, ZT_MESH_DIR_PULL.
 """
 import base64
 import hashlib
@@ -255,6 +259,21 @@ def roster_ok(new, old):
     if by not in admins(old) or new.get("mesh") != old.get("mesh") or new.get("seq", 0) <= old.get("seq", 0):
         return False
     return isinstance(new.get("members"), dict) and verify(new, old["members"][by]["pub"])
+
+
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+
+
+def tunnel_key(m, rec):
+    """The WireGuard key of member m (rec: its record), "" without a tunnel.
+    NAS and app members: the roster's (fixed when they joined).  A cloud joins
+    without one; its own signed record may name one later (cloud-api.md §4):
+    the node key the roster vouches for signs it, and the peer only ever gets
+    the cloud's own mesh address."""
+    if m.get("kind") != "cloud":
+        return m.get("wg") or ""
+    w = (rec or {}).get("wg")
+    return w if isinstance(w, str) and WG_KEY_RE.match(w) else ""
 
 
 def record_ok(rec, st):
@@ -447,10 +466,11 @@ def wg_apply(st):
     want = {}
     bk = book()
     for k, m in members(st).items():
-        if k == nid or not m.get("wg"):          # cloud members have no WireGuard link
-            continue
         rec = bk.get(k) or {}
-        want[m["wg"]] = {"addr": address(mesh["id"], m["pub"]), "eps": rec.get("ep") or m.get("ep") or []}
+        w = tunnel_key(m, rec)
+        if k == nid or not w:                    # a cloud without a tunnel: directory only
+            continue
+        want[w] = {"addr": address(mesh["id"], m["pub"]), "eps": rec.get("ep") or m.get("ep") or []}
     if FAKE_WG:
         data = json.load(open(FAKE_WG)) if os.path.exists(FAKE_WG) else {"peers": {}}
         data["iface"] = {"address": address(mesh["id"], pub), "port": WG_PORT}
@@ -524,7 +544,7 @@ def hosts_apply(st):
     if mesh:
         bk, used = book(), set()
         for k, m in sorted(members(st).items(), key=lambda x: x[1].get("added", 0)):
-            if not m.get("wg"):
+            if not tunnel_key(m, bk.get(k)):
                 continue
             name = (bk.get(k) or {}).get("name") or m.get("name") or k[:8]
             base, i = name, 2
@@ -622,17 +642,19 @@ def dir_sync(k, m, items, have, st):
 
 def dir_recover(st, nid):
     """Members without a handshake for 3 minutes: ask the directories where
-    they are now (and tell them where we are)."""
+    they are now (and tell them where we are).  Each directory is asked at
+    least every 10 minutes anyway: a cloud's own record (its tunnel key)
+    reaches the members only from there."""
     clouds = [k for k, m in members(st).items() if m.get("kind") == "cloud"]
     if not clouds:
         return
-    peers = wg_peers()
+    peers, bk = wg_peers(), book()
     now = time.time()
     lost = [k for k, m in members(st).items()
-            if k != nid and m.get("wg") and now - (peers.get(m["wg"]) or {}).get("handshake", 0) > 180]
-    if lost:
-        rec = book().get(nid)
-        for k in clouds:
+            if k != nid and tunnel_key(m, bk.get(k)) and now - (peers.get(tunnel_key(m, bk.get(k))) or {}).get("handshake", 0) > 180]
+    rec = bk.get(nid)
+    for k in clouds:
+        if lost or now - ((st.get("dirseen") or {}).get(k) or {}).get("t", 0) > float(E("ZT_MESH_DIR_PULL", "600")):
             sync_with(k, [rec] if rec else [], st)
 
 
@@ -671,7 +693,7 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
                 sender = k
         if E("ZT_MESH_ADDRMAP") and req.get("from") in members(st):
             sender = req["from"]                 # PC test: no WireGuard addresses
-        if not sender or sender == identity()[0] or not mirror_message(sender, req):
+        if not sender or sender == identity()[0] or members(st)[sender].get("kind") == "cloud" or not mirror_message(sender, req):
             return self.send_error(403)
         self.send_response(200)
         self.send_header("Content-Length", "2")
@@ -691,8 +713,8 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
                 sender = k
         if E("ZT_MESH_ADDRMAP") and req.get("from") in members(st):
             sender = req["from"]                 # PC test: no WireGuard addresses
-        if not sender or sender == identity()[0]:
-            return self.send_error(403)
+        if not sender or sender == identity()[0] or members(st)[sender].get("kind") == "cloud":
+            return self.send_error(403)           # a cloud's tunnel reaches WebDAV, it offers no shares
         shares = [{"name": str(x.get("name")), "mode": "ro" if x.get("mode") == "ro" else "rw"}
                   for x in (req.get("shares") or [])[:64] if SHARE_RE.match(str(x.get("name", "")))]
         with LOCK:
@@ -1095,7 +1117,8 @@ def status():
         out["address"] = address(st["mesh"]["id"], pub)
         now, apps = time.time(), jload("apps.json", {})
         for k, m in members(st).items():
-            rec, p = bk.get(k) or {}, peers.get(m["wg"]) or {}
+            rec = bk.get(k) or {}
+            p = peers.get(tunnel_key(m, rec)) or {}
             out["members"].append({"node": k, "name": rec.get("name") or m.get("name"), "role": m.get("role"), "kind": m.get("kind"),
                                    "address": address(st["mesh"]["id"], m["pub"]), "self": k == nid,
                                    "endpoints": rec.get("ep", []), "seq": rec.get("seq"), "seen": rec.get("time"),
@@ -1104,9 +1127,11 @@ def status():
                                    or now - ((st.get("dirseen") or {}).get(k) or {}).get("t", 0) < 600,
                                    "user": (apps.get(k) or {}).get("user") if m.get("kind") == "app" else None})
             if m.get("kind") == "cloud":
-                # "last contact" of a cloud: this node's last exchange with its directory
+                # "last contact" of a cloud: this node's last exchange with its directory;
+                # "tunnel": the WireGuard handshake when the cloud is also a tunnel peer
                 out["members"][-1].update(dir=m.get("dir"), shares=(clouds.get(k) or {}).get("shares", []),
-                                          handshake=((st.get("dirseen") or {}).get(k) or {}).get("t"))
+                                          handshake=((st.get("dirseen") or {}).get(k) or {}).get("t"),
+                                          tunnel=(p.get("handshake") or None) if tunnel_key(m, rec) else False)
     return out
 
 
