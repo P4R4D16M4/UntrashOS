@@ -647,7 +647,8 @@ def render(s, root=""):
     paths = share_paths(root)
     dl = ["# untrash-config: media server (stock: shares published per media type)",
           "port=8200", "friendly_name=%s" % hn, "db_dir=/var/cache/minidlna", "log_dir=/var/cache/minidlna",
-          "inotify=yes", "notify_interval=895", "serial=0", "model_number=1", "root_container=."]
+          "inotify=yes", "notify_interval=90",   # a client that missed the SSDP reply sees the server within 90 s
+          "serial=0", "model_number=1", "root_container=."]
     for name, mask in sorted(ms["shares"].items()):
         p = paths.get(name)
         t = ("V" if mask & MEDIA_VIDEO else "") + ("P" if mask & MEDIA_PHOTO else "") + ("A" if mask & MEDIA_MUSIC else "")
