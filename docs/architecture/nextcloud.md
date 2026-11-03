@@ -125,12 +125,22 @@ WireGuard peer.
     off, no offers from a cloud;
   - `test_nextcloud_docker.py` (31 checks): helper (fake WireGuard) against
     a real Nextcloud; PHP and the NAS agree on the mesh address.
+- On the reference server (OpenVZ, Ubuntu 20.04), since 2026-11-03:
+  - wireguard-go 0.0.20250522, built statically from the official tag
+    with Go 1.27.3 (checksum against go.dev, `go mod verify`);
+  - App 0.4.0 and `untrash-cloud-wg.service` are running: `ut-mesh` with
+    its mesh address, ip6tables answers-only, UDP 51820;
+  - peers: both NAS.
+- Lesson: the `wg` of Ubuntu 20.04 (1.0.20200513) hangs after every
+  `set` on a current wireguard-go; the control socket itself answers.
+  The helper therefore speaks the WireGuard UAPI itself for wireguard-go,
+  and uses `wg` only for kernel WireGuard.
 - Open:
-  - wireguard-go for the OpenVZ server: no source or build is approved
-    yet;
-  - the real `ip`/`wg`/`ip6tables` path of the helper is untested (the PC
-    tests use the fake);
-  - the NAS side needs a new release candidate on the hardware.
+  - the NAS side (record key) needs a new release candidate on the
+    hardware. 1.2-rc1 ignores the cloud's key, so there is no handshake
+    yet.
+  - Then: a handshake, the hoster's firewall for UDP 51820, the feed and
+    a WebDAV external storage over the mesh address.
 
 ## Version range
 

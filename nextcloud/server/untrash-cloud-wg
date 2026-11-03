@@ -42,6 +42,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -118,12 +119,68 @@ def occ(cmd, *args):
 
 # ------------------------------------------------------------ interface
 
+SOCK = "/var/run/wireguard/%s.sock" % IFACE
+
+
+def uapi(req):
+    """One request to wireguard-go's control socket (the cross-platform
+    WireGuard UAPI).  The wg of Ubuntu 20.04 hangs on a current wireguard-go
+    after each "set" (it waits for the socket to close), so for wireguard-go
+    this helper speaks UAPI itself; kernel WireGuard goes through wg."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    try:
+        s.connect(SOCK)
+        s.sendall(req.encode())
+        buf = b""
+        while not buf.endswith(b"\n\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    lines = buf.decode().splitlines()
+    err = [l for l in lines if l.startswith("errno=")]
+    if not err or err[-1] != "errno=0":
+        raise RuntimeError("wireguard-go: %s" % (err[-1] if err else "no answer"))
+    return lines
+
+
+def userspace():
+    """ut-mesh is a wireguard-go interface: its control socket answers (a
+    stale socket file of a killed wireguard-go does not)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def hexkey(b64):
+    return base64.b64decode(b64).hex()
+
+
 def handshakes():
+    """{peer public key: last handshake (unix seconds, 0 = none)}."""
     if FAKE:
         return {k: p.get("handshake", 0) for k, p in fake_load().get("peers", {}).items()}
     if not quiet(["ip", "link", "show", IFACE]):
         return {}
     out = {}
+    if userspace():
+        cur = None
+        for l in uapi("get=1\n\n"):
+            k, _, v = l.partition("=")
+            if k == "public_key":
+                cur = base64.b64encode(bytes.fromhex(v)).decode()
+                out[cur] = 0
+            elif k == "last_handshake_time_sec" and cur:
+                out[cur] = int(v)
+        return out
     for line in run(["wg", "show", IFACE, "latest-handshakes"], check=False).splitlines():
         f = line.split()
         if len(f) == 2 and f[1].isdigit():
@@ -143,10 +200,33 @@ def iface_up(wg_go):
     # -f: in the foreground, as a child of this service (systemd stops both)
     WG_GO = subprocess.Popen([wg_go, "-f", IFACE], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     for _ in range(50):
-        if quiet(["ip", "link", "show", IFACE]):
+        # the link comes a moment before wireguard-go's control socket
+        try:
+            uapi("get=1\n\n")
             return
-        time.sleep(0.1)
+        except (OSError, RuntimeError):
+            time.sleep(0.1)
     raise RuntimeError("wireguard-go did not make %s" % IFACE)
+
+
+def wg_config(keyfile, port, want):
+    """Key, port and exactly the peers in want {public key: allowed ip}."""
+    old = handshakes()
+    if userspace():
+        req = ["set=1", "private_key=" + hexkey(open(keyfile).read().strip()), "listen_port=%d" % port]
+        for w in old:
+            if w not in want:
+                req += ["public_key=" + hexkey(w), "remove=true"]
+        for w, a in want.items():
+            req += ["public_key=" + hexkey(w), "replace_allowed_ips=true", "allowed_ip=" + a]
+        uapi("\n".join(req) + "\n\n")
+        return
+    run(["wg", "set", IFACE, "private-key", keyfile, "listen-port", str(port)])
+    for w, a in want.items():
+        run(["wg", "set", IFACE, "peer", w, "allowed-ips", a], check=False)
+    for w in old:
+        if w not in want:
+            run(["wg", "set", IFACE, "peer", w, "remove"], check=False)
 
 
 def apply(r, keyfile, port, wg_go, firewall):
@@ -159,15 +239,10 @@ def apply(r, keyfile, port, wg_go, firewall):
         fake_save(d)
         return
     iface_up(wg_go)
-    run(["wg", "set", IFACE, "private-key", keyfile, "listen-port", str(port)])
+    wg_config(keyfile, port, want)
     if r["address"] not in run(["ip", "-6", "addr", "show", "dev", IFACE]):
         run(["ip", "-6", "addr", "add", "%s/48" % r["address"], "dev", IFACE])
     run(["ip", "link", "set", IFACE, "mtu", "1380", "up"])
-    for w, a in want.items():
-        run(["wg", "set", IFACE, "peer", w, "allowed-ips", a], check=False)
-    for w in handshakes():
-        if w not in want:
-            run(["wg", "set", IFACE, "peer", w, "remove"], check=False)
     if firewall:
         firewall_on()
 
