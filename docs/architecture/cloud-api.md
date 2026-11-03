@@ -111,7 +111,7 @@ endpoints, so it should be the server of people who are in the mesh anyway.
 - The `you` IP becomes the NAS's last-resort endpoint `<ip>:51820`, if it is
   public. That endpoint only works when port 51820 is forwarded to the NAS.
 
-The UntrashApp can use the same endpoint with its own node key (planned).
+The UntrashApp uses the same endpoint with its own node key (`app-api.md` §3, "Mesh directory").
 
 ## 3. untrash-cloudlink
 

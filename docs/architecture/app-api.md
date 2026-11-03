@@ -111,6 +111,29 @@ few minutes while in the foreground.
 (body `{}`) when a request for the app's user waits. An app that cannot
 listen in the background simply polls `/api/app/requests` (§5).
 
+**Mesh directory (since 1.2).** A Nextcloud with the UntrashOS app is a
+roster member of `kind` `"cloud"`. It has no `wg` (no WireGuard peer, no Desk)
+and carries `dir`, the HTTPS base URL of its directory. Over plain internet,
+not the tunnel, the app syncs there the same way a NAS does
+(`cloud-api.md` §2):
+
+- `POST <dir>/v1/sync` with the sync body of this section plus
+  `"from": <app node id>, "ts": <unix seconds>, "nonce": <32 hex>` and
+  `"sig"`. `sig` is Ed25519 with the app's node key over the canonical JSON
+  without `sig`.
+- The answer `{"items", "you"}` is merged with the same rules as a member's.
+  The directory never makes or changes records, so it cannot redirect anyone.
+  `you` is the app's public IP as the directory saw it; it is only
+  informational, a phone needs no endpoint of its own.
+- `403` (no body): wrong signature, old `ts`, a reused nonce, the app is not
+  in the directory's roster, or the cloud was removed.
+
+When to use it: when no NAS answers on any of its endpoints (it has a new
+public IP), and after the phone changed networks. The app sends its own
+record and takes the fresher NAS records. Only cloud members with a `dir`
+like `https?://host/path` count. Cloud members are no NAS: no tunnel peer,
+no Desk requests.
+
 ## 4. Signed requests
 
 Every Desk API request of the app carries:
