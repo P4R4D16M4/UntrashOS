@@ -1483,6 +1483,8 @@ def upnp_save(req):
         if k not in UPNP_SERVICES:
             raise Fail("Unknown service %s." % k)
         v = int(v or 0)
+        if v and k == "HTTP":
+            raise Fail("The Desk is forwarded only over HTTPS: over HTTP the sign-in would cross the internet unencrypted.")
         if v:
             if not 1 <= v <= 65535:
                 raise Fail("WAN port 1 to 65535.")
@@ -2490,6 +2492,25 @@ def links_write(d):
     os.replace(tmp, LINKS)
 
 
+LINK_FAILS = {}        # client address or "link:<token>" -> (wrong passwords, wait until)
+
+
+def link_wait(keys):
+    """Seconds until another password may be tried (per address and per link)."""
+    return int(max(LINK_FAILS.get(k, (0, 0))[1] for k in keys) - time.time())
+
+
+def link_fail(keys):
+    """A wrong link password: from the 5th on, wait 2^n s (at most 5 min)."""
+    now = time.time()
+    if len(LINK_FAILS) > 10000:
+        for k in [k for k, (_n, t) in LINK_FAILS.items() if t < now]:
+            del LINK_FAILS[k]
+    for k in keys:
+        n = LINK_FAILS.get(k, (0, 0))[0] + 1
+        LINK_FAILS[k] = (n, now + min(300, 2 ** n) if n >= 5 else 0)
+
+
 def link_create(user, req):
     """A download link for a file or folder the user may read: expires after
     1..90 days, optionally with a password (stored as salted SHA-256)."""
@@ -2873,6 +2894,21 @@ def tv_call(fn, *a):
         raise Fail(str(e), e.code)
 
 
+def client_ip(handler):
+    """The client's address (PC tests may name another one: X-Test-Client)."""
+    if TEST and handler.headers.get("X-Test-Client"):
+        return handler.headers["X-Test-Client"]
+    return handler.client_address[0]
+
+
+def plain_from_internet(handler):
+    """A request over plain HTTP from outside the home network and the mesh.
+    A password must never cross the internet unencrypted (security check
+    2026-11-03: a stock UPnP forward had put the Desk's port 80 on the
+    internet), so sign-in, reset and setup then need HTTPS."""
+    return not getattr(handler.server, "tls", False) and not lan_client(client_ip(handler))
+
+
 def lan_client(ip):
     import ipaddress
     try:
@@ -3083,7 +3119,7 @@ def session_user(handler):
 
 
 def login(handler, req):
-    ip = handler.client_address[0]
+    ip = client_ip(handler)
     n, until = FAILS.get(ip, (0, 0))
     if until > time.time():
         raise Fail("Too many failed attempts, please wait %d s." % int(until - time.time()), 429)
@@ -3919,6 +3955,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, {"initialized": initialized(), "hostname": settings_load()["hostname"],
                                     "language": settings_load().get("language", "en"),
                                     "user": session_user(self), "reset_window": reset_window()})
+        if p in ("/api/reset-admin", "/api/setup", "/api/login", "/api/login/app") and method == "POST" and plain_from_internet(self):
+            raise Fail("Over the internet the Desk signs in only over HTTPS (Settings → Certificate, HTTPS).", 403)
         if p == "/api/reset-admin" and method == "POST":
             with LOCK:
                 return self.reply(200, reset_admin(self.json_body()))
@@ -4272,11 +4310,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, LINK_PAGE % ("Link", "UntrashOS", "<p>This link has expired or was deleted.</p>"),
                               "text/html; charset=utf-8")
         if v.get("pw"):
+            keys = (client_ip(self), "link:" + tok.split("/")[0])
+            wait = link_wait(keys)
+            if wait > 0:
+                return self.reply(429, LINK_PAGE % ("Link", "UntrashOS", "<p>Too many wrong passwords. Try again in %d s.</p>" % wait),
+                                  "text/html; charset=utf-8")
             pw = ""
             if method == "POST":
                 n = min(int(self.headers.get("Content-Length") or 0), 4096)
                 pw = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace")).get("pw", [""])[0]
             if not hmac.compare_digest(hashlib.sha256((v["salt"] + pw).encode()).hexdigest(), v["pw"]):
+                if method == "POST":
+                    link_fail(keys)
                 form = ('<p>This link is protected with a password.</p>%s<div class="ut-field"><label for="pw">Password</label>'
                         '<input class="ut-input" id="pw" name="pw" type="password" autofocus></div>'
                         '<button class="ut-btn ut-btn--primary ut-btn--lg" style="width:100%%">Download</button>') % (

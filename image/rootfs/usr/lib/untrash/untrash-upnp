@@ -8,6 +8,11 @@ upnp_main_model, /etc/zyxel/upnp.db upnpInfo: service, LAN port, WAN port).
   untrash-upnp status    JSON {router, external_ip, mappings [...]}
 LAN ports come from the current settings (Desk 80/HTTPS, FTP, SSH, WebDAV,
 Web Publishing, media server).
+
+The Desk over plain HTTP ("HTTP") is never forwarded, even when the stock
+configuration did: its sign-in would cross the internet unencrypted (security
+check 2026-11-03).  Routers may show the description with "." for the space
+(FritzBox: "UntrashOS.HTTP"); both forms count as ours.
 """
 import json
 import os
@@ -18,6 +23,12 @@ import sys
 SETTINGS = os.environ.get("ZT_SETTINGS", "/etc/untrash/settings.json")
 UPNPC = os.environ.get("ZT_UPNPC", "upnpc")
 TAG = "UntrashOS "
+NEVER = {"HTTP"}            # the Desk unencrypted: not to the internet
+
+
+def ours(desc):
+    """The service name of a mapping this NAS made, or None."""
+    return desc[len(TAG):] if desc[:len(TAG) - 1] == TAG[:-1] and desc[len(TAG) - 1:len(TAG)] in (" ", ".") else None
 
 
 def settings():
@@ -52,7 +63,8 @@ def status():
         x = re.match(r"\s*\d+\s+(TCP|UDP)\s+(\d+)->([\d.]+):(\d+)\s+'([^']*)'", line)
         if x:
             maps.append({"proto": x.group(1), "wan_port": int(x.group(2)), "ip": x.group(3), "lan_port": int(x.group(4)),
-                         "description": x.group(5), "ours": x.group(5).startswith(TAG)})
+                         "description": x.group(5), "ours": ours(x.group(5)) is not None,
+                         "service": ours(x.group(5))})
     return {"router": router.group(1) if router else "", "external_ip": m.group(1) if m else "",
             "lan_ip": lan.group(1) if lan else "", "mappings": maps}
 
@@ -60,6 +72,9 @@ def status():
 def apply():
     s = settings()
     want = {k: int(v) for k, v in ((s.get("upnp") or {}).get("services") or {}).items() if int(v) > 0}
+    for k in sorted(set(want) & NEVER):
+        print("not forwarded: %s (the Desk unencrypted; forward HTTPS instead)" % k, flush=True)
+        del want[k]
     st = status()
     if not st["router"]:
         print("no UPnP router found", flush=True)
@@ -67,7 +82,7 @@ def apply():
     ports = lan_ports(s)
     rc = 0
     for m in st["mappings"]:                     # stale mappings of this NAS
-        svc = m["description"][len(TAG):]
+        svc = m["service"]
         if m["ours"] and m["ip"] == st["lan_ip"] and want.get(svc) != m["wan_port"]:
             upnpc("-d", str(m["wan_port"]), m["proto"])
             print("removed %s %d" % (svc, m["wan_port"]), flush=True)

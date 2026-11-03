@@ -253,6 +253,21 @@ cloud's own mesh address (`/128`), so the key opens nothing else.
   before the first one, `false` without a tunnel.
 - A cloud cannot offer shares (`/v1/offer`) or mirrors (`/v1/mirror`): the
   NAS answers `403`.
+- **Firewall (nftables, since 1.2-rc3).** On `ut-mesh` a cloud peer
+  reaches only TCP 5002 (WebDAV and `/untrash-cloudlink`), ICMPv6, and
+  answers to connections the NAS opened. SSH, SMB, the Desk, DNS and the
+  mesh sync stay closed to it. NAS and app members are not filtered.
+  - The table is `inet untrash_mesh` with the set `clouds`, replaced as a
+    whole on every change.
+  - **Fail closed:** when the filter cannot be loaded, the cloud gets no
+    WireGuard peer at all.
+  - The kernel needs `kernel/config/system.d/30-firewall.config` (nftables
+    built in), and the image needs the `nftables` package.
+  - Tests: `test-cloudlink-host.py` (ruleset, fail closed) and
+    `test_mesh_firewall_root.py` (real kernel and nft in two network
+    namespaces).
+  - Why: on 2026-11-03 the first hardware run showed that the tunnel
+    opened every NAS service to the server, including a guest share.
 
 **Server side.** The PHP app runs as the web server user and cannot make
 network interfaces. A small root helper next to it,
@@ -274,6 +289,12 @@ occ untrash:tunnel sync --key <wg public> --endpoint <ip:port> --handshakes '{<p
 - When the key or endpoint changed, the app signs a new own record.
 - `peers` are the roster's NAS members (with their roster keys). Apps and
   other clouds are not peers.
+- The helper runs as root on what the web server user's PHP printed. It
+  checks every value before it reaches `wg`, `ip` or the UAPI socket:
+  - the prefix must be a ULA `/48`;
+  - every address must be inside it;
+  - every key must be a WireGuard key.
+  Anything else is dropped (`nextcloud/tests/test_cloud_wg_checks.py`).
 - The helper sets the address (`/48`), one `/128` per NAS and no endpoints:
   the NAS connect out, and WireGuard roaming learns where they are.
 - The app keeps the handshakes for its settings page. It writes them only

@@ -195,9 +195,26 @@ def main():
             check("static traversal refused", a.req("/desk/../../../../etc/passwd")[0] == 404)
             check("login without X-UT refused (CSRF)", a.req("/api/login", {"user": "admin", "password": PW}, csrf=False)[0] == 403)
             check("wrong password 401", a.req("/api/login", {"user": "admin", "password": "x"})[0] == 401)
+
+            def from_ip(ip, path, body):
+                rq = urllib.request.Request(a.base + path, data=json.dumps(body).encode(), headers={"X-UT": "1", "X-Test-Client": ip})
+                try:
+                    with urllib.request.urlopen(rq) as resp:
+                        return resp.status, json.loads(resp.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, json.loads(e.read() or b"{}")
+            st, j = from_ip("8.8.8.8", "/api/login", {"user": "admin", "password": PW})
+            check("plain-HTTP sign-in from the internet refused (403, use HTTPS)", st == 403 and "HTTPS" in j.get("error", ""))
+            check("... reset and setup too", from_ip("8.8.4.4", "/api/reset-admin", {"password": "x"})[0] == 403
+                  and from_ip("2a00:1450:4001::1", "/api/setup", {"password": "x"})[0] == 403
+                  and from_ip("100.64.1.2", "/api/login/app", {"user": "admin"})[0] == 403)
+            check("plain-HTTP sign-in from the home network and the mesh still works", from_ip("192.168.1.50", "/api/login",
+                  {"user": "admin", "password": "x"})[0] == 401 and from_ip("fd12:3456:789a::1", "/api/login", {"user": "admin", "password": "x"})[0] == 401)
             check("admin login", a.req("/api/login", {"user": "admin", "password": PW})[0] == 200)
             check("pc-guest cannot log in", g.req("/api/login", {"user": "pc-guest", "password": PW})[0] == 401)
             check("user login (alice)", u.req("/api/login", {"user": "alice", "password": PW})[0] == 200)
+            st, j = a.req("/api/upnp", {"services": {"HTTP": 8000}})
+            check("UPnP: the Desk over HTTP is never forwarded", st == 400 and "HTTPS" in j.get("error", ""))
             me = a.req("/api/me")[1]
             check("me admin", me["user"] == "admin" and me["admin"] is True)
             check("alice is no admin, overview 403", u.req("/api/overview")[0] == 403)
@@ -634,10 +651,10 @@ def main():
             # UPnP
             st, uj = a.req("/api/upnp")
             check("upnp state: router + external address", st == 200 and uj["external_ip"] == "203.0.113.5" and "HTTP" in uj["names"])
-            check("upnp: duplicate WAN port refused", a.req("/api/upnp", {"services": {"HTTP": 8000, "FTP": 8000}})[0] == 400)
+            check("upnp: duplicate WAN port refused", a.req("/api/upnp", {"services": {"HTTPS": 8443, "FTP": 8443}})[0] == 400)
             check("upnp: unknown service refused", a.req("/api/upnp", {"services": {"CIFS": 445}})[0] == 400)
-            check("upnp saved", a.req("/api/upnp", {"services": {"HTTP": 8000}})[0] == 200 and
-                  json.load(open(r + "/etc/untrash/settings.json"))["upnp"]["services"] == {"HTTP": 8000})
+            check("upnp saved", a.req("/api/upnp", {"services": {"HTTPS": 8443}})[0] == 200 and
+                  json.load(open(r + "/etc/untrash/settings.json"))["upnp"]["services"] == {"HTTPS": 8443})
             # iSCSI (LUN files real, LIO only on the NAS: test-iscsi-host.py)
             check("iscsi: no LUN yet", a.req("/api/iscsi")[1]["luns"] == [])
             check("iscsi: LUN on unknown volume refused", a.req("/api/iscsi/lun", {"name": "l1", "volume": "x", "size_gb": 1})[0] == 400)
@@ -1145,6 +1162,19 @@ def main():
             zb = urllib.request.urlopen(urllib.request.Request(anon.base + lk2["url"], data=b"pw=geheim1")).read()
             zn = zipfile.ZipFile(io.BytesIO(zb)).namelist()
             check("folder link: ZIP with the files", zn == ["Fotos/2025/bild.txt"])
+            st, lk3 = a.req("/api/links/create", {"share": "Fotos", "path": "", "days": 1, "password": "geheim3"})
+
+            def link_try(pw, ip):
+                try:
+                    return urllib.request.urlopen(urllib.request.Request(anon.base + lk3["url"], data=("pw=" + pw).encode(),
+                                                                         headers={"X-Test-Client": ip})).status
+                except urllib.error.HTTPError as e:
+                    return e.code
+            codes = [link_try("falsch%d" % i, "198.51.100.4") for i in range(5)]
+            check("link password: 5 wrong tries, then blocked (429), even the right one", codes == [403] * 5
+                  and link_try("geheim3", "198.51.100.4") == 429)
+            check("... from another address too (per link), with a clear page", link_try("geheim3", "198.51.100.5") == 429)
+            a.req("/api/links/delete", {"token": lk3["token"]})
             check("user sees only own links", len(u.req("/api/links")[1]["links"]) == 1 and len(a.req("/api/links")[1]["links"]) == 2)
             check("user cannot delete another's link", u.req("/api/links/delete", {"token": lk2["token"]})[0] == 404)
             check("no link without access", u.req("/api/links/create", {"share": "geheim", "path": "", "days": 7})[0] in (403, 404))

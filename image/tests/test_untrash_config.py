@@ -605,15 +605,28 @@ with tempfile.TemporaryDirectory() as W:
     r = subprocess.run([UP, "apply"], env=uenv, stdout=subprocess.PIPE, text=True)
     st = json.loads(subprocess.run([UP, "status"], env=uenv, stdout=subprocess.PIPE, text=True).stdout)
     ours = {m["description"]: (m["wan_port"], m["lan_port"]) for m in st["mappings"] if m["ours"]}
-    check("upnp apply: Desk 80 -> WAN 8000, WebDAV 5002, foreign mapping kept", r.returncode == 0 and
-          ours == {"UntrashOS HTTP": (8000, 80), "UntrashOS WEBDAV_HTTP": (5002, 5002)} and any(m["description"] == "foreign" for m in st["mappings"])
-          and st["external_ip"] == "203.0.113.5")
+    check("upnp apply: the stock Desk HTTP forward is NOT made (unencrypted sign-in), WebDAV 5002, foreign mapping kept",
+          r.returncode == 0 and "not forwarded: HTTP" in r.stdout and ours == {"UntrashOS WEBDAV_HTTP": (5002, 5002)}
+          and any(m["description"] == "foreign" for m in st["mappings"]) and st["external_ip"] == "203.0.113.5")
     s3 = json.load(open(env["ZT_SETTINGS"]))
-    s3["upnp"]["services"] = {"HTTP": 8080}
+    s3["upnp"]["services"] = {"HTTPS": 8443}
     json.dump(s3, open(env["ZT_SETTINGS"], "w"))
     subprocess.run([UP, "apply"], env=uenv, stdout=subprocess.PIPE)
     st = json.loads(subprocess.run([UP, "status"], env=uenv, stdout=subprocess.PIPE, text=True).stdout)
-    check("upnp: changed port remapped, removed service unmapped", {m["description"]: m["wan_port"] for m in st["mappings"] if m["ours"]} == {"UntrashOS HTTP": 8080})
+    check("upnp: changed service remapped, removed service unmapped", {m["description"]: m["wan_port"] for m in st["mappings"] if m["ours"]} == {"UntrashOS HTTPS": 8443})
+    # a FritzBox shows the description as "UntrashOS.HTTPS": still ours, so it is removed when switched off
+    os.remove(st_file)
+    denv = dict(uenv, ZT_FAKE_UPNP_DOT="1")
+    subprocess.run([UP, "apply"], env=denv, stdout=subprocess.PIPE)
+    st = json.loads(subprocess.run([UP, "status"], env=denv, stdout=subprocess.PIPE, text=True).stdout)
+    check("upnp (FritzBox names): \"UntrashOS.HTTPS\" counts as ours", [(m["description"], m["service"]) for m in st["mappings"] if m["ours"]]
+          == [("UntrashOS.HTTPS", "HTTPS")])
+    s3["upnp"]["services"] = {}
+    json.dump(s3, open(env["ZT_SETTINGS"], "w"))
+    subprocess.run([UP, "apply"], env=denv, stdout=subprocess.PIPE)
+    st = json.loads(subprocess.run([UP, "status"], env=denv, stdout=subprocess.PIPE, text=True).stdout)
+    check("upnp (FritzBox names): switched off -> the mapping is removed (2026-11-03: it stayed forever)",
+          not [m for m in st["mappings"] if m["ours"]] and any(m["description"] == "foreign" for m in st["mappings"]))
 
     # network name: default "untrash"; Avahi's conflict name is kept (untrash-2), a name of its own never changes
     check("import: stock hostname is not automatic", s["hostname_auto"] is False)

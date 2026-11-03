@@ -13,7 +13,8 @@ if a == ["-l"]:
     for i, (p, w, ip, l, d) in enumerate(st["maps"]):
         print(" %d %s %5d->%s:%-5d '%s' '' 0" % (i, p, w, ip, l, d))
 elif a[:1] == ["-e"] and a[2] == "-a":
-    st["maps"] = [m for m in st["maps"] if m[1] != int(a[5])] + [[a[6], int(a[5]), a[3], int(a[4]), a[1]]]
+    desc = a[1].replace(" ", ".") if os.environ.get("ZT_FAKE_UPNP_DOT") else a[1]     # FritzBox shows "UntrashOS.HTTP"
+    st["maps"] = [m for m in st["maps"] if m[1] != int(a[5])] + [[a[6], int(a[5]), a[3], int(a[4]), desc]]
     print("external 203.0.113.5:%s TCP is redirected to internal %s:%s" % (a[5], a[3], a[4]))
 elif a[:1] == ["-d"]:
     st["maps"] = [m for m in st["maps"] if m[1] != int(a[1])]

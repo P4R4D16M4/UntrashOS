@@ -220,6 +220,33 @@ try:
         lambda: (cpeer("a") or {}).get("allowed") == caddr + "/128" and cpeer("a")["eps"] == ["203.0.113.5:51820"], 20))
     check("... on nas-b too (record through the directory)", wait(lambda: cpeer("b") is not None, 20))
     check("... and nextcloud.mesh in /etc/hosts", wait(lambda: "nextcloud.mesh" in open(NODES["a"]["dir"] + "/hosts").read()))
+    rules = lambda: open(NODES["a"]["dir"] + "/state/nft.ruleset").read() if os.path.exists(NODES["a"]["dir"] + "/state/nft.ruleset") else ""
+    check("firewall: the cloud's address filtered on ut-mesh, only TCP 5002 (and ICMPv6, answers) let through",
+          wait(lambda: caddr in rules()) and 'tcp dport 5002 accept' in rules() and rules().rstrip().endswith("}")
+          and 'ip6 saddr @clouds drop' in rules() and "delete table inet untrash_mesh" in rules())
+    # fail closed: the same state, but nft does not work -> no WireGuard peer for the cloud (NAS peers stay)
+    import importlib.machinery, importlib.util, shutil as _sh
+    fdir = os.path.join(W, "failclosed")
+    _sh.copytree(NODES["a"]["dir"] + "/state", fdir)
+    fenv = {"ZT_MESH_DIR": fdir, "ZT_SIG": SIG, "ZT_MESH_FAKE_WG": fdir + "/wg-fc.json", "ZT_MESH_FAKE_NFT": "",
+            "ZT_MESH_NFT": "/bin/false", "ZT_MESH_HOSTS": fdir + "/hosts"}
+    old_env = {k: os.environ.get(k) for k in fenv}
+    os.environ.update(fenv)
+    try:
+        _l = importlib.machinery.SourceFileLoader("mesh_fc", TOOL)
+        _s = importlib.util.spec_from_loader("mesh_fc", _l)
+        mfc = importlib.util.module_from_spec(_s)
+        _l.exec_module(mfc)
+        mfc.log = lambda m: None
+        mfc.wg_apply(mfc.state())
+        fc_peers = jf(fdir + "/wg-fc.json").get("peers", {})
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("firewall fails -> no tunnel to the cloud (fail closed), the NAS peer stays", ckey not in fc_peers and len(fc_peers) == 1)
     check("status: the cloud's tunnel state (no handshake yet)", wait(lambda: [m for m in cli("a", "status")["members"]
                                                                             if m["node"] == nc][0].get("tunnel", False) is None))
     rr = urllib.request.Request("http://127.0.0.1:%d/v1/offer" % BASE, method="POST", headers={"Content-Type": "application/json"},
@@ -239,6 +266,7 @@ try:
     check("tunnel off (record without wg): the peer goes, the cloud stays a member", wait(
         lambda: cpeer("a") is None and cpeer("b") is None and any(m["node"] == nc for m in cli("a", "status")["members"]), 20))
     check("... and its .mesh name goes", wait(lambda: "nextcloud.mesh" not in open(NODES["a"]["dir"] + "/hosts").read()))
+    check("... and the firewall table is empty again", wait(lambda: caddr not in rules() and "@clouds" not in rules()))
 
     # ---------------------------------------------------------------- cloudlink
     R = os.path.join(W, "root")

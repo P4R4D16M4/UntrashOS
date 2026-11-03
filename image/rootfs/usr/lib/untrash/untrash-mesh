@@ -88,7 +88,7 @@ State: /etc/untrash/mesh/ (node.sec/.pub, wg.key, mesh.json, book.json).
 Test hooks: ZT_MESH_DIR, ZT_MESH_FAKE_WG (no ip/wg; peers in a JSON file),
 ZT_MESH_ADDRMAP (JSON mesh address -> host:port for sync), ZT_MESH_JOIN_HOST,
 ZT_MESH_SYNC_PORT, ZT_MESH_JOIN_PORT, ZT_MESH_ENDPOINTS (own endpoints),
-ZT_SIG, ZT_MESH_TLS_CERT, ZT_MESH_DIR_PULL.
+ZT_SIG, ZT_MESH_TLS_CERT, ZT_MESH_DIR_PULL, ZT_MESH_NFT, ZT_MESH_FAKE_NFT.
 """
 import base64
 import hashlib
@@ -117,6 +117,10 @@ WG_PORT = 51820
 SYNC_PORT = int(E("ZT_MESH_SYNC_PORT", "7340"))
 JOIN_PORT = int(E("ZT_MESH_JOIN_PORT", "7341"))
 IFACE = "ut-mesh"
+NFT = E("ZT_MESH_NFT", "nft")
+# PC tests with the fake WireGuard: the nftables ruleset goes into a file (ZT_MESH_FAKE_NFT="" = the real nft)
+FAKE_NFT = E("ZT_MESH_FAKE_NFT", os.path.join(DIR, "nft.ruleset") if FAKE_WG else "") or None
+CLOUD_PORT = 5002                     # what a cloud tunnel peer may reach: WebDAV and /untrash-cloudlink
 # a state directory of its own (PC tests) keeps every other path inside it too,
 # so a test can never write the PC's /etc/samba or mount under /p-data
 _TESTDIR = DIR if E("ZT_MESH_DIR") else None
@@ -465,12 +469,18 @@ def wg_apply(st):
     peers_now = wg_peers()
     want = {}
     bk = book()
+    clouds = {}
     for k, m in members(st).items():
         rec = bk.get(k) or {}
         w = tunnel_key(m, rec)
         if k == nid or not w:                    # a cloud without a tunnel: directory only
             continue
         want[w] = {"addr": address(mesh["id"], m["pub"]), "eps": rec.get("ep") or m.get("ep") or []}
+        if m.get("kind") == "cloud":
+            clouds[w] = want[w]["addr"]
+    if not fw_apply(set(clouds.values())):
+        for w in clouds:                         # fail closed: no filter, no tunnel to a cloud
+            del want[w]
     if FAKE_WG:
         data = json.load(open(FAKE_WG)) if os.path.exists(FAKE_WG) else {"peers": {}}
         data["iface"] = {"address": address(mesh["id"], pub), "port": WG_PORT}
@@ -504,6 +514,59 @@ def wg_apply(st):
             run(["wg", "set", IFACE, "peer", w, "remove"], check=False)
 
 
+_FW = {}
+
+
+def fw_ruleset(addrs):
+    """nftables: on ut-mesh a cloud tunnel peer reaches only CLOUD_PORT (and
+    ICMPv6, and answers to what this NAS opened); every other service of this
+    NAS (SSH, SMB, the Desk, DNS, mesh sync) stays closed to it.  NAS and app
+    members are not affected.  The table is replaced as a whole."""
+    out = "table inet untrash_mesh\ndelete table inet untrash_mesh\n"
+    if addrs:
+        out += """table inet untrash_mesh {
+	set clouds {
+		type ipv6_addr
+		elements = { %s }
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "%s" ip6 saddr @clouds ct state established,related accept
+		iifname "%s" ip6 saddr @clouds meta l4proto ipv6-icmp accept
+		iifname "%s" ip6 saddr @clouds tcp dport %d accept
+		iifname "%s" ip6 saddr @clouds drop
+	}
+}
+""" % (", ".join(sorted(addrs)), IFACE, IFACE, IFACE, CLOUD_PORT, IFACE)
+    return out
+
+
+def fw_apply(addrs):
+    """Load the filter for these cloud addresses; True when it is in place
+    (or nothing needs filtering).  Loaded only when it changed."""
+    rules = fw_ruleset(addrs)
+    if _FW.get("rules") == rules and _FW.get("ok"):
+        return True
+    if FAKE_NFT:
+        open(FAKE_NFT, "w").write(rules)
+        ok = True
+    else:
+        try:
+            r = subprocess.run([NFT, "-f", "-"], input=rules, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+            ok = r.returncode == 0
+            if not ok and addrs:
+                log("firewall: %s" % r.stdout.strip()[:300])
+        except (OSError, subprocess.TimeoutExpired) as e:
+            ok = False
+            if addrs:
+                log("firewall: %s" % e)
+        ok = ok or not addrs                     # nothing to filter: no nft is fine
+    if not ok and _FW.get("rules") != rules:
+        log("firewall not in place: no tunnel to the cloud members")
+    _FW.update(rules=rules, ok=ok)
+    return ok
+
+
 def pick_endpoint(eps, current):
     """Rotate through a peer's endpoints while there is no handshake: LAN ones
     of a subnet this node is in first, then the rest."""
@@ -528,6 +591,7 @@ def pick_endpoint(eps, current):
 
 
 def wg_down():
+    fw_apply(set())
     if FAKE_WG:
         if os.path.exists(FAKE_WG):
             os.remove(FAKE_WG)

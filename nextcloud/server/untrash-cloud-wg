@@ -45,9 +45,11 @@ import signal
 import socket
 import subprocess
 import sys
+import re
 import time
 
 IFACE = "ut-mesh"
+WG_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
 CHAIN = "UNTRASH-MESH-IN"
 FAKE = os.environ.get("UT_CLOUDWG_FAKE")
 WG_GO = None          # the wireguard-go process, when this helper started one
@@ -276,6 +278,32 @@ def down():
 
 # ------------------------------------------------------------ rounds
 
+def checked(r):
+    """The app's answer, only as far as it is well-formed: this helper runs as
+    root on what the web server user's PHP printed, so every key and address
+    is checked before it reaches wg, ip or the UAPI socket.  The mesh prefix
+    must be a ULA /48, every address inside it, every key a WireGuard key."""
+    try:
+        net = ipaddress.IPv6Network(str(r["prefix"]))
+        own = ipaddress.IPv6Address(str(r["address"]))
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("the app's answer has no valid mesh prefix or address")
+    if net.prefixlen != 48 or not net.subnet_of(ipaddress.IPv6Network("fd00::/8")) or own not in net:
+        raise RuntimeError("mesh prefix %s / address %s refused" % (net, own))
+    peers = []
+    for p in r.get("peers") or []:
+        try:
+            a = ipaddress.IPv6Address(str(p.get("address")))
+        except (AttributeError, ValueError):
+            log("peer refused: bad address")
+            continue
+        if a not in net or a == own or not WG_RE.match(str(p.get("wg"))):
+            log("peer refused: %r" % str(p.get("node"))[:16])
+            continue
+        peers.append({"node": str(p.get("node"))[:16], "wg": p["wg"], "address": str(a)})
+    return {"mesh": r["mesh"], "address": str(own), "prefix": str(net), "peers": peers}
+
+
 def round_(a, keyfile, pub, ep):
     r = occ(a.occ, "untrash:tunnel", "sync", "--key", pub, "--endpoint", ep, "--handshakes", json.dumps(handshakes()))
     if "error" in r:
@@ -283,6 +311,7 @@ def round_(a, keyfile, pub, ep):
     if not r.get("mesh"):
         down()                     # not (or no longer) in a mesh
         return r
+    r = checked(r)
     apply(r, keyfile, a.port, a.wireguard_go, a.firewall)
     return r
 

@@ -1180,9 +1180,10 @@ VIEWS.network = async b => {
   api('upnp').then(u => {
     const names = { HTTP: 'Untrash Desk (HTTP)', HTTPS: 'Untrash Desk (HTTPS)', FTP: 'FTP', SSH: 'SSH', WEBDAV_HTTP: 'WebDAV', WEBDAV_HTTPS: 'WebDAV (HTTPS)', WEBPUBLISHING_HTTP: 'Web Publishing', MEDIASERVER: 'Media server' };
     $('#upnp', b).innerHTML = `<p class="ut-faint">${u.router ? 'Router: ' + esc(u.router) + ' · external address ' + esc(u.external_ip || '?') : 'No UPnP router found.'}</p>
-      <div class="ut-callout ut-callout--warn"><div>Forwarded services are reachable from the internet.</div></div>
-      <table class="ut-table"><thead><tr><th>Service</th><th>WAN port (empty = off)</th><th>at the router</th></tr></thead><tbody>${u.names.map(n => { const m = (u.mappings || []).find(x => x.ours && x.description.endsWith(' ' + n));
-        return `<tr><td>${esc(names[n] || n)}</td><td><input class="ut-input" data-upnp="${n}" value="${u.services[n] || ''}" inputmode="numeric" style="max-width:110px"></td><td>${m ? '<span class="ut-pill ut-pill--ok">' + m.wan_port + '</span>' : '–'}</td></tr>`; }).join('')}</tbody></table>
+      <div class="ut-callout ut-callout--warn"><div>Forwarded services are reachable from the internet. Over FTP, WebDAV and Web Publishing without HTTPS, passwords cross the internet unencrypted: forward only HTTPS services.</div></div>
+      <table class="ut-table"><thead><tr><th>Service</th><th>WAN port (empty = off)</th><th>at the router</th></tr></thead><tbody>${u.names.map(n => { const m = (u.mappings || []).find(x => x.ours && x.service === n);
+        return n === 'HTTP' ? `<tr><td>${esc(names[n])}</td><td class="ut-faint">never forwarded: the sign-in would be unencrypted</td><td>${m ? '<span class="ut-pill ut-pill--danger">' + m.wan_port + '</span>' : '–'}</td></tr>`
+          : `<tr><td>${esc(names[n] || n)}</td><td><input class="ut-input" data-upnp="${n}" value="${u.services[n] || ''}" inputmode="numeric" style="max-width:110px"></td><td>${m ? '<span class="ut-pill ut-pill--ok">' + m.wan_port + '</span>' : '–'}</td></tr>`; }).join('')}</tbody></table>
       <button class="ut-btn" id="upsave">Save forwardings</button>`;
     $('#upsave', b).onclick = () => save('upnp', { services: Object.fromEntries($$('[data-upnp]', b).filter(x => x.value.trim()).map(x => [x.dataset.upnp, +x.value])) }, 'network');
   }).catch(e => { $('#upnp', b).textContent = e.message; });
