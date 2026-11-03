@@ -84,7 +84,7 @@ State: /etc/untrash/mesh/ (node.sec/.pub, wg.key, mesh.json, book.json).
 Test hooks: ZT_MESH_DIR, ZT_MESH_FAKE_WG (no ip/wg; peers in a JSON file),
 ZT_MESH_ADDRMAP (JSON mesh address -> host:port for sync), ZT_MESH_JOIN_HOST,
 ZT_MESH_SYNC_PORT, ZT_MESH_JOIN_PORT, ZT_MESH_ENDPOINTS (own endpoints),
-ZT_SIG.
+ZT_SIG, ZT_MESH_TLS_CERT.
 """
 import base64
 import hashlib
@@ -123,6 +123,7 @@ FAKE_ACCOUNTS = E("ZT_MESH_FAKE_ACCOUNTS")  # PC test: Samba/Unix accounts recor
 FAKE_DRBD = E("ZT_MESH_FAKE_DRBD")          # PC test: DRBD, loop devices and sizes in a JSON file
 DRBDADM = "/usr/lib/drbd/drbdadm-84"        # the kernel has DRBD 8.4 (in-tree); drbd-utils 9 ships its tools there
 MIRROR_META = E("ZT_MESH_MIRROR_META", os.path.join(DIR, "mirror") if E("ZT_MESH_DIR") else "/state/mirror")
+TLS_CERT = E("ZT_MESH_TLS_CERT", os.path.join(_TESTDIR, "tls.crt") if _TESTDIR else "/etc/untrash/tls/untrash.crt")  # untrash-tls
 HOSTS = E("ZT_MESH_HOSTS", os.path.join(DIR, "hosts") if E("ZT_MESH_DIR") else "/etc/hosts")
 PROTO = 1
 LOCK = threading.RLock()
@@ -330,6 +331,30 @@ def router_public(ext):
     return ip.version == 4 and not any(ip in n for n in NOT_PUBLIC)
 
 
+_PIN = {}
+
+
+def tls_pin():
+    """"sha256//<base64>" of this node's TLS public key (SPKI, as curl's
+    CURLOPT_PINNEDPUBLICKEY takes it), None without a certificate.  In the
+    signed record, so a member that trusts this node's key can trust its
+    self-signed HTTPS too (a Nextcloud reaching untrash-cloudlink on 5003)."""
+    try:
+        m = os.stat(TLS_CERT).st_mtime_ns
+    except OSError:
+        return None
+    if _PIN.get("m") != m:
+        pem = subprocess.run(["openssl", "x509", "-in", TLS_CERT, "-pubkey", "-noout"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True).stdout
+        body = "".join(l for l in pem.splitlines() if l and not l.startswith("-----"))
+        try:
+            spki = base64.b64decode(body, validate=True)
+        except ValueError:
+            spki = b""
+        _PIN.update(m=m, v="sha256//" + base64.b64encode(hashlib.sha256(spki).digest()).decode() if spki else None)
+    return _PIN["v"]
+
+
 def own_record(st, extra=()):
     """This node's signed record; a new seq only when the endpoints changed."""
     nid, pub, wg = identity()
@@ -352,10 +377,14 @@ def own_record(st, extra=()):
     eps = list(dict.fromkeys(local_endpoints() + public + list(extra)))
     cur = book().get(nid)
     name = st.get("name") or default_name()      # never None vs "": that made a new record every tick (untrash-2)
-    if cur and cur.get("ep") == eps and cur.get("name") == name and now - cur.get("time", 0) < 6 * 3600:
+    pin = tls_pin()
+    if cur and cur.get("ep") == eps and cur.get("name") == name and cur.get("tls") == pin and now - cur.get("time", 0) < 6 * 3600:
         return cur, False
-    rec = sign({"type": "node", "proto": PROTO, "node": nid, "pub": pub, "wg": wg, "name": name,
-                "ep": eps, "seq": (cur or {}).get("seq", 0) + 1, "time": int(now)})
+    rec = {"type": "node", "proto": PROTO, "node": nid, "pub": pub, "wg": wg, "name": name,
+           "ep": eps, "seq": (cur or {}).get("seq", 0) + 1, "time": int(now)}
+    if pin:
+        rec["tls"] = pin
+    rec = sign(rec)
     return rec, True
 
 

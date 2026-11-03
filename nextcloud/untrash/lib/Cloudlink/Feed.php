@@ -65,7 +65,7 @@ class Feed {
         $res = ['t' => time(), 'ok' => false];
         try {
             $q = '/v1/changes?' . http_build_query(['since' => (string)($nas->cursor ?? ''), 'wait' => $wait]);
-            $ch = $this->client->get($nas, $q, $wait + 30);
+            $ch = $this->client->get($nas, $q, $wait + 30, $this->mesh->tlsPin($node));
             $host = parse_url($nas->base, PHP_URL_HOST) ?: '';
             $n = 0;
             foreach ($ch['rescan'] ?? [] as $share) {

@@ -332,14 +332,29 @@ class Mesh {
             $own = $this->sign((object)['type' => 'node', 'proto' => self::PROTO, 'node' => $nid, 'pub' => $pub, 'wg' => '',
                                         'name' => $name, 'ep' => [], 'seq' => 1, 'time' => time()]);
             $this->mergeLocked(array_merge(is_array($ans->items ?? null) ? $ans->items : [], [$own]));
-            // the inviting NAS: its change feed on the WebDAV port of the address the invitation named
+            // the inviting NAS: its change feed on the WebDAV port of the address the invitation named;
+            // HTTPS (5003) when its record pins its TLS key, plain HTTP (5002) for an older NAS
             $nas = new \stdClass();
             $h = (string)$inv->h[0];
-            $nas->{$roster->by} = (object)['base' => 'http://' . (strpos($h, ':') !== false ? '[' . $h . ']' : $h) . ':5002/untrash-cloudlink',
+            $host = strpos($h, ':') !== false ? '[' . $h . ']' : $h;
+            $nas->{$roster->by} = (object)['base' => $this->tlsPin((string)$roster->by) ? 'https://' . $host . ':5003/untrash-cloudlink'
+                                                     : 'http://' . $host . ':5002/untrash-cloudlink',
                                            'verify' => true, 'cursor' => ''];
             $this->save('nas.json', $nas);
         });
         return $this->status();
+    }
+
+    /**
+     * The TLS key pin of a member ("sha256//<base64>", curl's
+     * CURLOPT_PINNEDPUBLICKEY form) from its signed record, or null.  The
+     * record is signed by the member's node key, which the roster vouches
+     * for: its self-signed HTTPS needs no certificate authority.
+     */
+    public function tlsPin(string $node): ?string {
+        $rec = $this->load('book.json', new \stdClass())->$node ?? null;
+        $pin = $rec->tls ?? null;
+        return is_string($pin) && preg_match('#^sha256//[A-Za-z0-9+/]{43}=$#', $pin) ? $pin : null;
     }
 
     public function leave(): void {
@@ -368,6 +383,7 @@ class Mesh {
             $out['members'][] = ['node' => $k, 'name' => $rec->name ?? $m->name ?? $k, 'kind' => $m->kind ?? 'nas',
                                  'role' => $m->role ?? 'member', 'self' => $k === $nid, 'endpoints' => $rec->ep ?? [],
                                  'seen' => $rec->time ?? null,
+                                 'pinned' => isset($rec->tls),
                                  'feed' => $n ? ['base' => $n->base, 'verify' => $n->verify, 'last' => $n->last ?? null] : null];
         }
         return $out;

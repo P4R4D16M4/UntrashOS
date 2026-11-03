@@ -134,18 +134,21 @@ directory).
      `getUpdater()->update/remove` on every WebDAV external storage whose URL
      is the NAS and whose folder is `webdav/<share>`. A rescan does one
      recursive scan.
-   - Test: `make test-nextcloud APACHEROOT=…` with Docker
-     `nextcloud:25-apache` and the real NAS services (untrash-mesh,
-     untrash-cloudlink, Apache WebDAV), 20 checks.
+   - Test: `make test-nextcloud APACHEROOT=… [NC_IMAGE=…]` with the real NAS
+     services (untrash-mesh, untrash-cloudlink, Apache WebDAV and HTTPS),
+     24 checks. It passes on `nextcloud:25-apache` and `nextcloud:30-apache`
+     (2026-11-03), including the background job (cron.php).
+   - HTTPS to the NAS uses the TLS key pin from the NAS's signed mesh record
+     (cloud-api.md §3), with no certificate authority and no trust on first
+     use.
    - Decided instead of an own storage backend: the built-in WebDAV backend
      is used, and the app only finds its mounts. That is less code, and an
      existing mount keeps working without the app.
    - Open:
-     - the background job itself (only `occ untrash:feed` is tested);
-     - newer Nextcloud versions (28+);
      - user-created external storages (only admin mounts are followed);
-     - a self-signed NAS certificate can only be accepted with "check the
-       HTTPS certificate" off, there is no pinning yet.
+     - the WebDAV external storage itself over HTTPS still needs the NAS
+       certificate in Nextcloud's trust store (`occ security:certificates:import`):
+       the pin covers untrash-cloudlink, not the file access.
 3. Dashboard widget, bin restore, backup state, mesh server member.
 4. File sidebar (two UI paths), "load URL to NAS".
 5. App store publication (needs a Nextcloud app signing certificate and the

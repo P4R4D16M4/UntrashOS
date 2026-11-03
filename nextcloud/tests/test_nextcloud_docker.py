@@ -127,6 +127,8 @@ try:
     check("Nextcloud container installed and answering", wait(lambda: json.load(urllib.request.urlopen(
         NC + "/status.php", timeout=5)).get("installed") is True, 240))
     occ("config:system:set", "overwrite.cli.url", "--value", NC)
+    occ("config:system:set", "has_internet_connection", "--value", "false", "--type", "boolean")   # cron.php: no app store
+    occ("config:system:set", "appstoreenabled", "--value", "false", "--type", "boolean")
     docker("exec", NAME, "sh", "-c", "rm -rf /var/www/html/custom_apps/untrash && cp -r /untrash-app /var/www/html/custom_apps/untrash"
            " && chown -R www-data: /var/www/html/custom_apps/untrash")
     occ("app:enable", "files_external")
@@ -152,13 +154,18 @@ try:
     nasdir = os.path.join(W, "nas")
     os.makedirs(nasdir)
     open(nasdir + "/hosts", "w").write("")
-    jp, sp, ap, cp = free_port(), free_port(), free_port(), free_port()
+    jp, sp, ap, cp, tp1, tp2 = (free_port() for _ in range(6))
+    # TLS: the NAS's certificate (its key pin goes into its signed record) and an impostor's
+    for n in ("nas", "other"):
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=" + n,
+                        "-keyout", "%s/%s.key" % (W, n), "-out", "%s/%s.crt" % (W, n)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     nenv = dict(os.environ, ZT_MESH_DIR=nasdir + "/state", ZT_SIG=SIG, ZT_MESH_FAKE_WG=nasdir + "/wg.json",
                 ZT_MESH_ADDRMAP="{}", ZT_MESH_JOIN_HOST="127.0.0.1", ZT_MESH_ENDPOINTS="192.168.1.10:51820",
                 ZT_MESH_SYNC_PORT=str(sp), ZT_MESH_JOIN_PORT=str(jp), ZT_MESH_HOSTS=nasdir + "/hosts", ZT_MESH_TICK="0.5",
                 ZT_MESH_DIR_EVERY="1", ZT_UPNPC="/nonexistent", ZT_MESH_SMB=nasdir + "/smb.conf", ZT_MESH_PDATA=nasdir + "/p",
                 ZT_MESH_FAKE_MOUNT=nasdir + "/m.json", ZT_MESH_FAKE_ACCOUNTS=nasdir + "/a.json", ZT_MESH_FAKE_DRBD=nasdir + "/d.json",
-                ZT_MESH_HOST_MNT=nasdir + "/nohost")
+                ZT_MESH_HOST_MNT=nasdir + "/nohost", ZT_MESH_TLS_CERT=W + "/nas.crt")
 
     def mesh(*a):
         r = subprocess.run([MESH] + list(a), env=nenv, stdout=subprocess.PIPE, text=True)
@@ -184,13 +191,16 @@ try:
                                   stdout=open(W + "/cloudlink.log", "w"), stderr=subprocess.STDOUT))
     # Apache: WebDAV on the share (no auth: the rights are test-webdav-host.py's subject) + the pass-through
     os.makedirs(W + "/run")
-    mods = ["mpm_event", "authz_core", "alias", "mime", "dav", "dav_fs", "dav_lock", "proxy", "proxy_http", "dir"]
+    mods = ["mpm_event", "authz_core", "alias", "mime", "dav", "dav_fs", "dav_lock", "proxy", "proxy_http", "dir", "ssl", "socache_shmcb"]
     conf = ["ServerRoot " + W, "ServerName localhost", "PidFile %s/run/httpd.pid" % W, "Mutex file:%s/run default" % W,
             "DefaultRuntimeDir %s/run" % W, "ErrorLog %s/apache.log" % W, "TypesConfig /dev/null", "Listen 127.0.0.1:%d" % ap]
     conf += ["LoadModule %s_module %s/usr/lib/apache2/modules/mod_%s.so" % (m, AR, m) for m in mods]
     conf += ["DavLockDB %s/run/DavLock" % W, "Alias /webdav/Photos " + share, "<Directory %s>" % share, "  Require all granted",
              "</Directory>", "<Location /webdav/Photos>", "  Dav On", "</Location>",
              "ProxyPass /untrash-cloudlink/ http://127.0.0.1:%d/ timeout=180" % cp]
+    for port, n in ((tp1, "nas"), (tp2, "other")):        # HTTPS like the NAS's port 5003, and an impostor
+        conf += ["Listen 127.0.0.1:%d" % port, "<VirtualHost 127.0.0.1:%d>" % port, "  SSLEngine on",
+                 "  SSLCertificateFile %s/%s.crt" % (W, n), "  SSLCertificateKeyFile %s/%s.key" % (W, n), "</VirtualHost>"]
     open(W + "/httpd.conf", "w").write("\n".join(conf) + "\n")
     procs.append(subprocess.Popen([AR + "/usr/sbin/apache2", "-DFOREGROUND", "-f", W + "/httpd.conf"],
                                   env=dict(os.environ, LD_LIBRARY_PATH=AR + "/usr/lib/x86_64-linux-gnu")))
@@ -250,6 +260,27 @@ try:
     st = json.loads(occ("untrash:status"))
     last = [m for m in st["members"] if m["node"] == nas["node"]][0]["feed"]["last"]
     check("status shows the last feed round", last and last["ok"])
+
+    # HTTPS with the key pin from the NAS's signed record (self-signed certificate, no CA)
+    check("the NAS's record pins its TLS key", [m for m in st["members"] if m["node"] == nas["node"]][0].get("pinned") is True)
+
+    def https_round(port, name):
+        occ("untrash:nas", nas["node"], "https://127.0.0.1:%d/untrash-cloudlink" % port)
+        open(share + "/" + name, "w").write(name)
+        open(feed, "a").write(share + "/" + name + "\n")
+        return json.loads(occ("untrash:feed", "--once").strip().splitlines()[-1])[nas["node"]]
+    r = https_round(tp1, "tls.jpg")
+    check("HTTPS to the NAS with the pinned key works (self-signed, check stays on)", r["ok"] and "tls.jpg" in nc_dav("NAS"))
+    r = https_round(tp2, "mitm.jpg")
+    check("HTTPS to another key is refused, with a clear message", not r["ok"] and "mitm.jpg" not in nc_dav("NAS")
+          and "not the one the NAS signed" in r.get("error", ""))
+    occ("untrash:nas", nas["node"], "https://127.0.0.1:%d/untrash-cloudlink" % tp1)
+
+    # the background job (cron.php runs the due jobs; the feed job is due once enabled)
+    open(share + "/cron.jpg", "w").write("cron")
+    open(feed, "a").write(share + "/cron.jpg\n")
+    docker("exec", "-u", "www-data", NAME, "php", "-f", "/var/www/html/cron.php")
+    check("background job (cron.php) applies the feed", "cron.jpg" in nc_dav("NAS"))
 
     # settings page and controller (admin session)
     import http.cookiejar

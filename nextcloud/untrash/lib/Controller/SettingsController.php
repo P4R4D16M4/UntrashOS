@@ -76,7 +76,7 @@ class SettingsController extends Controller {
             if (!$nas) {
                 throw new MeshException($this->l->t('No address for this NAS yet.'));
             }
-            return $this->client->get($nas, '/v1/info', 15);
+            return $this->client->get($nas, '/v1/info', 15, $this->mesh->tlsPin($node));
         });
     }
 

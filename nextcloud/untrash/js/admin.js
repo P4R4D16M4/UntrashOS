@@ -50,7 +50,8 @@
 			const f = m.feed || {}, l = f.last || null;
 			return `<div class="untrash-feed" data-node="${esc(m.node)}"><h4>${esc(m.name)}</h4>
 				<p><input type="text" class="untrash-base" value="${esc(f.base || '')}" placeholder="http://NAS:5002/untrash-cloudlink">
-				<label><input type="checkbox" class="untrash-verify"${f.verify === false ? '' : ' checked'}> ${esc(T('check the HTTPS certificate'))}</label></p>
+				${m.pinned && /^https:/i.test(f.base || '') ? `<input type="checkbox" class="untrash-verify" checked hidden><span class="untrash-ok">${esc(T('HTTPS key pinned through the mesh'))}</span>`
+					: `<label><input type="checkbox" class="untrash-verify"${f.verify === false ? '' : ' checked'}> ${esc(T('check the HTTPS certificate'))}</label>`}</p>
 				<p><button class="untrash-save">${esc(T('Save'))}</button> <button class="untrash-test"${f.base ? '' : ' disabled'}>${esc(T('Test'))}</button>
 				<span class="${l && !l.ok ? 'untrash-err' : 'untrash-ok'}">${l ? esc(l.ok ? T('last round {time}: {changes} changes', { time: when(l.t), changes: l.changes }) : l.error) : ''}</span></p></div>`;
 		}).join('');

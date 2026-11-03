@@ -17,6 +17,10 @@ T = {
     "For each NAS, the address of its WebDAV port with /untrash-cloudlink. External storages (WebDAV) whose URL is that NAS and whose folder is webdav/<share> are then updated path by path; set their \"Check for changes\" to \"Never\". The changes arrive every 5 minutes with the background jobs, or within seconds while \"occ untrash:feed\" runs as a service.":
         ("Für jedes NAS die Adresse seines WebDAV-Ports mit /untrash-cloudlink. Externe Speicher (WebDAV), deren URL dieses NAS ist und deren Ordner webdav/<Freigabe> ist, werden dann Pfad für Pfad aktualisiert; bei ihnen \"Auf Änderungen prüfen\" auf \"Nie\" stellen. Die Änderungen kommen alle 5 Minuten mit den Hintergrundjobs, oder innerhalb von Sekunden, solange \"occ untrash:feed\" als Dienst läuft.",
          "Pour chaque NAS, l'adresse de son port WebDAV avec /untrash-cloudlink. Les stockages externes (WebDAV) dont l'URL est ce NAS et dont le dossier est webdav/<partage> sont alors mis à jour chemin par chemin ; réglez leur « Rechercher les modifications » sur « Jamais ». Les modifications arrivent toutes les 5 minutes avec les tâches de fond, ou en quelques secondes tant que « occ untrash:feed » tourne comme service."),
+    "The HTTPS key at this address is not the one the NAS signed in the mesh. Check the address; if the NAS made a new certificate, wait until its new mesh record has arrived.":
+        ("Der HTTPS-Schlüssel unter dieser Adresse ist nicht der, den das NAS im Mesh signiert hat. Adresse prüfen; hat das NAS ein neues Zertifikat erstellt, warten, bis sein neuer Mesh-Eintrag angekommen ist.",
+         "La clé HTTPS à cette adresse n'est pas celle que le NAS a signée dans le mesh. Vérifiez l'adresse ; si le NAS a créé un nouveau certificat, attendez que sa nouvelle fiche du mesh soit arrivée."),
+    "HTTPS key pinned through the mesh": ("HTTPS-Schlüssel über das Mesh gepinnt", "Clé HTTPS épinglée par le mesh"),
     "Invitation": ("Einladung", "Invitation"),
     "Join": ("Beitreten", "Adhérer"),
     "Join a mesh": ("Einem Mesh beitreten", "Adhérer à un mesh"),
