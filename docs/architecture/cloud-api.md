@@ -120,7 +120,21 @@ The UntrashApp can use the same endpoint with its own node key (planned).
   TLS certificate;
 - or `http://<NAS>:5002/untrash-cloudlink` on the LAN or over the mesh.
 
-Apache passes it to the service on the loopback interface (port 7342). WebDAV must be switched on: the cloud
+**TLS key pin.** The NAS certificate is self-signed (`untrash-tls`). A NAS
+puts the pin of its TLS public key into its signed node record:
+`"tls": "sha256//<base64 of sha256(SubjectPublicKeyInfo DER)>"`, the form
+curl's `CURLOPT_PINNEDPUBLICKEY` takes.
+- The cloud trusts the record because it trusts the NAS's node key through
+  the roster. It then connects to `https://` with the pin instead of
+  certificate authorities.
+- Another key at that address fails, so there is no trust on first use.
+- A new certificate gives a new record (higher `seq`).
+- Records without `tls` come from an older NAS: the cloud falls back to the
+  normal certificate check.
+- On joining, the cloud takes `https://<h>:5003` when the inviting NAS's
+  record has a pin, and `http://<h>:5002` when it has none.
+
+Apache passes it to `localhost:7342` (untrash-cloudlink listens on loopback only). WebDAV must be switched on: the cloud
 needs it for the files anyway. The service runs only while a cloud is linked.
 
 ### Signed requests

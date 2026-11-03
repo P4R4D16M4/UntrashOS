@@ -21,10 +21,13 @@ storage support* for the feed.
 2. Here: **Administration settings → UntrashOS**. Paste the invitation and
    choose **Join**. This server must reach the NAS while it joins. The same
    works with `occ untrash:join <invitation> --name <name>`.
-3. **Change feed.** Enter the address of the NAS WebDAV port, for example
-   `http://nas.local:5002/untrash-cloudlink` or
-   `https://nas.local:5003/untrash-cloudlink`. **Test** shows the shares the
-   NAS lets this Nextcloud follow.
+3. **Change feed.** Joining fills in the address of the NAS WebDAV port,
+   for example `https://nas.local:5003/untrash-cloudlink`. Change it if this
+   server reaches the NAS under another name. **Test** shows the shares the NAS
+   lets this Nextcloud follow.
+   - Over HTTPS the NAS's self-signed certificate is checked against the key
+     pin in its signed mesh record ("HTTPS key pinned through the mesh").
+   - Another key at that address is refused.
 4. **External storage**, one per share:
    - Backend **WebDAV**.
    - URL: the NAS (for example `nas.local:5002`).

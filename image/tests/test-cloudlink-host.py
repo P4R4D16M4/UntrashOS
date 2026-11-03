@@ -197,6 +197,16 @@ try:
         code = e.code
     check("reference directory refuses a request with a wrong signature", code == 403)
 
+    # TLS pin: a's record names its HTTPS key (curl CURLOPT_PINNEDPUBLICKEY form)
+    crt = NODES["a"]["dir"] + "/state/tls.crt"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=t",
+                    "-keyout", NODES["a"]["dir"] + "/tls.key", "-out", crt], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    der = subprocess.run("openssl x509 -in %s -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | base64"
+                         % crt, shell=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+    check("TLS pin in a's signed record (= openssl SPKI sha256)", wait(lambda: jf(NODES["a"]["dir"] + "/state/book.json")
+                                                                       .get(na, {}).get("tls") == "sha256//" + der))
+    check("... and it reaches the directory", wait(lambda: jf(CD + "/state/book.json").get(na, {}).get("tls") == "sha256//" + der))
+
     # ---------------------------------------------------------------- cloudlink
     R = os.path.join(W, "root")
     for s in ("Photos", "Music"):

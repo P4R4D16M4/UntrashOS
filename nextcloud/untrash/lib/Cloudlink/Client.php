@@ -25,17 +25,30 @@ class Client {
         $this->clients = $clients;
     }
 
-    public function get(\stdClass $nas, string $path, int $timeout = 30): array {
+    /**
+     * $pin: the NAS's TLS key pin from its signed mesh record.  With an
+     * https address and a pin, the certificate is checked against the pin
+     * instead of the certificate authorities (the NAS certificate is
+     * self-signed); a different key fails the request.
+     */
+    public function get(\stdClass $nas, string $path, int $timeout = 30, ?string $pin = null): array {
         [$nid] = $this->mesh->identity();
         $ts = (string)time();
         $nonce = bin2hex(random_bytes(16));
         $sig = $this->mesh->signBytes(implode("\n", ['UTCL1', 'GET', $path, $ts, $nonce, hash('sha256', '')]));
         try {
-            $r = $this->clients->newClient()->get(rtrim($nas->base, '/') . $path, [
-                'headers' => ['Authorization' => "UntrashCloud node=$nid, ts=$ts, nonce=$nonce, sig=$sig"],
-                'timeout' => $timeout, 'verify' => (bool)($nas->verify ?? true), 'http_errors' => false,
-                'nextcloud' => ['allow_local_address' => true]]);
+            $opt = ['headers' => ['Authorization' => "UntrashCloud node=$nid, ts=$ts, nonce=$nonce, sig=$sig"],
+                    'timeout' => $timeout, 'verify' => (bool)($nas->verify ?? true), 'http_errors' => false,
+                    'nextcloud' => ['allow_local_address' => true]];
+            if ($pin !== null && stripos($nas->base, 'https://') === 0) {
+                $opt['verify'] = false;
+                $opt['curl'] = [CURLOPT_PINNEDPUBLICKEY => $pin];
+            }
+            $r = $this->clients->newClient()->get(rtrim($nas->base, '/') . $path, $opt);
         } catch (\Exception $e) {
+            if (isset($opt['curl']) && strpos($e->getMessage(), 'cURL error 90') !== false) {   // CURLE_SSL_PINNEDPUBKEYNOTMATCH
+                throw new MeshException($this->l->t('The HTTPS key at this address is not the one the NAS signed in the mesh. Check the address; if the NAS made a new certificate, wait until its new mesh record has arrived.'));
+            }
             throw new MeshException($this->l->t('The NAS is not reachable: %s', [$e->getMessage()]));
         }
         $body = json_decode((string)$r->getBody(), true);
