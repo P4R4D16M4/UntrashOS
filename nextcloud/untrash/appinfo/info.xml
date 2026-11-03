@@ -10,7 +10,7 @@
 * **Change feed:** a linked UntrashOS NAS tells this Nextcloud which files changed in its shares. External storages (WebDAV) on that NAS are updated path by path instead of being scanned, so the NAS disks can sleep.
 
 Contract: docs/architecture/cloud-api.md in the UntrashOS repository.]]></description>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <licence>agpl</licence>
     <author>UntrashOS</author>
     <namespace>Untrash</namespace>

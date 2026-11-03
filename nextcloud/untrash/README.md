@@ -61,6 +61,13 @@ WantedBy=multi-user.target
 | `occ untrash:nas NODE URL [--insecure]` | feed address of a NAS |
 | `occ untrash:feed [--once] [--wait S]` | apply the change feed (loop, or one round) |
 
+## Translations
+
+German (`de`, `de_DE`) and French. The source is
+`nextcloud/l10n/catalog.py` in the UntrashOS repository; `nextcloud/l10n/build.py`
+writes `l10n/`. A new UI text needs an entry there (`build.py --check` runs in
+`make test`).
+
 ## Tests
 
 `nextcloud/tests/test_nextcloud_docker.py APACHEROOT [IMAGE]` tests this app

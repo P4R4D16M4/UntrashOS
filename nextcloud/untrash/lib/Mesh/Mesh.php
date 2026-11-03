@@ -8,6 +8,7 @@ use OCP\Files\IAppData;
 use OCP\Files\NotFoundException;
 use OCP\Files\SimpleFS\ISimpleFolder;
 use OCP\Http\Client\IClientService;
+use OCP\IL10N;
 use OCP\IURLGenerator;
 use OCP\Lock\ILockingProvider;
 use OCP\Security\ICrypto;
@@ -32,9 +33,11 @@ class Mesh {
     private ILockingProvider $locking;
     private IClientService $clients;
     private IURLGenerator $urls;
+    private IL10N $l;
 
     public function __construct(IAppData $appData, ICrypto $crypto, ILockingProvider $locking, IClientService $clients,
-                                IURLGenerator $urls) {
+                                IURLGenerator $urls, IL10N $l) {
+        $this->l = $l;
         $this->appData = $appData;
         $this->crypto = $crypto;
         $this->locking = $locking;
@@ -260,17 +263,17 @@ class Mesh {
         $inv = Canon::b64urlDecode($text);
         if (!($inv instanceof \stdClass) || ($inv->v ?? 0) !== self::PROTO || !is_array($inv->h ?? null) || !$inv->h
             || !is_string($inv->s ?? null) || !preg_match('/^[0-9a-f]{32}$/', $inv->s)) {
-            throw new MeshException('This is not an UntrashMesh invitation.');
+            throw new MeshException($this->l->t('This is not an UntrashMesh invitation.'));
         }
         if (($inv->k ?? '') !== 'cloud') {
-            throw new MeshException('This invitation is not for a Nextcloud. On the NAS choose UntrashMesh → Connect a Nextcloud.');
+            throw new MeshException($this->l->t('This invitation is not for a Nextcloud. On the NAS choose UntrashMesh → Connect a Nextcloud.'));
         }
         if (time() > (int)($inv->e ?? 0)) {
-            throw new MeshException('The invitation has expired.');
+            throw new MeshException($this->l->t('The invitation has expired.'));
         }
         $st = $this->load('mesh.json', null);
         if ($st && isset($st->mesh)) {
-            throw new MeshException('This Nextcloud is in a mesh already. Leave it first.');
+            throw new MeshException($this->l->t('This Nextcloud is in a mesh already. Leave it first.'));
         }
         [$nid, $pub] = $this->identity();
         $name = self::safeName($name);
@@ -293,7 +296,7 @@ class Mesh {
                     continue;
                 }
                 if ($r->getStatusCode() === 403) {
-                    throw new MeshException('The NAS refused the invitation: it was used already, or it is not for a Nextcloud.');
+                    throw new MeshException($this->l->t('The NAS refused the invitation: it was used already, or it is not for a Nextcloud.'));
                 }
                 if ($r->getStatusCode() === 200) {
                     $ans = json_decode((string)$r->getBody());
@@ -309,18 +312,18 @@ class Mesh {
             }
         }
         if (!($ans instanceof \stdClass)) {
-            throw new MeshException('The NAS is not reachable (' . $last . '). It must be reachable from this server while the Nextcloud joins.');
+            throw new MeshException($this->l->t('The NAS is not reachable (%s). It must be reachable from this server while the Nextcloud joins.', [$last]));
         }
         $mac = (string)($ans->mac ?? '');
         unset($ans->mac);
         if (!hash_equals(hash_hmac('sha256', Canon::encode($ans), hex2bin($inv->s)), $mac)) {
-            throw new MeshException('The answer is not from the inviting NAS.');
+            throw new MeshException($this->l->t('The answer is not from the inviting NAS.'));
         }
         $roster = $ans->roster ?? null;
         $ms = self::members($roster);
         if (($roster->mesh ?? '') !== $inv->m || !isset($ms[$nid]) || !isset($ms[$roster->by ?? ''])
             || !self::verify($roster, $ms[$roster->by]->pub)) {
-            throw new MeshException('The NAS did not take this Nextcloud in.');
+            throw new MeshException($this->l->t('The NAS did not take this Nextcloud in.'));
         }
         $this->locked(function () use ($inv, $roster, $ans, $name, $nid, $pub) {
             $this->save('mesh.json', (object)['mesh' => (object)['id' => $inv->m, 'name' => (string)($inv->n ?? ''), 'joined' => time()],

@@ -9,6 +9,7 @@ use OCA\Untrash\Mesh\Mesh;
 use OCA\Untrash\Mesh\MeshException;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http\JSONResponse;
+use OCP\IL10N;
 use OCP\IRequest;
 use OCP\IURLGenerator;
 
@@ -17,8 +18,11 @@ class SettingsController extends Controller {
     private Mesh $mesh;
     private Client $client;
     private IURLGenerator $urls;
+    private IL10N $l;
 
-    public function __construct(string $appName, IRequest $request, Mesh $mesh, Client $client, IURLGenerator $urls) {
+    public function __construct(string $appName, IRequest $request, Mesh $mesh, Client $client, IURLGenerator $urls,
+                                IL10N $l) {
+        $this->l = $l;
         parent::__construct($appName, $request);
         $this->mesh = $mesh;
         $this->client = $client;
@@ -49,12 +53,12 @@ class SettingsController extends Controller {
     public function nas(string $node = '', string $base = '', bool $verify = true): JSONResponse {
         return $this->wrap(function () use ($node, $base, $verify) {
             if (!preg_match('#^https?://[^\s/?\#]+(/[^\s?\#]*)?$#', $base)) {
-                throw new MeshException('Enter the address as http://NAS:5002/untrash-cloudlink or https://NAS:5003/untrash-cloudlink.');
+                throw new MeshException($this->l->t('Enter the address as http://NAS:5002/untrash-cloudlink or https://NAS:5003/untrash-cloudlink.'));
             }
             $this->mesh->locked(function () use ($node, $base, $verify) {
                 $st = $this->mesh->load('mesh.json', null);
                 if (!isset(Mesh::members($st->roster ?? null)[$node])) {
-                    throw new MeshException('Unknown member.');
+                    throw new MeshException($this->l->t('Unknown member.'));
                 }
                 $all = $this->mesh->load('nas.json', new \stdClass());
                 $old = $all->$node ?? null;
@@ -70,7 +74,7 @@ class SettingsController extends Controller {
         return $this->wrap(function () use ($node) {
             $nas = $this->mesh->load('nas.json', new \stdClass())->$node ?? null;
             if (!$nas) {
-                throw new MeshException('No address for this NAS yet.');
+                throw new MeshException($this->l->t('No address for this NAS yet.'));
             }
             return $this->client->get($nas, '/v1/info', 15);
         });

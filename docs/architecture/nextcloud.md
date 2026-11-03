@@ -123,6 +123,9 @@ directory).
      run (fanotify on the A9 and the stock ext4 volumes).
 2. **Done (2026-11-03): the Nextcloud app `nextcloud/untrash`**, PHP 7.4+,
    Nextcloud 25 to 31.
+   - Translations: de, de_DE (the same neutral German), fr. The source is
+     `nextcloud/l10n/catalog.py`; `build.py` writes `untrash/l10n/`, and
+     `make test` checks that every text is translated.
    - Join: admin settings page or `occ untrash:join`.
    - Directory `POST <dir>/v1/sync`, with the merge rules of untrash-mesh.
    - Canonical JSON (`Canon.php`) is checked against Python.
@@ -141,7 +144,6 @@ directory).
      - the background job itself (only `occ untrash:feed` is tested);
      - newer Nextcloud versions (28+);
      - user-created external storages (only admin mounts are followed);
-     - UI texts are English only;
      - a self-signed NAS certificate can only be accepted with "check the
        HTTPS certificate" off, there is no pinning yet.
 3. Dashboard widget, bin restore, backup state, mesh server member.

@@ -7,6 +7,7 @@ namespace OCA\Untrash\Cloudlink;
 use OCA\Untrash\Mesh\Mesh;
 use OCA\Untrash\Mesh\MeshException;
 use OCP\Http\Client\IClientService;
+use OCP\IL10N;
 
 /**
  * Requests to untrash-cloudlink on a NAS, signed with this cloud's node key
@@ -16,8 +17,10 @@ use OCP\Http\Client\IClientService;
 class Client {
     private Mesh $mesh;
     private IClientService $clients;
+    private IL10N $l;
 
-    public function __construct(Mesh $mesh, IClientService $clients) {
+    public function __construct(Mesh $mesh, IClientService $clients, IL10N $l) {
+        $this->l = $l;
         $this->mesh = $mesh;
         $this->clients = $clients;
     }
@@ -33,15 +36,14 @@ class Client {
                 'timeout' => $timeout, 'verify' => (bool)($nas->verify ?? true), 'http_errors' => false,
                 'nextcloud' => ['allow_local_address' => true]]);
         } catch (\Exception $e) {
-            throw new MeshException('The NAS is not reachable: ' . $e->getMessage());
+            throw new MeshException($this->l->t('The NAS is not reachable: %s', [$e->getMessage()]));
         }
         $body = json_decode((string)$r->getBody(), true);
         if ($r->getStatusCode() === 401) {
-            throw new MeshException('The NAS refused this Nextcloud: ' . ($body['error'] ?? 'not linked there'));
+            throw new MeshException($this->l->t('The NAS refused this Nextcloud: %s', [$body['error'] ?? $this->l->t('not linked there')]));
         }
         if ($r->getStatusCode() !== 200 || !is_array($body)) {
-            throw new MeshException('The NAS answered HTTP ' . $r->getStatusCode()
-                . ' (is WebDAV on, and is this the address of its WebDAV port?)');
+            throw new MeshException($this->l->t('The NAS answered HTTP %s. Is WebDAV on, and is this the address of its WebDAV port?', [$r->getStatusCode()]));
         }
         return $body;
     }
