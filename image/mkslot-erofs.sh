@@ -159,6 +159,11 @@ rm -f "$W/root/etc/systemd/system/multi-user.target.wants/chrony-wait.service"
 # chrony.service and chronyd-restricted.service were both enabled (they
 # conflict): keep chrony.service
 rm -f "$W/root/etc/systemd/system/multi-user.target.wants/chronyd-restricted.service"
+# Debian's nftables.service loads /etc/nftables.conf, which starts with
+# "flush ruleset": a restart would drop untrash-mesh's cloud-peer filter
+# (table inet untrash_mesh).  UntrashOS keeps its own rules; mask it.
+ln -sf /dev/null "$W/root/etc/systemd/system/nftables.service"
+rm -f "$W/root/etc/systemd/system/sysinit.target.wants/nftables.service"
 # eth0 also asks DHCP; wait-online would wait 2 min and fail without a
 # DHCP server (system "degraded").  Nothing here needs network-online.target.
 ln -sf /dev/null "$W/root/etc/systemd/system/systemd-networkd-wait-online.service"

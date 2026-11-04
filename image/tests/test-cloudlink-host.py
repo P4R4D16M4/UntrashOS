@@ -224,6 +224,8 @@ try:
     check("firewall: the cloud's address filtered on ut-mesh, only TCP 5002 (and ICMPv6, answers) let through",
           wait(lambda: caddr in rules()) and 'tcp dport 5002 accept' in rules() and rules().rstrip().endswith("}")
           and 'ip6 saddr @clouds drop' in rules() and "delete table inet untrash_mesh" in rules())
+    os.remove(NODES["a"]["dir"] + "/state/nft.ruleset")          # someone's "nft flush ruleset"
+    check("firewall: a vanished filter table is loaded again by the daemon", wait(lambda: caddr in rules(), 20))
     # fail closed: the same state, but nft does not work -> no WireGuard peer for the cloud (NAS peers stay)
     import importlib.machinery, importlib.util, shutil as _sh
     fdir = os.path.join(W, "failclosed")

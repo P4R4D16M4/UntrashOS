@@ -541,11 +541,26 @@ def fw_ruleset(addrs):
     return out
 
 
+def fw_present():
+    """The filter table is still loaded (someone's "nft flush ruleset" or a
+    restarted nftables.service would drop it silently): checked every tick."""
+    if FAKE_NFT:
+        try:
+            return "@clouds" in open(FAKE_NFT).read()
+        except OSError:
+            return False
+    try:
+        return subprocess.run([NFT, "list", "table", "inet", "untrash_mesh"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def fw_apply(addrs):
     """Load the filter for these cloud addresses; True when it is in place
     (or nothing needs filtering).  Loaded only when it changed."""
     rules = fw_ruleset(addrs)
-    if _FW.get("rules") == rules and _FW.get("ok"):
+    if _FW.get("rules") == rules and _FW.get("ok") and (not addrs or fw_present()):
         return True
     if FAKE_NFT:
         open(FAKE_NFT, "w").write(rules)
@@ -561,6 +576,8 @@ def fw_apply(addrs):
             if addrs:
                 log("firewall: %s" % e)
         ok = ok or not addrs                     # nothing to filter: no nft is fine
+    if _FW.get("ok") and _FW.get("rules") == rules:
+        log("firewall: the filter table was gone, loaded again")
     if not ok and _FW.get("rules") != rules:
         log("firewall not in place: no tunnel to the cloud members")
     _FW.update(rules=rules, ok=ok)

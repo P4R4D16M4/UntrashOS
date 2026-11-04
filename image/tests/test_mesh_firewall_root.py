@@ -84,6 +84,17 @@ try:
     r = sh(NFT, "-f", "-", ns=NS[0], input=mesh.fw_ruleset({CLOUD}), check=False)
     check("loading it again replaces the table (no error, no double rules)", r.returncode == 0
           and sh(NFT, "list", "ruleset", ns=NS[0]).stdout.count("@clouds drop") == 1)
+    # fw_apply itself (the daemon's code path) against this namespace: a flush is noticed and repaired
+    wrap = os.path.join(os.environ["ZT_MESH_DIR"], "nft-ns")
+    open(wrap, "w").write("#!/bin/sh\nexec sudo -n ip netns exec %s %s \"$@\"\n" % (NS[0], NFT))
+    os.chmod(wrap, 0o755)
+    mesh.NFT, mesh.FAKE_NFT, mesh.log = wrap, None, lambda m: None
+    mesh._FW.clear()
+    check("fw_apply loads the filter (daemon code path)", mesh.fw_apply({CLOUD}) and not connects(22, CLOUD))
+    sh(NFT, "flush", "ruleset", ns=NS[0])
+    check("after \"nft flush ruleset\" the cloud is unfiltered ...", connects(22, CLOUD))
+    check("... and the next fw_apply notices and loads it again", mesh.fw_apply({CLOUD}) and not connects(22, CLOUD)
+          and connects(5002, CLOUD))
     r = sh(NFT, "-f", "-", ns=NS[0], input=mesh.fw_ruleset(set()), check=False)
     check("no cloud with a tunnel: the table goes, nothing is filtered", r.returncode == 0
           and "untrash_mesh" not in sh(NFT, "list", "ruleset", ns=NS[0]).stdout and connects(22, CLOUD))
