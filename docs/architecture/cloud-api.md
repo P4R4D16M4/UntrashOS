@@ -274,6 +274,16 @@ occ untrash:tunnel sync --key <wg public> --endpoint <ip:port> --handshakes '{<p
 - When the key or endpoint changed, the app signs a new own record.
 - `peers` are the roster's NAS members (with their roster keys). Apps and
   other clouds are not peers.
+- The helper runs as root on what the web server user's PHP printed. It
+  checks every value before it reaches `wg`, `ip` or the UAPI socket:
+  - the prefix must be a ULA `/48`;
+  - every address must be inside it;
+  - every key must be a WireGuard key.
+  Anything else is dropped (`nextcloud/tests/test_cloud_wg_checks.py`).
+- On the NAS side, UntrashOS 1.2-rc3 and newer filter a cloud peer with
+  nftables (only TCP 5002). This branch is based on 1.1, whose kernel
+  has no netfilter: there the tunnel opens every NAS service to the
+  server. Use 1.2 for the tunnel.
 - The helper sets the address (`/48`), one `/128` per NAS and no endpoints:
   the NAS connect out, and WireGuard roaming learns where they are.
 - The app keeps the handshakes for its settings page. It writes them only

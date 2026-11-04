@@ -50,4 +50,5 @@ test-run:
 	python3 image/tests/test-mesh-host.py
 	python3 image/tests/test_mesh_endpoints.py
 	python3 image/tests/test-cloudlink-host.py
+	python3 nextcloud/tests/test_cloud_wg_checks.py
 	python3 nextcloud/l10n/build.py --check
