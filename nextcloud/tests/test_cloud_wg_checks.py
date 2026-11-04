@@ -22,13 +22,13 @@ def check(name, ok):
     fails += not ok
 
 
-K = "psTZOtuMNDstPjmWb/q8vM2rofj2Pbq1TbhftIYWkyQ="
-GOOD = {"mesh": "m", "prefix": "fd35:dba1:77af::/48", "address": "fd35:dba1:77af:0:1::1",
-        "peers": [{"node": "a", "wg": K, "address": "fd35:dba1:77af:0:2::2"},
-                  {"node": "inject", "wg": K, "address": "fd35:dba1:77af:0:2::3/128\nallowed_ip=::/0"},
+K = "lV28Q6vKDrvJoC2oGFs8iy3GHACty2abkN6gOcWeEII="
+GOOD = {"mesh": "m", "prefix": "fd12:3456:789a::/48", "address": "fd12:3456:789a:0:1::1",
+        "peers": [{"node": "a", "wg": K, "address": "fd12:3456:789a:0:2::2"},
+                  {"node": "inject", "wg": K, "address": "fd12:3456:789a:0:2::3/128\nallowed_ip=::/0"},
                   {"node": "outside", "wg": K, "address": "2001:db8::1"},
-                  {"node": "self", "wg": K, "address": "fd35:dba1:77af:0:1::1"},
-                  {"node": "badkey", "wg": K + "\nlisten_port=1", "address": "fd35:dba1:77af:0:2::4"}]}
+                  {"node": "self", "wg": K, "address": "fd12:3456:789a:0:1::1"},
+                  {"node": "badkey", "wg": K + "\nlisten_port=1", "address": "fd12:3456:789a:0:2::4"}]}
 r = cwg.checked(GOOD)
 check("only the well-formed peer stays (no injected line, no outside or own address, no bad key)",
       [p["node"] for p in r["peers"]] == ["a"])
@@ -42,6 +42,6 @@ def refused(**kw):
         return True
 check("a prefix that is not a ULA /48 stops the round", refused(prefix="::/0") and refused(prefix="2001:db8::/48"))
 check("an own address outside the prefix stops the round", refused(address="fd00::1"))
-check("a prefix with an injected line stops the round", refused(prefix="fd35:dba1:77af::/48\n"))
+check("a prefix with an injected line stops the round", refused(prefix="fd12:3456:789a::/48\n"))
 print("%d failed" % fails if fails else "all ok")
 sys.exit(1 if fails else 0)

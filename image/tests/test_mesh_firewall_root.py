@@ -28,7 +28,7 @@ mesh = importlib.util.module_from_spec(_s)
 _l.exec_module(mesh)
 fails = 0
 NS = ("utfw-nas", "utfw-cloud")
-CLOUD, NASMEMBER, NASADDR = "fd35:dba1:77af:0:aaaa::1", "fd35:dba1:77af:0:bbbb::1", "fd35:dba1:77af:0:cccc::1"
+CLOUD, NASMEMBER, NASADDR = "fd12:3456:789a:0:aaaa::1", "fd12:3456:789a:0:bbbb::1", "fd12:3456:789a:0:cccc::1"
 
 
 def check(name, ok):
