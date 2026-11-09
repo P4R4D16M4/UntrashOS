@@ -29,3 +29,13 @@ T = {
     "follows %s": ("folgt %s", "suit %s"),
     "follows no share here": ("folgt hier keiner Freigabe", "ne suit aucun partage ici"),
 }
+
+# Desk phone shell (mdesk in desk.js)
+T.update({
+    "Back": ("Zurück", "Retour"),
+    "Desktop view": ("Desktop-Ansicht", "Vue bureau"),
+    "Phone view": ("Handy-Ansicht", "Vue téléphone"),
+    "One app at a time on the whole screen, for phones.": ("Eine App nach der anderen auf dem ganzen Bildschirm, für Handys.",
+                                                           "Une app à la fois sur tout l'écran, pour les téléphones."),
+    "Windows and dock, as on a computer.": ("Fenster und Dock, wie am Computer.", "Fenêtres et dock, comme sur un ordinateur."),
+})

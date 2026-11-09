@@ -116,6 +116,8 @@ function resetScreen(st) {
 }
 function loginScreen(st) {
   if (st.reset_window) return resetScreen(st);
+  // in UntrashApp the session ran out: the app signs the view in again itself
+  if (window.UntrashApp) UntrashApp.postMessage('signin');
   setTimeout(() => { const l = $('#lang'); if (l) l.onchange = () => UTI18N.set(l.value); });
   $('#app').innerHTML = `<main class="ut-login"><form class="ut-login__card" id="lf">
     <img class="ut-login__logo" src="/ut/assets/logo-mark-192.png" alt=""><img class="ut-login__word" src="/ut/assets/wordmark-300.png" alt="UntrashOS">
@@ -235,6 +237,7 @@ document.addEventListener('pointerdown', e => { if (!e.target.closest('.ut-dock-
 addEventListener('resize', closeDockPopup);
 
 function desk(st) {
+  if (MOBILE) return mdesk(st);
   const apps = Object.keys(APPS).filter(k => (ME.admin || APPS[k].user) && !APPS[k].hidden);
   const dock = ME.admin ? DOCK_ADMIN : ['files', 'transfers', 'tv', 'manual', 'account'];
   $('#app').innerHTML = `<div class="ut-desk" id="desk">
@@ -254,14 +257,7 @@ function desk(st) {
     const g = e.target.closest('[data-group]'); if (g) dockPopup(g);
   });
   $('#desk').addEventListener('dblclick', e => { const b = e.target.closest('.ut-desk-icon'); if (b) openApp(b.dataset.app); });
-  $('#user-btn').onclick = () => {
-    const d = dialog({ title: 'Account', body: `<p>Signed in as <b translate="no">${esc(ME.user)}</b>.</p>
-      <div class="ut-field"><label for="ulang">Language of this browser</label>${langSel('ulang', UTI18N.own, true)}</div>
-      ${signinFields()}<div class="ut-section-title">Appearance</div>${appearanceFields()}`, ok: 'Sign out',
-      onOk: async () => { await api('logout', {}); location.reload(); } });
-    $('#ulang', d).onchange = e => UTI18N.set(e.target.value);
-    appearanceBind(d); signinBind(d);
-  };
+  $('#user-btn').onclick = accountDialog;
   const tick = () => $('#clock') && ($('#clock').textContent = new Date().toLocaleString(UTI18N.locale, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }));
   tick(); setInterval(tick, 15000);
   $('#ops-btn').onclick = () => openApp('transfers');
@@ -269,6 +265,137 @@ function desk(st) {
   if (ME.admin) { const rp = single(raidPill), ab = single(activityBar); rp(); setInterval(rp, 60000); ab(); setInterval(ab, 5000); openApp('overview'); 
     api('update').then(u => { const r = u.release || {}; if (r.available && (r.download || {}).state === 'ready') toast('Update', UTI18N.tr('UntrashOS %s is downloaded and checked; install it under Updates.').replace('%s', r.available.version)); }).catch(() => { }); } else openApp('files');
 }
+/* phone shell: a home page with the app groups, then one app at a time on
+   the whole screen.  The browser history is the back stack, so Android's
+   back button (in the browser and in UntrashApp's web view) goes back from
+   an app to the one before and to the home page.  Chosen once at start:
+   UntrashApp (user agent), a narrow screen, or the user's own choice. */
+const SHELL_KEY = 'ut-shell';
+const MOBILE = (() => {
+  let own = null; try { own = localStorage.getItem(SHELL_KEY); } catch (e) { }
+  if (own === 'desktop' || own === 'mobile') return own === 'mobile';
+  return /\bUntrashApp\b/.test(navigator.userAgent) || Math.min(innerWidth, screen.width) <= 760;
+})();
+function shellSwitch(mobile) {
+  try { localStorage.setItem(SHELL_KEY, mobile ? 'mobile' : 'desktop'); } catch (e) { }
+  location.replace(location.pathname);
+}
+const shellField = () => `<div class="ut-field"><button class="ut-btn ut-btn--sm" type="button" data-shell>${MOBILE ? 'Desktop view' : 'Phone view'}</button>
+  <span class="ut-hint">${MOBILE ? 'Windows and dock, as on a computer.' : 'One app at a time on the whole screen, for phones.'}</span></div>`;
+const shellBind = root => { const b = $('[data-shell]', root); if (b) b.onclick = () => shellSwitch(!MOBILE); };
+function accountDialog() {
+  const d = dialog({ title: 'Account', body: `<p>Signed in as <b translate="no">${esc(ME.user)}</b>.</p>
+    <div class="ut-field"><label for="ulang">Language of this browser</label>${langSel('ulang', UTI18N.own, true)}</div>
+    ${signinFields()}<div class="ut-section-title">Appearance</div>${appearanceFields()}${shellField()}`, ok: 'Sign out',
+    onOk: async () => { await api('logout', {}); if (window.UntrashApp) UntrashApp.postMessage('close'); else location.reload(); } });
+  $('#ulang', d).onchange = e => UTI18N.set(e.target.value);
+  appearanceBind(d); signinBind(d); shellBind(d);
+}
+function mdesk(st) {
+  document.body.classList.add('ut-mobile');
+  const sections = ME.admin
+    ? [{ g: 'top', name: '', apps: DOCK_ADMIN.filter(x => typeof x === 'string') }, ...DOCK_ADMIN.filter(x => typeof x !== 'string')]
+    : [{ g: 'top', name: '', apps: ['files', 'transfers', 'tv', 'manual', 'account'] }];
+  const tile = k => `<button class="ut-mtile" data-app="${k}"><img src="${ICON(APPS[k].icon)}" alt=""><span>${esc(UTI18N.tr(APPS[k].name))}</span></button>`;
+  $('#app').innerHTML = `<div class="ut-desk ut-mdesk" id="desk">
+    <header class="ut-topbar ut-mbar">
+      <button class="ut-topbar__item ut-mbar__back" id="m-back" aria-label="Back" hidden>‹</button>
+      <img class="ut-mbar__logo" id="m-logo" src="/ut/assets/logo-mark-48.png" alt="">
+      <img class="ut-mbar__icon" id="m-icon" alt="" hidden>
+      <span class="ut-mbar__title" id="active-title" translate="no">${esc(st.hostname)}</span>
+      <button class="ut-topbar__item ut-ops-btn" id="ops-btn" hidden></button>
+      <button class="ut-topbar__item ut-mbar__user" id="user-btn" aria-label="Account" translate="no">${esc((ME.user || '?')[0].toUpperCase())}</button></header>
+    <main class="ut-mhome" id="m-home">
+      <section class="ut-mhome__status ut-card" data-app="overview"><div id="m-vols"></div>
+        <div class="ut-activity ut-mhome__act" id="activity" aria-live="polite"></div></section>
+      ${sections.map(g => `<section class="ut-mhome__group">${g.name ? `<div class="ut-section-title">${esc(g.name)}</div>` : ''}
+        <div class="ut-mhome__grid">${g.apps.filter(k => ME.admin || APPS[k].user).map(tile).join('')}</div></section>`).join('')}
+      ${ME.admin ? '<button class="ut-btn ut-mhome__power" data-power><img src="' + ICON('power') + '" alt="">Switch off</button>' : ''}
+    </main>
+    <div id="windows"></div><div class="ut-toasts" id="toasts" aria-live="polite"></div></div>`;
+  $('#desk').addEventListener('click', e => {
+    const b = e.target.closest('[data-app]'); if (b && !b.closest('.ut-window')) openApp(b.dataset.app);
+    if (e.target.closest('[data-power]')) powerDialog();
+  });
+  $('#m-back').onclick = () => history.back();
+  $('#user-btn').onclick = accountDialog;
+  $('#ops-btn').onclick = () => openApp('transfers');
+  const ob = single(opsBadge); ob(); setInterval(ob, 4000);
+  if (ME.admin) {
+    const rp = single(mStatus), ab = single(activityBar); rp(); setInterval(rp, 60000); ab(); setInterval(ab, 5000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('#m-home').hidden) { rp(); ab(); } });
+    api('update').then(u => { const r = u.release || {}; if (r.available && (r.download || {}).state === 'ready') toast('Update', UTI18N.tr('UntrashOS %s is downloaded and checked; install it under Updates.').replace('%s', r.available.version)); }).catch(() => { });
+  } else $('.ut-mhome__status').hidden = true;
+  MHOST = st.hostname;
+  addEventListener('popstate', mRoute);
+  // a reload inside an app (#files) keeps it; the home page stays below it in the history
+  const k = location.hash.slice(1);
+  history.replaceState({ ut: null }, '', location.pathname + location.search);
+  if (APPS[k] && (ME.admin || APPS[k].user)) openApp(k);
+}
+let MHOST = '';
+/* home page card: how full the volumes are, RAID health; a tap opens Overview */
+async function mStatus() {
+  const el = $('#m-vols'); if (!el || document.hidden) return;
+  try {
+    const o = await api('overview'), deg = o.arrays.filter(a => a.degraded).length;
+    el.innerHTML = (o.arrays.length ? `<span class="ut-pill ${deg ? 'ut-pill--danger' : 'ut-pill--ok'}">${deg ? 'RAID incomplete' : 'RAID ok'}</span>` : '')
+      + o.volumes.filter(v => v.kind !== 'partner').map(v => {
+        const used = v.size ? Math.round(100 * (v.size - v.free) / v.size) : 0;
+        return `<div class="ut-mvol"><span translate="no">${esc(v.label)}</span><span class="ut-faint">${gb(v.size - v.free)} / ${gb(v.size)}</span>
+          <div class="ut-progress ${used > 90 ? 'ut-progress--danger' : used > 75 ? 'ut-progress--warn' : ''}" style="--v:${used}%"><i></i></div></div>`;
+      }).join('');
+  } catch (e) { }
+}
+function mClose(k) {
+  if (CLEANUP[k]) { CLEANUP[k](); delete CLEANUP[k]; }
+  wins[k].remove(); delete wins[k];
+}
+let MCUR = null;
+function mRoute() {
+  const k = (history.state || {}).ut;
+  // back with a menu or dialog open closes that, the app stays
+  const ctx = $$('.ut-ctx'), scrims = $$('.ut-scrim');
+  if (ctx.length || scrims.length) {
+    ctx.forEach(m => m.remove());
+    if (!ctx.length) scrims[scrims.length - 1].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    return history.pushState({ ut: MCUR }, '', MCUR ? '#' + MCUR : location.pathname + location.search);
+  }
+  if (k && k === MCUR && wins[k]) return render(k, history.state.nav);
+  if (k && APPS[k]) return mOpen(k, true);
+  MCUR = null;
+  Object.keys(wins).forEach(mClose);
+  $('#m-home').hidden = false;
+  if (ME.admin) { mStatus(); activityBar(); }
+  $('#m-back').hidden = $('#m-icon').hidden = true; $('#m-logo').hidden = false;
+  $('#active-title').textContent = MHOST;
+}
+function mOpen(k, fromHistory) {
+  if (wins[k]) return;
+  Object.keys(wins).forEach(mClose);
+  if (!fromHistory) history.pushState({ ut: k }, '', '#' + k);
+  MCUR = k;
+  const a = APPS[k], w = document.createElement('section');
+  w.className = 'ut-window'; w.dataset.app = k; w.setAttribute('data-active', '');
+  // the bar stays for views that look for it; the top bar shows title and back
+  w.innerHTML = `<div class="ut-window__bar" hidden><span class="ut-window__title">${a.name}</span><div class="ut-window__ctl"><button data-act="close">✕</button></div></div>
+    <div class="ut-window__body"><div class="ut-window__main"><span class="ut-spinner"></span></div></div>`;
+  $('#windows').append(w); wins[k] = w;
+  w.querySelector('[data-act=close]').onclick = () => history.back();
+  // an app that starts with its list (Shares, Users): opening an entry is a
+  // step back can undo
+  w.addEventListener('click', e => {
+    const n = e.target.closest('.ut-sidebar [data-nav]');
+    if (n && !$('.ut-sidebar [aria-current]', w)) history.pushState({ ut: k, nav: n.dataset.nav }, '', '#' + k);
+  }, true);
+  $('#m-home').hidden = true;
+  $('#m-back').hidden = $('#m-icon').hidden = false; $('#m-logo').hidden = true;
+  $('#m-icon').src = ICON(a.icon);
+  $('#active-title').textContent = UTI18N.tr(a.name);
+  scrollTo(0, 0);
+  render(k);
+}
+
 // polling: never a second request while the first is still open.  Browsers
 // allow 6 connections per server; slow answers that piled up blocked every
 // other request, also uploads.
@@ -310,6 +437,7 @@ let Z = 10, N = 0;
 const CLEANUP = {};   // per window: stop polling, close sockets
 const wins = {};
 function openApp(k) {
+  if (MOBILE) return mOpen(k);
   if (wins[k]) { wins[k].hidden = false; return focusWin(wins[k]); }
   const a = APPS[k], w = document.createElement('section');
   let sz = null; try { sz = JSON.parse(localStorage.getItem('ut-win-' + k)); } catch (e) { }   // last size of this window, per browser
@@ -375,7 +503,7 @@ function resizable(w, k) {
 const body = k => wins[k] && wins[k].querySelector('.ut-window__body');
 async function render(k, arg) {
   const b = body(k); if (!b) return;
-  try { await VIEWS[k](b, arg); } catch (e) { b.innerHTML = `<div class="ut-window__main"><div class="ut-callout ut-callout--danger">${esc(e.message)}</div></div>`; }
+  try { await VIEWS[k](b, arg); if (MOBILE) { const n = $('.ut-sidebar [aria-current]', b); if (n) n.scrollIntoView({ block: 'nearest', inline: 'center' }); } } catch (e) { b.innerHTML = `<div class="ut-window__main"><div class="ut-callout ut-callout--danger">${esc(e.message)}</div></div>`; }
 }
 // names of shares, users and groups are data: never translated (i18n.js skips translate="no")
 // language choice: native names, never translated
@@ -868,9 +996,17 @@ function viewer(names, cur, rel) {
         <a class="ut-btn" href="${dl}">Download</a><button class="ut-btn ut-btn--primary" data-x>Close</button></div></div>`;
     $$('[data-v]', s).forEach(x => x.onclick = () => { i = (i + +x.dataset.v + names.length) % names.length; show(); });
   };
-  s.onclick = e => { if (e.target === s || e.target.closest('[data-x]')) { s.remove(); document.removeEventListener('keydown', key); } };
+  let swiped = false;
+  s.onclick = e => { if (swiped) { swiped = false; return; } if (e.target === s || e.target.closest('[data-x]')) { s.remove(); document.removeEventListener('keydown', key); } };
   const key = e => { if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { i = (i + (e.key === 'ArrowRight' ? 1 : -1) + names.length) % names.length; show(); } else if (e.key === 'Escape') s.click(); };
   document.addEventListener('keydown', key);
+  // a swipe sideways shows the next or the previous one
+  let x0 = null;
+  s.addEventListener('pointerdown', e => { x0 = /^(VIDEO|AUDIO|IFRAME)$/.test(e.target.tagName) ? null : e.clientX; });
+  s.addEventListener('pointerup', e => {
+    if (x0 === null || Math.abs(e.clientX - x0) < 60 || names.length < 2) return;
+    i = (i + (e.clientX < x0 ? 1 : -1) + names.length) % names.length; x0 = null; swiped = true; setTimeout(() => { swiped = false; }); show();
+  });
   document.body.append(s); show();
 }
 

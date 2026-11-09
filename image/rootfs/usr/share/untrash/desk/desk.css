@@ -262,3 +262,91 @@ tr.ut-ab-blocked td { color: var(--ut-danger); }
 .ut-procs td, .ut-procs th { white-space: nowrap; }
 .ut-procs__cmd { max-width: 380px; overflow: hidden; text-overflow: ellipsis; font-size: var(--ut-fs-xs); color: var(--ut-fg-2); }
 .ut-procs [data-on]:not([data-on=""])::after { content: " " attr(data-on); }
+
+/* Phone shell (desk.js mdesk): a home page, then one app at a time on the whole
+   screen; the page itself scrolls, dialogs and menus come up from the bottom */
+.ut-mobile .ut-mdesk { position: static; overflow: visible; min-height: 100vh; min-height: 100dvh; background-attachment: fixed; }
+.ut-mbar { position: sticky; top: 0; height: calc(52px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 8px 0; gap: 6px; }
+.ut-mbar .ut-topbar__item { height: 40px; min-width: 40px; justify-content: center; }
+.ut-mbar__back { font-size: 30px; line-height: 1; padding: 0 0 4px; }
+.ut-mbar__logo, .ut-mbar__icon { width: 28px; height: 28px; margin: 0 2px 0 6px; border-radius: 7px; }
+.ut-mbar__title { flex: 1; min-width: 0; font-weight: 650; font-size: var(--ut-fs-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ut-mbar__user { width: 34px; min-width: 34px !important; height: 34px !important; border-radius: 50%; background: var(--ut-grad-soft);
+  border: 1px solid var(--ut-line-2); color: var(--ut-fg); font-weight: 750; }
+.ut-mbar .ut-ops-btn { font-size: var(--ut-fs-xs); padding: 0 8px; }
+.ut-mhome { padding: 14px 14px calc(24px + env(safe-area-inset-bottom)); max-width: 640px; margin: 0 auto; }
+.ut-mhome__status { display: grid; gap: 8px; margin-bottom: 6px; }
+.ut-mhome__status { cursor: pointer; }
+#m-vols { display: grid; gap: 10px; justify-items: start; }
+.ut-mvol { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: var(--ut-fs-sm); }
+.ut-mvol .ut-progress { grid-column: 1 / -1; }
+.ut-mhome__act:empty { display: none; }
+.ut-mhome__act { display: flex; flex-wrap: wrap; max-width: none; gap: 6px; }
+.ut-mhome__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; }
+.ut-mtile { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px 8px; border: 1px solid transparent; border-radius: var(--ut-r-md);
+  background: none; color: var(--ut-fg-2); font: inherit; font-size: var(--ut-fs-sm); text-align: center; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ut-mtile img { width: 56px; height: 56px; filter: drop-shadow(0 4px 10px color-mix(in srgb, var(--ut-shade) 55%, transparent)); }
+.ut-mtile:active { background: color-mix(in srgb, var(--ut-accent) 12%, transparent); border-color: color-mix(in srgb, var(--ut-accent) 35%, transparent); }
+.ut-mhome__power { display: flex; gap: 8px; align-items: center; margin: 22px auto 0; }
+.ut-mhome__power img { width: 22px; height: 22px; }
+
+/* the app fills the screen below the bar */
+.ut-mobile .ut-window { position: static; min-width: 0; min-height: calc(100dvh - 52px - env(safe-area-inset-top)); border: 0; border-radius: 0;
+  box-shadow: none; overflow: visible; background: var(--ut-bg-1); }
+.ut-mobile .ut-window[data-active]::before { display: none; }
+.ut-mobile .ut-window__body { flex-direction: column; }
+.ut-mobile .ut-window__main { overflow: visible; padding: 14px 14px calc(24px + env(safe-area-inset-bottom)); }
+/* app sections: a row of chips under the bar instead of the side list */
+.ut-mobile .ut-sidebar { position: sticky; top: calc(52px + env(safe-area-inset-top)); z-index: 20; width: auto; display: flex; gap: 6px; padding: 8px 10px;
+  overflow-x: auto; scrollbar-width: none; border-right: 0; border-bottom: 1px solid var(--ut-line); background: var(--ut-glass);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+.ut-mobile .ut-sidebar::-webkit-scrollbar { display: none; }
+.ut-mobile .ut-sidebar__group { display: none; }
+.ut-mobile .ut-sidebar .ut-nav { flex: none; width: auto; margin: 0; padding: 6px 12px; border-radius: var(--ut-r-pill); border: 1px solid var(--ut-line); white-space: nowrap; }
+.ut-mobile .ut-sidebar .ut-nav span, .ut-mobile .ut-sidebar .ut-nav .ut-pill { display: inline-flex; }
+.ut-mobile .ut-sidebar .ut-nav[aria-current] { border-color: color-mix(in srgb, var(--ut-accent) 45%, transparent); }
+.ut-mobile .ut-sidebar .ut-nav[aria-current]::before { display: none; }
+/* wide tables scroll sideways on their own, the page does not */
+.ut-mobile .ut-window__main .ut-table { display: block; overflow-x: auto; }
+.ut-mobile .ut-window__main .ut-table-wrap .ut-table { display: table; }
+.ut-mobile .row > .ut-field { flex-basis: 100%; }
+.ut-mobile .ut-input, .ut-mobile .ut-select { font-size: 16px; }   /* no zoom-in on focus (iOS) */
+/* toasts at the top, dialogs and menus as sheets from the bottom */
+.ut-mobile .ut-toasts { position: fixed; top: calc(58px + env(safe-area-inset-top)); left: 12px; right: 12px; width: auto; }
+.ut-mobile .ut-scrim { place-items: end stretch; padding: 0; }
+.ut-mobile .ut-dialog { width: 100%; max-height: 92dvh; display: flex; flex-direction: column; border-radius: var(--ut-r-xl) var(--ut-r-xl) 0 0;
+  border-bottom: 0; animation: ut-sheet .22s var(--ut-ease); }
+.ut-mobile .ut-dialog__body { padding: 6px 18px 16px; overflow: auto; }
+.ut-mobile .ut-dialog__foot { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
+.ut-mobile .ut-dialog__foot .ut-btn { flex: 1; justify-content: center; }
+.ut-mobile .ut-ctx { left: 8px !important; right: 8px; top: auto !important; bottom: calc(8px + env(safe-area-inset-bottom)); min-width: 0; max-height: 70dvh; overflow: auto;
+  box-shadow: 0 0 0 100vmax var(--ut-scrim), var(--ut-sh-3); animation: ut-sheet .2s var(--ut-ease); }
+.ut-mobile .ut-ctx .ut-menu__item { padding-top: 12px; padding-bottom: 12px; }
+@keyframes ut-sheet { from { transform: translateY(40px); opacity: 0; } }
+.ut-mobile .ut-window { left: auto !important; width: auto !important; }
+/* Files on a phone: a list of names; actions for a selection show up only with one */
+.ut-mobile .ut-files__search { width: 100%; }
+.ut-mobile .ut-files__bar .ut-spacer, .ut-mobile .ut-files__sep, .ut-mobile .ut-files__bar .ut-btn:disabled,
+.ut-mobile .ut-files__bar label:has(#upd), .ut-mobile [data-office] { display: none; }
+.ut-mobile .ut-files .ut-table { display: table; table-layout: fixed; }
+.ut-mobile .ut-files th:nth-child(4), .ut-mobile .ut-files td:nth-child(4) { display: none; }
+.ut-mobile .ut-files th:nth-child(3), .ut-mobile .ut-files td:nth-child(3) { width: 74px; font-size: var(--ut-fs-xs); color: var(--ut-fg-3); }
+.ut-mobile .ut-files th:nth-child(5) { width: 44px; }
+.ut-mobile .ut-files td { padding: 11px 6px; }
+.ut-mobile .ut-files__name { display: block; width: 100%; overflow-wrap: anywhere; }
+.ut-mobile .ut-files__ck input { width: 20px; height: 20px; }
+.ut-mobile .ut-menu__item kbd { display: none; }
+.ut-mobile .ut-dialog__foot { flex-wrap: wrap; }
+.ut-mobile .ut-dialog__foot > .ut-faint { flex-basis: 100%; text-align: center; }
+/* an app whose start is its list (no entry chosen yet): the list fills the screen */
+.ut-mobile .ut-window__body:has(> .ut-sidebar):not(:has(.ut-sidebar [aria-current])) > .ut-sidebar { position: static; flex-direction: column; overflow: visible;
+  padding: 10px 14px; gap: 6px; border: 0; background: none; backdrop-filter: none; -webkit-backdrop-filter: none; }
+.ut-mobile .ut-window__body:has(> .ut-sidebar):not(:has(.ut-sidebar [aria-current])) > .ut-sidebar .ut-sidebar__group { display: block; margin: 12px 2px 2px; }
+.ut-mobile .ut-window__body:has(> .ut-sidebar):not(:has(.ut-sidebar [aria-current])) > .ut-sidebar .ut-nav { width: 100%; padding: 13px 16px; border-radius: var(--ut-r-md);
+  background: var(--ut-bg-2); font-size: var(--ut-fs-md); }
+.ut-mobile .ut-window__body:has(> .ut-sidebar):not(:has(.ut-sidebar [aria-current])) > .ut-sidebar .ut-nav::after { content: "›"; margin-left: auto; color: var(--ut-fg-3); }
+.ut-mobile .ut-window__body:has(> .ut-sidebar):not(:has(.ut-sidebar [aria-current])) > .ut-window__main { display: none; }
+/* the terminal needs a fixed height: the screen below the bar */
+.ut-mobile .ut-window[data-app=terminal] { height: calc(100dvh - 52px - env(safe-area-inset-top)); min-height: 0; }
+.ut-mobile .ut-window[data-app=terminal] .ut-window__main { overflow: hidden; padding: 0; min-height: 0; }
+.ut-mhome__status:has(#m-vols:empty):has(.ut-mhome__act:empty) { display: none; }

@@ -185,6 +185,16 @@ address; it sets an ordinary Desk session cookie for the linked user and
 redirects to `/`. It gives no new rights: signed requests may already do
 everything the user may.
 
+The web view adds ` UntrashApp/<version>` to its user agent; the Desk then
+starts its phone view (a home page with the apps, one app at a time on the
+whole screen, the history as the back stack, so the system back button goes
+back). The view offers a JavaScript channel `UntrashApp`; the Desk posts:
+- `signin`: the Desk shows its sign-in page (the session ran out). The app
+  asks for a new `/api/app/session` link and loads it, at most once in 30 s.
+- `close`: the user signed out. The app closes the Desk view.
+
+A Desk without the phone view ignores both; the app works with it as before.
+
 **Number matching.** The browser shows a two-digit number; the app shows
 the three `choices`. Approving with the wrong number denies the request: the
 person at the phone is not the person at that browser.
