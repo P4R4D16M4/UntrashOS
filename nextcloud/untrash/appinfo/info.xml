@@ -11,7 +11,7 @@
 * **Tunnel (optional):** with the root helper untrash-cloud-wg, this server is also a WireGuard peer of the mesh. The NAS connect out to it, so it reaches their WebDAV shares and change feed with no port forwarded at home.
 
 Contract: docs/architecture/cloud-api.md in the UntrashOS repository.]]></description>
-    <version>0.4.1</version>
+    <version>0.5.0</version>
     <licence>agpl</licence>
     <author>UntrashOS</author>
     <namespace>Untrash</namespace>
@@ -20,7 +20,7 @@ Contract: docs/architecture/cloud-api.md in the UntrashOS repository.]]></descri
     <dependencies>
         <php min-version="7.4"/>
         <lib>sodium</lib>
-        <nextcloud min-version="25" max-version="32"/>
+        <nextcloud min-version="25" max-version="35"/>
     </dependencies>
     <background-jobs>
         <job>OCA\Untrash\BackgroundJob\FeedJob</job>

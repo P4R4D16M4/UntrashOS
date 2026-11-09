@@ -168,7 +168,7 @@ WireGuard peer.
    - Open: the Desk UI (invite a Nextcloud, choose its shares), a hardware
      run (fanotify on the A9 and the stock ext4 volumes).
 2. **Done (2026-11-03): the Nextcloud app `nextcloud/untrash`**, PHP 7.4+,
-   Nextcloud 25 to 32 (app 0.4.1; tested on 25, 30 and 32).
+   Nextcloud 25 to 35 (app 0.5.0; tested on 25, 30, 32, 33, 34 and 35).
    - Translations: de, de_DE (the same neutral German), fr. The source is
      `nextcloud/l10n/catalog.py`; `build.py` writes `untrash/l10n/`, and
      `make test` checks that every text is translated.
