@@ -11,8 +11,22 @@ devices. The contract is `docs/architecture/cloud-api.md` in this repository.
   External storages on that NAS are then updated path by path instead of being
   scanned, so the NAS disks can sleep.
 
-Requirements: Nextcloud 25 or newer, PHP with sodium, the app *External
+Requirements: Nextcloud 25 to 35, PHP with sodium, the app *External
 storage support* for the feed.
+
+## Installation
+
+Download `untrash-<version>.tar.gz` from the release, unpack it into the
+`apps` or `custom_apps` folder of the Nextcloud as the web server user, then
+enable it:
+
+```
+sudo -u www-data tar -xzf untrash-<version>.tar.gz -C /var/www/nextcloud/custom_apps
+sudo -u www-data php /var/www/nextcloud/occ app:enable untrash
+```
+
+For an update, replace the folder `untrash` the same way; Nextcloud runs the
+app's upgrade steps on the next `occ upgrade` or page load.
 
 ## Setup
 
@@ -56,9 +70,13 @@ What the server needs:
 
 Setup:
 
+The helper is `untrash-cloud-wg-<version>.tar.gz` in the same release
+(`nextcloud/server/` in the repository):
+
 ```
-install -m 755 nextcloud/server/untrash-cloud-wg /usr/local/sbin/
-install -m 644 nextcloud/server/untrash-cloud-wg.service /etc/systemd/system/
+tar -xzf untrash-cloud-wg-<version>.tar.gz
+install -m 755 untrash-cloud-wg/untrash-cloud-wg /usr/local/sbin/
+install -m 644 untrash-cloud-wg/untrash-cloud-wg.service /etc/systemd/system/
 untrash-cloud-wg --once          # one round: prints the peers, or the error
 systemctl enable --now untrash-cloud-wg
 ```
