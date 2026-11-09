@@ -1,4 +1,4 @@
-.PHONY: help test i18n docs-check test-nextcloud nextcloud-app
+.PHONY: help test i18n docs-check
 
 # UntrashOS: the device-independent part.  Images are built by a firmware
 # repository (e.g. ZyxelUntrash) that has this repository as a submodule and
@@ -10,21 +10,10 @@ help:
 	@echo "  make test         PC tests (no root) [BOARD_ROOTFS=<board>/rootfs]"
 	@echo "  make i18n         write design/i18n/*.json from tools/i18n"
 	@echo "  make docs-check   privacy check of the docs"
-	@echo "  make test-nextcloud APACHEROOT=<dir> [NC_IMAGE=nextcloud:25-apache]"
-	@echo "                    the Nextcloud app against a real Nextcloud (Docker, sudo -n)"
-	@echo "  make nextcloud-app  release archives of the Nextcloud app and tunnel helper"
-	@echo "                    (build/nextcloud/)"
+	@echo "The Nextcloud app is in its own repository, UntrashNC."
 
 i18n:
 	python3 tools/i18n/build.py
-
-NC_IMAGE ?= nextcloud:25-apache
-test-nextcloud:
-	@test -n "$(APACHEROOT)" || { echo "APACHEROOT=<unpacked apache2-bin libapr1 libaprutil1 debs> needed"; exit 1; }
-	python3 nextcloud/tests/test_nextcloud_docker.py $(APACHEROOT) $(NC_IMAGE)
-
-nextcloud-app:
-	python3 nextcloud/package.py build/nextcloud
 
 docs-check:
 	@python3 tools/check_public_docs.py
@@ -57,6 +46,3 @@ test-run:
 	python3 image/tests/test-mesh-host.py
 	python3 image/tests/test_mesh_endpoints.py
 	python3 image/tests/test-cloudlink-host.py
-	python3 nextcloud/tests/test_cloud_wg_checks.py
-	python3 nextcloud/l10n/build.py --check
-	python3 nextcloud/tests/test_package.py

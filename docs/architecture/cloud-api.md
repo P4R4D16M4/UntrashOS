@@ -271,7 +271,7 @@ cloud's own mesh address (`/128`), so the key opens nothing else.
 
 **Server side.** The PHP app runs as the web server user and cannot make
 network interfaces. A small root helper next to it,
-`nextcloud/server/untrash-cloud-wg` (Python 3.8, standard library only), runs
+`untrash-cloud-wg` (UntrashNC `server/`; Python 3.8, standard library only), runs
 the interface `ut-mesh`:
 - kernel WireGuard, or `wireguard-go` where the kernel has none (an OpenVZ
   container with `/dev/net/tun`);
@@ -294,7 +294,7 @@ occ untrash:tunnel sync --key <wg public> --endpoint <ip:port> --handshakes '{<p
   - the prefix must be a ULA `/48`;
   - every address must be inside it;
   - every key must be a WireGuard key.
-  Anything else is dropped (`nextcloud/tests/test_cloud_wg_checks.py`).
+  Anything else is dropped (UntrashNC `tests/test_cloud_wg_checks.py`).
 - The helper sets the address (`/48`), one `/128` per NAS and no endpoints:
   the NAS connect out, and WireGuard roaming learns where they are.
 - The app keeps the handshakes for its settings page. It writes them only

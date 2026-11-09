@@ -2,8 +2,10 @@
 
 Status (2026-11-03):
 - Phase 1 (NAS side) and the Desk UI are done on the PC.
-- Phase 2 (the Nextcloud app `nextcloud/untrash`) is tested against a real
-  Nextcloud 25 in Docker.
+- Phase 2 (the Nextcloud app `untrash`) is tested against a real
+  Nextcloud in Docker. Since 2026-11-09 the app, its tunnel helper and their
+  tests live in their own repository,
+  [UntrashNC](https://github.com/P4R4D16M4/UntrashNC) (AGPL-3.0-or-later).
 - The contract is in `cloud-api.md`.
 - The tunnel (the Nextcloud server as a WireGuard peer, `cloud-api.md` §4)
   is done on the PC.
@@ -118,7 +120,7 @@ WireGuard peer.
   - settings page: **Tunnel connected**, and **Use the mesh address** for
     the feed;
   - external storages are matched by IP value (`fd00::1` = `fd00:0::1`).
-- Root helper `nextcloud/server/untrash-cloud-wg` with a systemd unit:
+- Root helper `untrash-cloud-wg` (UntrashNC `server/`) with a systemd unit:
   kernel WireGuard or wireguard-go, ip6tables (answers only).
 - Tests:
   - `test-cloudlink-host.py`: record key, peer on both NAS, malformed key,
@@ -167,10 +169,10 @@ WireGuard peer.
      (pass-through).
    - Open: the Desk UI (invite a Nextcloud, choose its shares), a hardware
      run (fanotify on the A9 and the stock ext4 volumes).
-2. **Done (2026-11-03): the Nextcloud app `nextcloud/untrash`**, PHP 7.4+,
+2. **Done (2026-11-03): the Nextcloud app `untrash`** (UntrashNC), PHP 7.4+,
    Nextcloud 25 to 35 (app 0.5.0; tested on 25, 30, 32, 33, 34 and 35).
    - Translations: de, de_DE (the same neutral German), fr. The source is
-     `nextcloud/l10n/catalog.py`; `build.py` writes `untrash/l10n/`, and
+     `l10n/catalog.py` in UntrashNC; `build.py` writes `untrash/l10n/`, and
      `make test` checks that every text is translated.
    - Join: admin settings page or `occ untrash:join`.
    - Directory `POST <dir>/v1/sync`, with the merge rules of untrash-mesh.
@@ -180,7 +182,8 @@ WireGuard peer.
      `getUpdater()->update/remove` on every WebDAV external storage whose URL
      is the NAS and whose folder is `webdav/<share>`. A rescan does one
      recursive scan.
-   - Test: `make test-nextcloud APACHEROOT=… [NC_IMAGE=…]` with the real NAS
+   - Test (UntrashNC): `make test-nextcloud UNTRASHOS=… APACHEROOT=… [NC_IMAGE=…]`
+     with the real NAS
      services (untrash-mesh, untrash-cloudlink, Apache WebDAV and HTTPS),
      24 checks. It passes on `nextcloud:25-apache` and `nextcloud:30-apache`
      (2026-11-03), including the background job (cron.php).
