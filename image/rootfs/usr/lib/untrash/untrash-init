@@ -166,6 +166,16 @@ if [ -x /usr/lib/untrash/untrash-pfe-firmware ]; then
 		log "no PFE firmware: no network"
 fi
 
+# board: device model (NAS520/540/542: name, number of bays) from the install
+# record (MODEL_ID / FWVERSION, the stock Barebox env) and the stock kernel,
+# for the Desk, untrash-storage and MQTT (/run/untrash/model.json,
+# docs/board-interface.md).  The MAC addresses stay out of /run.
+mkdir -p /run/untrash
+echo "$devenv" | grep -E '^(MODEL_ID=[A-Za-z0-9]{1,8}|FWVERSION=[A-Za-z0-9.]{1,32}|ACTIVE_SLOT=[12])$' >/run/untrash/device.env
+if [ -x /usr/lib/untrash/untrash-model ]; then
+	m=$(/usr/lib/untrash/untrash-model 2>&1) && log "model $m" || log "model detection failed: $m"
+fi
+
 if [ -n "$DISK" ] && SWAP=$(part_dev ut-swap "$DISK"); then
 	if empty "$SWAP"; then
 		mkswap -L ut-swap "$SWAP" >/dev/null 2>&1 && log "mkswap $SWAP" || log "mkswap $SWAP failed"

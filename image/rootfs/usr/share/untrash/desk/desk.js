@@ -121,7 +121,7 @@ function loginScreen(st) {
   setTimeout(() => { const l = $('#lang'); if (l) l.onchange = () => UTI18N.set(l.value); });
   $('#app').innerHTML = `<main class="ut-login"><form class="ut-login__card" id="lf">
     <img class="ut-login__logo" src="/ut/assets/logo-mark-192.png" alt=""><img class="ut-login__word" src="/ut/assets/wordmark-300.png" alt="UntrashOS">
-    <div class="ut-login__host">${esc(st.hostname)} · NAS542</div>
+    <div class="ut-login__host" translate="no">${esc(st.hostname)}${st.model ? ' · ' + esc(st.model) : ''}</div>
     <div class="ut-login__lang">${langSel('lang', UTI18N.lang)}</div>
     <div class="ut-field"><label for="u">User name</label><input class="ut-input" id="u" autocomplete="username" value="admin"></div>
     <div class="ut-field"><label for="p">Password</label><input class="ut-input" id="p" type="password" autocomplete="current-password"></div>
@@ -546,7 +546,7 @@ VIEWS.overview = async b => {
   const memUsed = o.mem_total - o.mem_avail;
   const svc = Object.entries(o.services).map(([u, s]) => `<span class="ut-pill ${s === 'active' ? 'ut-pill--ok' : 'ut-pill--plain'}">${esc(u)}: ${s === 'active' ? 'running' : 'off'}</span>`).join(' ');
   b.innerHTML = `<div class="ut-window__main">
-    <div class="grid-3"><div class="ut-stat"><div class="ut-stat__label">UntrashOS</div><div class="ut-stat__value" style="font-size:16px">${esc(o.version)}</div></div>
+    <div class="grid-3"><div class="ut-stat"><div class="ut-stat__label">UntrashOS</div><div class="ut-stat__value" style="font-size:16px">${esc(o.version)}${o.model ? `<small translate="no"> · ${esc(o.model)}</small>` : ''}</div></div>
       <div class="ut-stat"><div class="ut-stat__label">Uptime · load</div><div class="ut-stat__value">${up}<small> · ${esc(o.load.join(' '))}</small></div></div>
       <div class="ut-stat"><div class="ut-stat__label">Memory (RAM)</div><div class="ut-stat__value">${(memUsed / 1048576).toFixed(0)}<small>/ ${(o.mem_total / 1048576).toFixed(0)} MB</small></div></div></div>
     ${o.unsupported.length ? `<div class="ut-callout ut-callout--warn" style="margin-bottom:12px"><div><b>Active on stock, not taken over in UntrashOS:</b><ul>${o.unsupported.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div></div>` : ''}

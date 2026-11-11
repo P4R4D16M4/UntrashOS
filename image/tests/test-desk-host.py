@@ -188,6 +188,7 @@ def main():
             a, u, g = Client(port), Client(port), Client(port)
             st, j = a.req("/api/state")
             check("state: initialized, not logged in", st == 200 and j["initialized"] and not j["user"])
+            check("state: no board data, neutral model", j["model"] == "NAS")
             st, page = a.req("/")
             check("index page served", st == 200 and b"desk.js" in page)
             st, _ = a.req("/ut/untrash.css")
@@ -218,7 +219,13 @@ def main():
             me = a.req("/api/me")[1]
             check("me admin", me["user"] == "admin" and me["admin"] is True)
             check("alice is no admin, overview 403", u.req("/api/overview")[0] == 403)
+            os.makedirs(r + "/run/untrash", exist_ok=True)
+            with open(r + "/run/untrash/model.json", "w") as f:      # board untrash-model (NAS520)
+                json.dump({"id": "B203", "name": "NAS520", "title": "Zyxel NAS520", "bays": 2, "source": "stock-env"}, f)
+            check("state: model from the board", a.req("/api/state")[1]["model"] == "NAS520")
             st, o = a.req("/api/overview")
+            check("overview: model title", o.get("model") == "Zyxel NAS520")
+            os.unlink(r + "/run/untrash/model.json")
             check("overview: version, RAID, volumes", st == 200 and o["version"] == "test-desk-1" and
                   o["arrays"][0]["health"] == "UU" and len(o["volumes"]) == 2)
             st, us = a.req("/api/users")

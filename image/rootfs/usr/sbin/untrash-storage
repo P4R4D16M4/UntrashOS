@@ -74,8 +74,9 @@ MD_NAMES = E("ZT_STORAGE_MDNAMES", "md2 md3 md4 md5").split()
 MDX_FW = E("ZT_STORAGE_MDFW", "md0")
 MDX_SWAP = E("ZT_STORAGE_MDSWAP", "md1")
 
-# storage_def
-BAY_NUM = 4
+# storage_def; BAY_NUM is the stock intern_disk_chker -n: 4 on the NAS540/542,
+# 2 on the NAS520 (board model, untrash_bays.bay_count); md0/md1 span it
+BAY_NUM = int(E("ZT_STORAGE_BAYNUM", "0")) or (untrash_bays.bay_count() if hasattr(untrash_bays, "bay_count") else 4)
 LEGAL_FW_SIZ = 3997696
 LEGAL_SWAP_SIZ = 3999744
 CHUNK_SIZ = 64

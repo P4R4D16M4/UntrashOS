@@ -39,6 +39,8 @@ RUNDIR = os.environ.get("ZT_INSTALLER_RUNDIR", "/run/untrash/installer")   # tmp
 if TEST:  # self-tests: stock disks are partitioned loop devices (every importer call)
     os.environ.setdefault("ZT_IMPORT_DEVGLOB", "/dev/loop*p[0-9]")
 IMPORT = os.environ.get("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "pylib"))
+import untrash_device  # noqa: E402
 KEY_PROG1 = 148          # NAS542 COPY button (gpio-keys-polled, DT label "copy")
 COPY_WAIT = 60
 BOOTSTATE = b"ZTBS1 pref=a a=3 b=3 good=- booting=-\n"
@@ -228,7 +230,8 @@ def scan():
     cfg = stock_config_dir(stick)
     return {"stick": stick, "backups": stick_backups(stick) if stick else [], "markers": stick_markers(stick),
             "slot": slot_source(stick), "disks": disks, "stock_arrays": arrays,
-            "stock_config": cfg, "import_plan": import_plan(cfg)}
+            "stock_config": cfg, "import_plan": import_plan(cfg),
+            "model": untrash_device.model(os.environ.get("ZT_INSTALLER_ROOT", ""))["title"]}
 
 
 def import_plan(cfg):
@@ -438,6 +441,8 @@ def do_wipe_install(req, info):
 
 
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9]{1,8}$")
+FWVERSION_RE = re.compile(r"^[A-Za-z0-9.]{1,32}$")
 
 
 def device_record(info):
@@ -452,6 +457,10 @@ def device_record(info):
                      if MAC_RE.match(b["device"].get(k, ""))]
             if b["device"].get("ACTIVE_SLOT") in ("1", "2"):
                 lines.append("ACTIVE_SLOT=%s" % b["device"]["ACTIVE_SLOT"])
+            # stock model id and firmware version (Barebox modelid_/fwversion_<slot>)
+            for k, rx in (("MODEL_ID", MODEL_ID_RE), ("FWVERSION", FWVERSION_RE)):
+                if rx.match(b["device"].get(k, "")):
+                    lines.append("%s=%s" % (k, b["device"][k]))
             if lines:
                 return ("\n".join(lines) + "\n").encode()
     return None
@@ -965,7 +974,7 @@ body{margin:0;background:#0d1115;color:#e9eef2;font:15px/1.5 system-ui,sans-seri
 details summary{cursor:pointer;color:var(--ut-fg-2);margin-top:10px}
 </style></head><body class="ut"><div class="ut-page">
 <header class="ut-page__head"><span class="ut-brand"><img src="ut/assets/logo-mark-96.png" alt=""><b>Untrash<span>OS</span></b></span>
-<span class="ut-faint" id="sub">Zyxel NAS542 · first setup</span>
+<span class="ut-faint" id="sub"><span id="model" translate="no"></span> · <span>First setup</span></span>
 <a href="manual/" target="_blank" rel="noopener" style="margin-left:auto">User guide</a>
 <select class="ut-select" id="lang" translate="no" style="width:auto;margin-left:12px" aria-label="Language"><option value="en">English</option><option value="de">Deutsch</option><option value="fr">Français</option></select></header>
 <main class="ut-page__main">
@@ -984,7 +993,7 @@ const gb=b=>(b/1e9).toFixed(b>1e11?0:1)+' GB';
 const KIND={untrash:'UntrashOS',stock:'Zyxel-Stock',empty:'empty',raid:'RAID member',foreign:'unknown'};
 const KPILL={untrash:'ok',stock:'info',empty:'',raid:'info',foreign:'warn'};
 async function load(){INFO=await (await fetch('api/scan')).json();render()}
-function render(){const i=INFO;let h='<div class=found-meta>';
+function render(){const i=INFO;let h='<div class=found-meta>';$('#model').textContent=i.model||'NAS';
  h+=i.stick?`<span class="ut-pill ut-pill--ok">Stick: ${esc(i.stick.model)} · ${gb(i.stick.size)}</span>`+(i.slot?`<span class="ut-pill ut-pill--ok">System image ${esc(i.slot.version)}</span>`:'<span class="ut-pill ut-pill--danger">System image missing</span>')+(i.backups.some(b=>b.stock&&b.verified)?'<span class="ut-pill ut-pill--ok">Stock backup present, checked</span>':(i.backups.some(b=>b.stock)?'<span class="ut-pill ut-pill--warn">Stock backup present (not checked)</span>':'<span class="ut-pill ut-pill--danger">No stock backup</span>')):'<span class="ut-pill ut-pill--danger">No UntrashOS stick found</span>';
  if(i.stock_config)h+='<span class="ut-pill ut-pill--info">Stock configuration on the stick</span>';
  h+='</div><div class=ut-table-wrap><table class=ut-table><thead><tr><th>Disk</th><th class=num>Size</th><th>Model</th><th>Contents</th></tr></thead><tbody>';

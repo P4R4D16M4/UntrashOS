@@ -148,5 +148,4 @@ T = {
     "What should happen?": ("Was soll passieren?", "Que doit-il se passer ?"),
     "Workgroup": ("Arbeitsgruppe", "Groupe de travail"),
     "Write cache": ("Schreibcache", "Cache d'écriture"),
-    "Zyxel NAS542 · first setup": ("Zyxel NAS542 · Erstkonfiguration", "Zyxel NAS542 · première configuration"),
 }

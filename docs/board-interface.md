@@ -57,6 +57,10 @@ out; items marked *optional* are skipped when missing.
 |---|---|---|
 | `/usr/lib/untrash/untrash-power boot\|shutdown\|tick\|next` | untrash-config, Desk power settings, `untrash-power*.service` | power-loss mode, Wake-on-LAN, scheduled power-on/off; `next` prints JSON `{"on": …, "off": …, "off_action": …}` |
 | `/usr/lib/untrash/pylib/untrash_bays.py` → `bays()` | untrash-storage (disks, bay LEDs) | `{"disk1": "/dev/sdb", …}`: internal disks by bay |
+| `untrash_bays.bay_count()` | untrash-storage (`BAY_NUM`: RAID limits, width of the stock md0/md1 mirrors) | number of bays of this device; *optional*, default 4 |
+| `/usr/lib/untrash/untrash-model` | untrash-init, after the network firmware, before systemd | writes `/run/untrash/model.json` `{"id", "name", "title", "bays", "source"}` (e.g. `"NAS520"`, `"Zyxel NAS520"`, `2`); *optional* |
+| `/run/untrash/model.json` | Desk (login, overview), installer page, MQTT device, via `pylib/untrash_device.py` | without it the board's `board.json` `title` is shown, without that a neutral "NAS"; a board must never guess a model it did not detect |
+| `/run/untrash/device.env` | the board's model detection | written by untrash-init from the install record: `MODEL_ID`, `FWVERSION`, `ACTIVE_SLOT` (only these; the MAC addresses stay out of /run) |
 | `/usr/lib/untrash/untrash-pfe-firmware CACHE` | untrash-init, before systemd | prepares network firmware; *optional* |
 | `/run/untrash/fan.json` | Desk status (untrash_live) | JSON with `temp_c` and `time` (stale after 60 s), written by the board's fan control; *optional* |
 | `/sys/bus/platform/devices/*buzzer*/play` | untrash-sound | write `"<hz> <ms>"`, one square-wave voice; *optional* |

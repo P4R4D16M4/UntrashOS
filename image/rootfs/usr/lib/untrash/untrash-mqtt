@@ -38,6 +38,7 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "pylib"))
+import untrash_device  # noqa: E402
 import untrash_live  # noqa: E402
 
 E = os.environ.get
@@ -361,7 +362,7 @@ class Bridge:
 
     def device(self):
         return {"identifiers": [device_uid(self.host)], "name": self.host, "manufacturer": "UntrashOS",
-                "model": jload(R + "/usr/share/untrash/board.json", {}).get("title") or "NAS",
+                "model": untrash_device.model(R)["title"],
                 "sw_version": first(R + VERSION, "?").strip(),
                 "configuration_url": "http://%s.local/" % self.host}
 

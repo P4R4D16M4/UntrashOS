@@ -49,6 +49,7 @@ R = os.environ.get("ZT_DESK_ROOT", "") if TEST else ""
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "pylib"))
 import untrash_auth  # noqa: E402
+import untrash_device  # noqa: E402
 import untrash_live  # noqa: E402
 import untrash_tv  # noqa: E402
 import untrash_slot  # noqa: E402
@@ -1614,11 +1615,12 @@ def overview():
     md = []
     stat = first("/proc/mdstat")
     for m in re.finditer(r"^(md\d+) : (\w+) (\w+) (.*?)\n.*?\[([U_]+)\]", stat, re.M | re.S):
-        if m.group(1) in ("md0", "md1"):     # stock firmware/swap mirrors over 4 bays (untrash-storage)
+        if m.group(1) in ("md0", "md1"):     # stock firmware/swap mirrors over all bays (untrash-storage)
             continue
         md.append({"name": m.group(1), "state": m.group(2), "level": m.group(3), "health": m.group(5),
                    "degraded": "_" in m.group(5)})
     return {"hostname": s["hostname"], "version": first("/etc/untrash-version", "?"),
+            "model": untrash_device.model(R)["title"],
             "uptime": int(up), "load": first("/proc/loadavg").split()[:3],
             "mem_total": mem.get("MemTotal", 0), "mem_avail": mem.get("MemAvailable", 0),
             "addresses": addrs, "services": units, "volumes": volumes(), "arrays": md,
@@ -3953,6 +3955,7 @@ class Handler(BaseHTTPRequestHandler):
             raise Fail("Missing X-UT header (CSRF protection).", 403)
         if p == "/api/state":
             return self.reply(200, {"initialized": initialized(), "hostname": settings_load()["hostname"],
+                                    "model": untrash_device.model(R)["name"],
                                     "language": settings_load().get("language", "en"),
                                     "user": session_user(self), "reset_window": reset_window()})
         if p in ("/api/reset-admin", "/api/setup", "/api/login", "/api/login/app") and method == "POST" and plain_from_internet(self):
