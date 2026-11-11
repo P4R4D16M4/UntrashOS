@@ -1,0 +1,13 @@
+[Unit]
+Description=UntrashOS: UntrashKey (paired USB stick as hardware key for SSH, terminal, critical Desk areas)
+ConditionKernelCommandLine=!untrash.installer=1
+After=local-fs.target systemd-udev-settle.service untrash-settings.service
+Before=ssh.service
+
+[Service]
+ExecStart=/usr/lib/untrash/untrash-key-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

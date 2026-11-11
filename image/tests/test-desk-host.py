@@ -126,7 +126,30 @@ def env_for(r, stick, port):
                 ZT_TRANSFER_CHUNK="65536", ZT_TRANSFER_DELAY="0.02",
                 ZT_DLNA_URL="http://127.0.0.1:9/", ZT_PROJECT=os.path.join(FILES, "usr/share/untrash/project.json"),
                 ZT_ADBLOCK_TOOL=os.path.join(FILES, "usr/lib/untrash/untrash-adblock"), ZT_ADBLOCK_STORE=r + "/etc/untrash/adblock.json",
-                ZT_ADBLOCK_DATA=r + "/var/lib/untrash/adblock", ZT_ADBLOCK_RUN=r + "/run/untrash/adblock")
+                ZT_ADBLOCK_DATA=r + "/var/lib/untrash/adblock", ZT_ADBLOCK_RUN=r + "/run/untrash/adblock",
+                ZT_KEY_ROOT=r + "/keyroot", ZT_KEY_STICKDIR=r + "/keystick", ZT_KEY_SYSLOG=r + "/keysys.log",
+                ZT_STICK_ARCHIVE=r + "/stickarchive", ZT_STICK_MNT=r + "/newstick", ZT_STICK_CMDLOG=r + "/stickcmd.log",
+                ZT_STICK_SYS=r + "/keyroot/sys/class/block")
+
+
+def key_plug(r, seq):
+    """UntrashKey test stick: USB disk sdb, label UNTRASHPK, attach number SEQ (None: pulled)."""
+    k = r + "/keyroot"
+    lbl = k + "/dev/disk/by-label/UNTRASHPK"
+    if os.path.lexists(lbl):
+        os.remove(lbl)
+    if seq is None:
+        return
+    os.makedirs(k + "/dev/disk/by-label", exist_ok=True)
+    os.makedirs(r + "/keystick/UNTRASH", exist_ok=True)
+    open(k + "/dev/sdb1", "w").close()
+    os.symlink("../../sdb1", lbl)
+    d = k + "/sys/devices/usb1/1-1/block/sdb"
+    os.makedirs(d + "/sdb1", exist_ok=True)
+    open(d + "/diskseq", "w").write(str(seq))
+    os.makedirs(k + "/sys/class/block", exist_ok=True)
+    if not os.path.lexists(k + "/sys/class/block/sdb1"):
+        os.symlink(d + "/sdb1", k + "/sys/class/block/sdb1")
 
 
 class Client:
@@ -228,6 +251,40 @@ def main():
             os.unlink(r + "/run/untrash/model.json")
             check("overview: version, RAID, volumes", st == 200 and o["version"] == "test-desk-1" and
                   o["arrays"][0]["health"] == "UU" and len(o["volumes"]) == 2)
+            # UntrashKey: off by default; pairing needs a replug; on: protected areas need the stick
+            kill = {"pid": 999999, "start": 0}
+            st, k = a.req("/api/untrashkey")
+            check("UntrashKey: off by default, no keys", st == 200 and not k["enabled"] and k["keys"] == [])
+            check("UntrashKey off: a system action is not held back", a.req("/api/processes/kill", kill)[0] != 423)
+            check("UntrashKey: only admins", u.req("/api/untrashkey")[0] == 403)
+            check("UntrashKey: a key belongs to an administrator", a.req("/api/untrashkey/pair", {"name": "K", "user": "alice"})[0] == 400)
+            st, j = a.req("/api/untrashkey/create", {"name": "K"})
+            check("UntrashKey: creating a stick needs FORMAT", st == 400 and "FORMAT" in j["error"])
+            st, j = a.req("/api/untrashkey/create", {"name": "K", "confirm": "FORMAT"})
+            check("UntrashKey: creating a stick needs the archive", st == 400 and "archive" in j["error"])
+            check("UntrashKey: no archive yet", a.req("/api/untrashkey")[1]["archive"] is None)
+            key_plug(r, 1)
+            a.req("/api/untrashkey/pair", {"name": "Keyring"})
+            check("UntrashKey: pairing waits for the replug", a.req("/api/untrashkey")[1]["pairing"]["state"] == "waiting")
+            key_plug(r, 2)
+            k = a.req("/api/untrashkey")[1]
+            check("UntrashKey: replugged stick paired and present", k["pairing"]["state"] == "done" and k["present"])
+            check("UntrashKey: the key belongs to the admin who paired it", k["keys"][0]["user"] == "admin" and k["current"] == k["keys"][0]["id"])
+            st, k = a.req("/api/untrashkey/save", {"enabled": True, "protect": ["ssh", "terminal", "access", "exposure", "system"]})
+            check("UntrashKey: switched on with the stick", st == 200 and k["enabled"])
+            check("UntrashKey: with the stick the action runs", a.req("/api/processes/kill", kill)[0] != 423)
+            key_plug(r, None)
+            st, j = a.req("/api/processes/kill", kill)
+            check("UntrashKey pulled: system action answers 423 + area", st == 423 and j.get("untrashkey") == "system")
+            check("UntrashKey pulled: settings outside the areas still work", a.req("/api/settings", {"language": "en"})[0] == 200)
+            check("UntrashKey pulled: service settings need the key", a.req("/api/settings", {"services": {}})[1].get("untrashkey") == "exposure")
+            check("UntrashKey pulled: another user's password needs the key",
+                  a.req("/api/password", {"name": "alice", "password": "Alice-Neu-1234"})[1].get("untrashkey") == "access")
+            check("UntrashKey pulled: data area not chosen, not held back", a.req("/api/raid/job", {})[0] != 423)
+            check("UntrashKey pulled: cannot be switched off", a.req("/api/untrashkey/save", {"enabled": False})[0] == 409)
+            key_plug(r, 3)
+            check("UntrashKey back in (new attach): switched off", a.req("/api/untrashkey/save", {"enabled": False})[1]["enabled"] is False)
+            key_plug(r, None)
             st, us = a.req("/api/users")
             check("users list", st == 200 and {x["name"] for x in us["users"]} >= {"admin", "alice", "bob", "pc-guest"})
             # users

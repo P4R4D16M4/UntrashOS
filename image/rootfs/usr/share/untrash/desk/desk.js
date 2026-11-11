@@ -7,7 +7,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const gb = b => b >= 1e12 ? (b / 1e12).toFixed(1) + ' TB' : b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : (b / 1e6).toFixed(0) + ' MB';
 const size = b => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : gb(b);
-const ICON = n => /^(mesh|settings|logs|packages)$/.test(n) ? `/ut/assets/icons/${n}.svg` : `/ut/assets/icons/${n}-128.png`;
+const ICON = n => /^(mesh|settings|logs|packages|key)$/.test(n) ? `/ut/assets/icons/${n}.svg` : `/ut/assets/icons/${n}-128.png`;
 let ME = null;
 
 /* busy feedback: while requests a click started are running, the pointer
@@ -38,8 +38,41 @@ async function apiRaw(path, body, raw) {
     await appWait({ title: j.action, code: j.code, poll: () => apiRaw('confirm?id=' + encodeURIComponent(j.confirm)) });
     return apiRaw(path, Object.assign({}, body, { confirm: j.confirm }));
   }
+  // UntrashKey on: the paired stick has to be plugged in for this action
+  if (r.status === 423 && j.untrashkey) {
+    await keyWait(j.untrashkey);
+    return apiRaw(path, body, raw);
+  }
   if (!r.ok) throw new Error(j.error || ('Error ' + r.status));
   return j;
+}
+/* UntrashKey: waits until the paired stick is plugged in (resolves) or the
+   admin cancels (throws); cat = the protected area that asked for it */
+const KEY_AREAS = {
+  ssh: ['SSH', 'sshd runs only while the key is plugged in; pulling it ends every SSH session.'],
+  terminal: ['Web terminal', 'Opens only with the key plugged in; pulling it closes the session.'],
+  access: ['Accounts and access', 'Users and groups, admin rights, other users\' passwords and sign-in, UntrashApp and mesh links.'],
+  exposure: ['Network exposure', 'Services and network settings, port forwarding (UPnP), certificate, iSCSI, smart home.'],
+  system: ['System', 'Installing updates and their settings, the way back to the stock firmware, ending processes.'],
+  data: ['Data and storage', 'RAID changes, shares, backup and cloud jobs, mesh shares and mirrors.'] };
+function keyWait(cat) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('div'); s.className = 'ut-scrim';
+    s.innerHTML = `<div class="ut-dialog" role="dialog" aria-modal="true"><div class="ut-dialog__head"><h2>${esc(UTI18N.tr('Plug in your UntrashKey'))}</h2></div>
+      <div class="ut-dialog__body"><div class="ut-appwait"><img src="${ICON('key')}" alt="">
+      <p>${esc(UTI18N.tr('This needs the UntrashKey: plug the paired stick into the NAS. It goes on by itself.'))}</p>
+      <p class="ut-faint">${esc(UTI18N.tr((KEY_AREAS[cat] || [cat])[0]))}</p><p class="ut-faint" id="kwt"></p></div></div>
+      <div class="ut-dialog__foot"><button class="ut-btn" data-x>Cancel</button></div></div>`;
+    document.body.append(s);
+    const t0 = Date.now(), stop = (fn, x) => { clearInterval(iv); s.remove(); fn(x); };
+    s.querySelector('[data-x]').onclick = () => stop(reject, new Error(UTI18N.tr('Cancelled.')));
+    const iv = setInterval(async () => {
+      const left = Math.max(0, 300 - Math.round((Date.now() - t0) / 1000));
+      s.querySelector('#kwt').textContent = UTI18N.tr('%s s left').replace('%s', left);
+      if (!left) return stop(reject, new Error(UTI18N.tr('No UntrashKey plugged in.')));
+      try { if ((await apiRaw('untrashkey')).present) stop(resolve); } catch (e) { stop(reject, e); }
+    }, 1500);
+  });
 }
 /* waits until the UntrashApp answers a request: shows the number to choose
    in the app; resolves on approval, throws on denial or timeout */
@@ -186,6 +219,7 @@ const APPS = {
   logs: { name: 'Logs', icon: 'logs', w: 860, h: 520 },
   status: { name: 'Status', icon: 'status', w: 760, h: 540 },
   terminal: { name: 'Terminal', icon: 'terminal', w: 860, h: 520 },
+  untrashkey: { name: 'UntrashKey', icon: 'key', w: 820, h: 660 },
   mesh: { name: 'UntrashMesh', icon: 'mesh', w: 860, h: 600 },
   sound: { name: 'Sounds', icon: 'synth', w: 1040, h: 700 },
   feedback: { name: 'Feedback', icon: 'feedback', w: 720, h: 600 },
@@ -201,7 +235,7 @@ const DOCK_ADMIN = ['overview', 'files',
   { g: 'data', name: 'Data', apps: ['shares', 'storage', 'transfers', 'backup', 'cloud', 'downloads'] },
   { g: 'net', name: 'Network', apps: ['network', 'mesh', 'adblock'] },
   { g: 'media', name: 'Media', apps: ['media', 'tv', 'sound'] },
-  { g: 'system', name: 'System', apps: ['status', 'users', 'settings', 'updates', 'logs', 'terminal'] },
+  { g: 'system', name: 'System', apps: ['status', 'users', 'settings', 'updates', 'logs', 'terminal', 'untrashkey'] },
   { g: 'help', name: 'Help', apps: ['manual', 'feedback'] }];
 const dockItem = k => `<button class="ut-dock__item" data-app="${k}" aria-label="${APPS[k].name}"><img src="${ICON(APPS[k].icon)}" alt=""><span class="ut-tip">${APPS[k].name}</span></button>`;
 const dockGroup = g => `<button class="ut-dock__item ut-dock__group" data-group="${g.g}" aria-label="${g.name}" aria-haspopup="menu" aria-expanded="false">
@@ -1936,6 +1970,8 @@ const loadOnce = (tag, attrs) => new Promise((ok, bad) => {
   const e = Object.assign(document.createElement(tag), attrs); e.dataset.once = key; e.onload = ok; e.onerror = bad; document.head.append(e);
 });
 VIEWS.terminal = async b => {
+  const k = await api('untrashkey');
+  if (k.enabled && k.protect.includes('terminal') && !k.present) await keyWait('terminal');
   await loadOnce('link', { rel: 'stylesheet', href: '/desk/vendor/xterm/xterm.css' });
   await loadOnce('script', { src: '/desk/vendor/xterm/xterm.js' });
   await loadOnce('script', { src: '/desk/vendor/xterm/xterm-addon-fit.js' });
@@ -1953,6 +1989,87 @@ VIEWS.terminal = async b => {
   term.onResize(({ cols, rows }) => send({ t: 'r', c: cols, r: rows }));
   const ro = new ResizeObserver(() => { try { fit.fit(); } catch (e) { } }); ro.observe(b);
   CLEANUP.terminal = () => { ro.disconnect(); ws.close(); term.dispose(); };
+};
+
+/* UntrashKey: the paired USB stick as hardware key (untrash_key.py) ------ */
+VIEWS.untrashkey = async b => {
+  const [k, us] = await Promise.all([api('untrashkey'), api('users')]), p = k.pairing, ar = k.archive, job = k.archive_job || {};
+  const admins = us.users.filter(u => u.admin).map(u => u.name);
+  const pill = (on, a, c) => `<span class="ut-pill ${on ? 'ut-pill--ok' : 'ut-pill--plain'}">${esc(on ? a : c)}</span>`;
+  const owner = id => `<select class="ut-select" id="${id}" translate="no">${admins.map(n => `<option${n === ME.user ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select>`;
+  const again = () => setTimeout(() => { if (document.body.contains(b)) render('untrashkey'); }, 1500);
+  let pair;
+  if (p && p.state === 'waiting') {
+    const left = esc(UTI18N.tr('%s s left').replace('%s', Math.max(0, p.expires - Math.round(Date.now() / 1000))));
+    pair = p.mode === 'create'
+      ? `<div class="ut-callout ut-callout--warn"><div><b>${esc(UTI18N.tr('Plug a USB stick into the NAS now.'))}</b>
+          ${esc(UTI18N.tr('Everything on it is erased. It needs at least %s MB.').replace('%s', Math.ceil(k.archive_need / 1e6)))}<p class="ut-faint">${left}</p></div></div>`
+      : `<div class="ut-callout ut-callout--info"><div><b>${esc(UTI18N.tr('Pull the UntrashOS stick out of the NAS and plug it in again.'))}</b>
+          ${esc(UTI18N.tr('This shows that someone is at the NAS. The stick gets a new random key; this NAS keeps only its fingerprint.'))}<p class="ut-faint">${left}</p></div></div>`;
+    pair += `<div class="row"><button class="ut-btn" id="kpc">Cancel</button></div>`;
+    again();
+  } else if (p && p.state === 'writing') {
+    pair = `<div class="ut-callout ut-callout--info"><div><span class="ut-spinner"></span> <b>${esc(UTI18N.tr('Writing the key stick – do not pull it.'))}</b>
+      <p class="ut-faint">${esc(UTI18N.tr(p.step || ''))}</p></div></div>`;
+    again();
+  } else {
+    const res = !p ? '' : p.state === 'done' ? `<div class="ut-callout ut-callout--ok"><div>${esc(UTI18N.tr(p.mode === 'create' ? 'Key stick "%s" is ready. Pull it and keep it safe.' : 'Stick paired as "%s".').replace('%s', p.name))}</div></div>`
+      : p.state === 'failed' ? `<div class="ut-callout ut-callout--danger"><div translate="no">${esc(p.error || '')}</div></div>`
+      : `<div class="ut-callout ut-callout--warn"><div>${esc(UTI18N.tr('Timed out: no stick was plugged in.'))}</div></div>`;
+    pair = `${res}<div class="row">${field('kname', 'Name of the key', '', 'placeholder="' + esc(UTI18N.tr('e.g. key ring')) + '"')}
+      <div class="ut-field"><label for="kuser">${esc(UTI18N.tr('Belongs to'))}</label>${owner('kuser')}</div></div>
+      <div class="row"><button class="ut-btn ut-btn--primary" id="kpair">Pair a stick</button>
+      <button class="ut-btn" id="kmake"${ar ? '' : ' disabled'}>Create a key stick</button></div>`;
+  }
+  const arch = ar ? `<p>${esc(UTI18N.tr('System %s for new sticks').replace('%s', ar.version))} · ${gb(ar.bytes)}</p>
+      <p class="ut-faint">${esc(ar.stock ? UTI18N.tr('With the stock backup of this NAS (%s): new sticks can also take it back to the Zyxel firmware.').replace('%s', ar.stock)
+        : UTI18N.tr('Without a stock backup: only the original stick can take this NAS back to the Zyxel firmware.'))}</p>`
+    : `<p class="ut-faint">${esc(UTI18N.tr('No stick archive yet (installed before 1.2). Plug in the original UntrashOS stick of this NAS and store it, then the NAS can make new sticks.'))}</p>`;
+  b.innerHTML = `<div class="ut-window__main">
+    <p class="ut-muted">${esc(UTI18N.tr('UntrashKey makes your UntrashOS stick a hardware key. The protected areas work only while it is plugged into the NAS, so a stolen or guessed admin password alone gives no shell and no lasting access.'))}</p>
+    <div class="row" style="margin-bottom:12px">${pill(k.enabled, 'UntrashKey on', 'UntrashKey off')} ${pill(k.present, 'Key plugged in', 'No key plugged in')}</div>
+    <div class="ut-section-title">Keys</div>
+    <div class="ut-card">${k.keys.length ? `<div class="ut-table-wrap"><table class="ut-table"><thead><tr><th>Name</th><th>Belongs to</th><th>ID</th><th>Added</th><th></th></tr></thead><tbody>${k.keys.map(x => `<tr>
+      <td translate="no">${esc(x.name)}${x.id === k.current ? ' <span class="ut-pill ut-pill--ok">plugged in</span>' : ''}</td><td translate="no">${esc(x.user || UTI18N.tr('every administrator'))}</td>
+      <td class="ut-faint" translate="no" style="font-family:ui-monospace,monospace">${esc(x.id)}</td>
+      <td class="ut-faint">${esc(x.added ? new Date(x.added).toLocaleDateString(UTI18N.locale) : '')}</td><td class="num"><button class="ut-btn ut-btn--ghost" data-krm="${esc(x.id)}">Remove</button></td></tr>`).join('')}</tbody></table></div>`
+      : `<p class="ut-faint">${esc(UTI18N.tr('No stick paired yet.'))}</p>`}
+      <p class="ut-faint">${esc(UTI18N.tr('A key opens the protected areas only for its administrator. The log names the key ID of every action it opens.'))}</p>${pair}</div>
+    <div class="ut-section-title">Protected areas</div>
+    <div class="ut-card">${k.categories.map(c => `<div style="margin-bottom:8px">${sw('kc-' + c, k.protect.includes(c), (KEY_AREAS[c] || [c])[0])}
+      <div class="ut-faint" style="margin-left:46px">${esc(UTI18N.tr((KEY_AREAS[c] || ['', ''])[1]))}</div></div>`).join('')}
+      <div style="margin-top:12px">${sw('kon', k.enabled, 'UntrashKey on')}</div>
+      <div class="row" style="margin-top:12px"><button class="ut-btn ut-btn--primary" id="ksave"${k.keys.length ? '' : ' disabled'}>Save</button></div>
+      <p class="ut-faint">${esc(UTI18N.tr('Switching on and every change while it is on need a paired stick plugged in. If you lose the stick: pair a new one here (sign in as admin, then pull and plug in the new stick at the NAS), then remove the old one.'))}</p></div>
+    <div class="ut-section-title">Stick archive</div>
+    <div class="ut-card">${arch}
+      ${job.state === 'running' ? `<p><span class="ut-spinner"></span> ${esc(UTI18N.tr('Storing the stick …'))}</p>` : job.state === 'failed' ? `<div class="ut-callout ut-callout--danger"><div translate="no">${esc((job.log || []).slice(-1)[0] || '')}</div></div>` : ''}
+      <div class="row"><button class="ut-btn" id="karch"${k.stick && job.state !== 'running' ? '' : ' disabled'}>${esc(UTI18N.tr(ar ? 'Store the plugged stick again' : 'Store the plugged stick'))}</button></div></div>
+    <div class="ut-section-title">SSH keys on the stick</div>
+    <div class="ut-card" id="ksshc">${k.present ? `<p class="ut-faint">${esc(UTI18N.tr('Public keys (one per line) that may log in as root while this stick is plugged in.'))}</p>
+      <textarea class="ut-input" id="kssh" rows="4" spellcheck="false" translate="no" style="font-family:ui-monospace,monospace;width:100%"></textarea>
+      <div class="row" style="margin-top:8px"><button class="ut-btn" id="ksshs">Save keys on the stick</button></div>`
+      : `<p class="ut-faint">${esc(UTI18N.tr('Plug in a paired stick to see or change its SSH keys.'))}</p>`}</div></div>`;
+  if (job.state === 'running') again();
+  const on = (id, fn) => { const e = $(id, b); if (e) e.onclick = fn; };
+  on('#kpair', () => api('untrashkey/pair', { name: $('#kname', b).value, user: $('#kuser', b).value }).then(() => render('untrashkey')).catch(fail));
+  on('#kmake', () => dialog({ kind: 'danger', title: UTI18N.tr('Create a key stick'), ok: 'Start', okCls: 'ut-btn--danger',
+    body: `<p>${esc(UTI18N.tr('The NAS writes a complete UntrashOS stick with its own key onto a USB stick you plug in next. Everything on that stick is erased.'))}</p>
+      ${field('kmn', 'Name of the key', $('#kname', b).value)}<div class="ut-field"><label for="kmu">${esc(UTI18N.tr('Belongs to'))}</label>${owner('kmu')}</div>
+      ${field('kmc', 'Type FORMAT to confirm', '', 'autocomplete="off"')}`,
+    onOk: s => api('untrashkey/create', { name: $('#kmn', s).value, user: $('#kmu', s).value, confirm: $('#kmc', s).value }).then(() => render('untrashkey')) }));
+  on('#kpc', () => api('untrashkey/pair-cancel', {}).then(() => render('untrashkey')).catch(fail));
+  on('#karch', () => api('untrashkey/archive', {}).then(() => render('untrashkey')).catch(fail));
+  b.querySelectorAll('[data-krm]').forEach(x => x.onclick = () => dialog({ kind: 'warn', title: UTI18N.tr('Remove this key?'), ok: 'Remove', okCls: 'ut-btn--danger',
+    body: `<p>${esc(UTI18N.tr('The stick no longer opens the protected areas. Pair it again to use it.'))}</p>`,
+    onOk: () => api('untrashkey/remove', { id: x.dataset.krm }).then(() => render('untrashkey')) }));
+  on('#ksave', () => api('untrashkey/save', { enabled: $('#kon', b).checked, protect: k.categories.filter(c => $('#kc-' + c, b).checked) })
+    .then(() => { toast('UntrashKey', UTI18N.tr('Saved.'), 'ok'); render('untrashkey'); }).catch(fail));
+  if (k.present) {
+    api('untrashkey/ssh-keys', {}).then(r => { $('#kssh', b).value = r.keys.join('\n'); }).catch(fail);
+    on('#ksshs', () => api('untrashkey/ssh-keys', { keys: $('#kssh', b).value.split('\n') })
+      .then(() => toast('UntrashKey', UTI18N.tr('Saved.'), 'ok')).catch(fail));
+  }
 };
 
 /* UntrashMesh: members, invitations (untrash-mesh) ------------------------ */

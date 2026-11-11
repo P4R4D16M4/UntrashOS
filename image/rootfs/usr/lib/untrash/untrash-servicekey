@@ -7,6 +7,12 @@
 # Without the stick nothing happens; the keys never reach persistent storage.
 OUT=${ZT_SK_OUT:-/run/untrash/servicekey}		# test hooks: ZT_SK_OUT, ZT_SK_NOSSH=1
 log() { echo "untrash-servicekey: $*"; echo "UNTRASH-SERVICEKEY: $*" >/dev/kmsg 2>/dev/null; }
+# UntrashKey on: only the paired stick counts, and only while it is plugged
+# in; untrash-key takes its keys over (pylib/untrash_key.py)
+if [ -z "${ZT_SK_OUT:-}" ] && grep -q '"enabled": true' /etc/untrash/untrashkey.json 2>/dev/null; then
+	log "UntrashKey is on: SSH keys come from the paired stick (untrash-key)"
+	exit 0
+fi
 dev=
 for i in $(seq 1 20); do
 	[ -e /dev/disk/by-label/UNTRASHPK ] && { dev=$(readlink -f /dev/disk/by-label/UNTRASHPK); break; }

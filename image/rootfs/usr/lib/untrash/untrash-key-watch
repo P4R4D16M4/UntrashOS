@@ -1,0 +1,20 @@
+#!/bin/sh
+# untrash-key-watch - follows the UntrashOS stick for UntrashKey
+# (untrash-key.service).  Every 2 s it looks at the stick's by-label link and
+# the attach number (diskseq) of its disk, both cheap; only on a change does
+# it run "untrash-key check", which verifies the key file and starts or stops
+# SSH.  Does nothing while UntrashKey is off and no stick is paired.
+CFG=/etc/untrash/untrashkey.json
+last=x
+while :; do
+	cur=
+	if [ -s "$CFG" ] && d=$(readlink -f /dev/disk/by-label/UNTRASHPK 2>/dev/null) && [ -e "$d" ]; then
+		s=/sys/class/block/${d##*/}
+		cur="$d $(cat "$s/diskseq" 2>/dev/null || cat "$s/../diskseq" 2>/dev/null)"
+	fi
+	if [ "$cur" != "$last" ]; then
+		/usr/lib/untrash/untrash-key check >/dev/null 2>&1 || echo "untrash-key check failed"
+		last=$cur
+	fi
+	sleep 2
+done

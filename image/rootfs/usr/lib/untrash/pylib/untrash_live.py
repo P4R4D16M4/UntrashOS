@@ -307,8 +307,10 @@ def _ws_recv(sock):
     return op, data
 
 
-def terminal(handler, user, shell_cmd=None):
-    """Serve one terminal session on handler's connection (blocks until closed)."""
+def terminal(handler, user, shell_cmd=None, alive=None):
+    """Serve one terminal session on handler's connection (blocks until closed).
+    alive(): checked every 2 s; the session ends when it turns false
+    (UntrashKey pulled)."""
     h = handler.headers
     key = h.get("Sec-WebSocket-Key", "")
     origin = re.sub(r"^https?://", "", h.get("Origin", ""))
@@ -348,10 +350,17 @@ def terminal(handler, user, shell_cmd=None):
             os._exit(127)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        idle = time.time()
         while True:
-            r, _, _ = select.select([sock, fd], [], [], 600)
+            r, _, _ = select.select([sock, fd], [], [], 2)
+            if alive and not alive():
+                _ws_send(sock, b"\r\n\x1b[31m[UntrashKey removed: session closed]\x1b[0m\r\n")
+                break
             if not r:
-                break            # 10 min without any traffic
+                if time.time() - idle > 600:
+                    break        # 10 min without any traffic
+                continue
+            idle = time.time()
             if fd in r:
                 try:
                     out = os.read(fd, 65536)

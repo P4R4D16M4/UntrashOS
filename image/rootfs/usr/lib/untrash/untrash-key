@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""untrash-key - UntrashKey, the paired USB stick as a hardware key
+(pylib/untrash_key.py, docs/architecture/untrashkey.md).
+
+  untrash-key check       verify the plugged stick, enforce SSH (untrash-key-watch)
+  untrash-key allow CAT   exit 0 if CAT (ssh, terminal, ...) may run now
+                          (ssh.service ExecCondition)
+  untrash-key status      JSON for diagnostics"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "pylib"))
+import untrash_key  # noqa: E402
+
+a = sys.argv[1:]
+if a == ["check"]:
+    print(json.dumps(untrash_key.check(), sort_keys=True))
+elif len(a) == 2 and a[0] == "allow":
+    ok = untrash_key.allow(a[1])
+    if not ok:
+        print("untrash-key: %s needs the UntrashKey (paired stick not plugged in)" % a[1], file=sys.stderr)
+    sys.exit(0 if ok else 1)
+elif a == ["status"]:
+    print(json.dumps(untrash_key.status(), indent=1, sort_keys=True))
+else:
+    print(__doc__, file=sys.stderr)
+    sys.exit(2)

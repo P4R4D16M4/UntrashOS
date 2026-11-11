@@ -41,6 +41,7 @@ if TEST:  # self-tests: stock disks are partitioned loop devices (every importer
 IMPORT = os.environ.get("ZT_IMPORT_TOOL", "/usr/sbin/untrash-import-zyxel")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "pylib"))
 import untrash_device  # noqa: E402
+import untrash_stick  # noqa: E402
 KEY_PROG1 = 148          # NAS542 COPY button (gpio-keys-polled, DT label "copy")
 COPY_WAIT = 60
 BOOTSTATE = b"ZTBS1 pref=a a=3 b=3 good=- booting=-\n"
@@ -435,7 +436,7 @@ def do_wipe_install(req, info):
         JOB.add("No stock MAC addresses on the stick: UntrashOS uses the driver's")
     run(["mkfs.btrfs", "-f", "-L", "ut-data", part_of(disk["path"], 5)])
     run(["wipefs", "-a", part_of(disk["path"], 3)])   # fresh state: no leftovers of the old disk content
-    seed_state(part_of(disk["path"], 3))
+    seed_state(part_of(disk["path"], 3), info["stick"])
     clear_install_marker(stick)
     JOB.add("Done: restarting starts UntrashOS %s from %s" % (slot["version"], disk["name"]))
 
@@ -470,14 +471,18 @@ PFE_CACHE = os.environ.get("ZT_INSTALLER_PFE", "/state/firmware/pfe")   # untras
 SEED_MNT = "/run/untrash/seed-state"
 
 
-def seed_state(target):
+def seed_state(target, stick=None):
     """Put the PFE PE firmware this installer runs with (untrash-init took it
     from the stock kernel copy on the stick) into the state of the installed
     system (ut-state partition or /.untrash/state.img), so that system never
     has to read the NAND for it.  An empty target becomes ext4 ut-state,
-    exactly as untrash-init would format it; a non-ext4 one is left alone."""
-    if not DRYRUN and not os.path.isfile(os.path.join(PFE_CACHE, "class_c2000.elf")):
+    exactly as untrash-init would format it; a non-ext4 one is left alone.
+    Also the stick archive (pylib/untrash_stick.py: release files + the stock
+    install run), from which the system makes new sticks (UntrashKey)."""
+    pfe = DRYRUN or os.path.isfile(os.path.join(PFE_CACHE, "class_c2000.elf"))
+    if not pfe:
         JOB.add("No PFE firmware in the installer: the system reads it itself on first start")
+    if not pfe and not stick:
         return
     if DRYRUN or sh(["wipefs", "-n", target], check=False).strip() == "":
         run(["mkfs.ext4", "-q", "-F", "-L", "ut-state", "-E", "lazy_itable_init=1,lazy_journal_init=1", target])
@@ -488,13 +493,25 @@ def seed_state(target):
     opts = "rw,noatime" + (",loop" if not target.startswith("/dev/") else "")
     run(["mount", "-t", "ext4", "-o", opts, target, SEED_MNT])
     try:
-        run(["mkdir", "-p", os.path.join(SEED_MNT, "firmware")])
-        run(["rm", "-rf", os.path.join(SEED_MNT, "firmware", "pfe")])
-        run(["cp", "-a", PFE_CACHE, os.path.join(SEED_MNT, "firmware", "pfe")])
+        if pfe:
+            run(["mkdir", "-p", os.path.join(SEED_MNT, "firmware")])
+            run(["rm", "-rf", os.path.join(SEED_MNT, "firmware", "pfe")])
+            run(["cp", "-a", PFE_CACHE, os.path.join(SEED_MNT, "firmware", "pfe")])
+            JOB.add("PFE firmware stored in the system state")
+        if stick:
+            # /var of the installed system is an overlay with its upper dir on the state
+            dest = os.path.join(SEED_MNT, "var.upper", "lib", "untrash", "stick")
+            if DRYRUN:
+                JOB.add("Would store the stick archive in %s" % dest)
+            else:
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    untrash_stick.archive_from(stick["mnt"], dest, log=JOB.add)
+                except (untrash_stick.StickFail, OSError) as e:
+                    JOB.add("Stick archive not stored (%s): new sticks need the original one" % e)
         run(["sync"])
     finally:
         run(["umount", SEED_MNT])
-    JOB.add("PFE firmware stored in the system state")
 
 
 def sha256_file(path):
@@ -757,7 +774,7 @@ def do_keep_install(req, info, takeover):
                 run(["fallocate", "-l", str(STATE_IMG), os.path.join(u, "state.img")])
             else:
                 JOB.add("state.img present: kept")
-            seed_state(os.path.join(u, "state.img"))
+            seed_state(os.path.join(u, "state.img"), stick)
             if DRYRUN or not os.path.exists(os.path.join(u, "swap.img")):
                 run(["fallocate", "-l", str(SWAP_IMG), os.path.join(u, "swap.img")])
                 run(["chmod", "600", os.path.join(u, "swap.img")])

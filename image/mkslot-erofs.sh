@@ -137,8 +137,8 @@ rm -f "$W/root/etc/init.d/inadyn" "$W"/root/etc/rc?.d/[SK]??inadyn
 mkdir -p "$W/root/etc/systemd/system/multi-user.target.wants"
 ln -sf /usr/lib/systemd/system/untrash-takeover-firstboot.service "$W/root/etc/systemd/system/multi-user.target.wants/"
 # Untrash Desk (port 80, not on the installer stick), way A data partition, SSH host keys,
-# service SSH key from the stick, memory offloading, RAM boost, Nextcloud link
-for u in untrash-desk untrash-data untrash-ssh-hostkeys untrash-copybtn untrash-servicekey untrash-adblock untrash-netname untrash-mesh untrash-memd untrash-boost untrash-cloudlink; do
+# service SSH key from the stick, UntrashKey, memory offloading, RAM boost, Nextcloud link
+for u in untrash-desk untrash-data untrash-ssh-hostkeys untrash-copybtn untrash-servicekey untrash-key untrash-adblock untrash-netname untrash-mesh untrash-memd untrash-boost untrash-cloudlink; do
 	ln -sf /usr/lib/systemd/system/$u.service "$W/root/etc/systemd/system/multi-user.target.wants/"
 done
 # services of the stock features run only when untrash-config switches them on (settings),

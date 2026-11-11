@@ -50,6 +50,8 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "pylib"))
 import untrash_auth  # noqa: E402
 import untrash_device  # noqa: E402
+import untrash_key  # noqa: E402
+import untrash_stick  # noqa: E402
 import untrash_live  # noqa: E402
 import untrash_tv  # noqa: E402
 import untrash_slot  # noqa: E402
@@ -1831,6 +1833,11 @@ def update_install(req):
         sysrun(["/usr/lib/untrash/untrash-slot-write", f, part])
     sysrun(["/usr/lib/untrash/untrash-bootstate", "prefer", other])
     UPDATE["log"].append("written to slot %s; restarting starts %s" % (other.upper(), UPDATE["version"]))
+    try:                    # sticks made from now on (UntrashKey) carry this system
+        if not TEST and untrash_stick.refresh_system(f, UPDATE["version"]):
+            UPDATE["log"].append("stick archive: system %s for new sticks" % UPDATE["version"])
+    except OSError as e:
+        UPDATE["log"].append("stick archive not updated: %s" % e)
     UPDATE["state"] = "installed"
     return {"slot": other}
 
@@ -3823,8 +3830,153 @@ def static(base, rel):
 
 
 ADMIN_GET = {"/api/processes", "/api/mesh", "/api/adblock", "/api/adblock/log", "/api/overview", "/api/live", "/api/activity", "/api/sound", "/api/volumes/dirs", "/api/feedback/info", "/api/storage", "/api/users", "/api/settings", "/api/logs", "/api/update", "/api/stock",
-             "/api/timezones", "/api/raid", "/api/printers", "/api/cloud", "/api/downloads", "/api/copybtn", "/api/backup", "/api/users/quota", "/api/cert", "/api/upnp", "/api/iscsi", "/api/power/next",
+             "/api/timezones", "/api/raid", "/api/printers", "/api/cloud", "/api/downloads", "/api/copybtn", "/api/backup", "/api/users/quota", "/api/cert", "/api/upnp", "/api/untrashkey", "/api/iscsi", "/api/power/next",
              "/api/backup/versions"}
+# ------------------------------------------------------------- UntrashKey
+#
+# With UntrashKey on (pylib/untrash_key.py, docs/architecture/untrashkey.md)
+# these actions run only while the paired stick is plugged in, by category;
+# the admin chooses the categories.  SSH: ssh.service ExecCondition.
+
+KEY_GUARD = {
+    "/api/term": "terminal",
+    # who can get in: accounts, admin rights, sign-in, app and mesh links
+    "/api/users/create": "access", "/api/users/delete": "access", "/api/users/signin": "access",
+    "/api/groups/create": "access", "/api/groups/delete": "access", "/api/groups/members": "access",
+    "/api/mesh/create": "access", "/api/mesh/invite": "access", "/api/mesh/join": "access",
+    "/api/mesh/remove": "access", "/api/mesh/leave": "access", "/api/mesh/pair": "access",
+    "/api/mesh/app-link": "access", "/api/mesh/cloud-invite": "access", "/api/mesh/cloud-link": "access",
+    # what the NAS opens to the network (services and network settings: KEY_SETTINGS)
+    "/api/upnp": "exposure", "/api/cert/regenerate": "exposure", "/api/cert/upload": "exposure",
+    "/api/iscsi/lun": "exposure", "/api/iscsi/lun-delete": "exposure", "/api/iscsi/targets": "exposure",
+    # the system itself
+    "/api/update/install": "system", "/api/update/upload": "system", "/api/update/settings": "system",
+    "/api/stock/rollback": "system", "/api/processes/kill": "system",
+    # where data goes, and what can destroy it
+    "/api/raid/job": "data", "/api/shares/save": "data", "/api/shares/delete": "data",
+    "/api/backup/jobs": "data", "/api/backup/restore": "data", "/api/mesh/share": "data",
+    "/api/mesh/mirror-start": "data", "/api/mesh/mirror-accept": "data", "/api/mesh/mirror-stop": "data",
+    "/api/cloud/auth-start": "data", "/api/cloud/auth-finish": "data", "/api/cloud/ftp": "data",
+    "/api/cloud/delete": "data", "/api/cloud/jobs": "data",
+}
+KEY_SETTINGS = ("services", "network", "smarthome")     # /api/settings sections that count as "exposure"
+
+
+def key_category(path, req, user):
+    if path == "/api/settings":
+        return "exposure" if any(k in req for k in KEY_SETTINGS) else None
+    if path == "/api/password":
+        return "access" if (req.get("name") or user) != user else None
+    return KEY_GUARD.get(path)
+
+
+def key_guard(path, req, user):
+    """423 with {"untrashkey": category} while the key of USER is needed and
+    not plugged in; the browser waits for the stick and repeats the call.
+    Every action a key opens goes to the journal with the key's id."""
+    cat = key_category(path, req, user)
+    if not cat:
+        return
+    cfg = untrash_key.load()
+    if not cfg["enabled"] or cat not in cfg["protect"]:
+        return
+    k = untrash_key.current(cfg)
+    if not k or k.get("user") not in ("", None, user):
+        raise Fail("Plug in your UntrashKey.", 423, {"untrashkey": cat})
+    print("untrashkey: key %s (%s) opened %s for %s: %s" % (k["key"], k.get("name", ""), cat, user, path), flush=True)
+
+
+def key_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except (untrash_key.KeyFail, untrash_stick.StickFail) as e:
+        raise Fail(str(e), 409)
+
+
+def key_owner(req, me):
+    """The Desk user a new key belongs to (an administrator; default: me)."""
+    u = str(req.get("user") or me)
+    if not is_admin(u):
+        raise Fail("A key belongs to an administrator.")
+    return u
+
+
+STICK_JOB = {"state": "idle", "log": []}          # archive import (copy from the plugged stick)
+
+
+def key_state():
+    """GET /api/untrashkey: status, a pairing or stick creation in progress,
+    the stick archive."""
+    st = untrash_key.pair_poll(start_create=key_create_thread)
+    st["archive"] = untrash_stick.info()
+    st["archive_need"] = untrash_stick.need_bytes() if st["archive"] else 0
+    st["archive_job"] = dict(STICK_JOB)
+    return st
+
+
+def key_create_thread(disk, p):
+    def work():
+        try:
+            kid = untrash_stick.make_stick(disk, lambda mnt: untrash_key.issue(mnt, p["name"], p.get("user", "")),
+                                           progress=lambda m: untrash_key.pair_update(step=m))
+            untrash_key.pair_update(state="done", key=kid, step="")
+            print("untrashkey: new key stick %s for %s written to %s" % (kid, p.get("user") or "any admin", disk["dev"]), flush=True)
+        except (untrash_stick.StickFail, untrash_key.KeyFail, OSError) as e:
+            untrash_key.pair_update(state="failed", error=str(e), step="")
+        untrash_key.check()
+    threading.Thread(target=work, daemon=True).start()
+
+
+def key_pair(req, me):
+    return key_call(untrash_key.pair_start, req.get("name"), key_owner(req, me))
+
+
+def key_create(req, me):
+    """A new stick from the archive onto a USB stick plugged in from now on
+    (erased: typed confirmation FORMAT)."""
+    if req.get("confirm") != "FORMAT":
+        raise Fail("Type FORMAT to confirm that the stick will be erased.")
+    if not untrash_stick.info():
+        raise Fail("No stick archive on this NAS: store the UntrashOS stick first.")
+    return key_call(untrash_key.pair_start, req.get("name"), key_owner(req, me), mode="create")
+
+
+def key_archive(req):
+    """Store the plugged UntrashOS stick in the archive (for systems
+    installed before 1.2).  Its stock backup only if it is this NAS's
+    (device.env MAC = eth0)."""
+    st = untrash_key.stick()
+    if not st:
+        raise Fail("Plug in the UntrashOS stick.")
+    if STICK_JOB["state"] == "running":
+        raise Fail("The stick is being stored already.")
+    mac = first("/sys/class/net/eth0/address", "").lower()
+
+    def work():
+        STICK_JOB.update(state="running", log=["Copying the stick"])
+        try:
+            def copy(mnt):
+                run = untrash_stick.stock_run(mnt)
+                own = False
+                if run:
+                    env = dict(l.strip().partition("=")[::2] for l in open(os.path.join(run, "device.env")) if "=" in l)
+                    own = bool(mac) and env.get("ETH0_MAC", "").lower() == mac
+                return untrash_stick.archive_from(mnt, log=STICK_JOB["log"].append, stock=own)
+            untrash_key._on_stick(st, False, copy)
+            STICK_JOB["state"] = "done"
+        except (untrash_stick.StickFail, untrash_key.KeyFail, OSError) as e:
+            STICK_JOB["log"].append(str(e))
+            STICK_JOB["state"] = "failed"
+    threading.Thread(target=work, daemon=True).start()
+    return {}
+
+
+def key_ssh(req, me):
+    if "keys" in req and not isinstance(req["keys"], list):
+        raise Fail("Invalid keys.")
+    return key_call(untrash_key.ssh_keys, req.get("keys"), user=me)
+
+
 ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete,
               "/api/groups/create": group_create, "/api/groups/delete": group_delete,
               "/api/groups/members": group_set_members, "/api/shares/save": share_save,
@@ -3854,6 +4006,14 @@ ADMIN_POST = {"/api/users/create": user_create, "/api/users/delete": user_delete
               "/api/backup/jobs": backup_jobs, "/api/users/quota": user_quota_set,
               "/api/cert/regenerate": cert_regenerate, "/api/upnp": upnp_save,
               "/api/iscsi/lun": iscsi_lun, "/api/iscsi/lun-delete": iscsi_lun_delete, "/api/iscsi/targets": iscsi_targets, "/api/cert/upload": cert_upload, "/api/backup/run": backup_run, "/api/backup/restore": backup_restore}
+# UntrashKey (admins; these get the acting user): pairing and creating a stick
+# need someone at the NAS instead of the key (also the way back after a loss)
+KEY_POST = {"/api/untrashkey/pair": key_pair, "/api/untrashkey/create": key_create,
+            "/api/untrashkey/pair-cancel": lambda req, me: key_call(untrash_key.pair_cancel),
+            "/api/untrashkey/save": lambda req, me: key_call(untrash_key.configure, req, user=me),
+            "/api/untrashkey/remove": lambda req, me: key_call(untrash_key.remove, str(req.get("id") or ""), user=me),
+            "/api/untrashkey/archive": lambda req, me: key_archive(req),
+            "/api/untrashkey/ssh-keys": key_ssh}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4034,8 +4194,10 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 return self.reply(200, prefs_save(user, self.json_body()))
         if p == "/api/password" and method == "POST":
+            req = self.json_body()
+            key_guard(p, req, user)
             with LOCK:
-                return self.reply(200, user_password(self.json_body(), user))
+                return self.reply(200, user_password(req, user))
         if p == "/api/shares" and method == "GET":
             if admin:
                 return self.reply(200, {"shares": shares(), "volumes": volumes()})
@@ -4119,9 +4281,11 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/term" and method == "GET":
             # web terminal: a login shell of this admin over a WebSocket
             # (sudo for root; untrash_live.terminal checks Origin == Host)
+            key_guard(p, {}, user)
             if TEST:
                 raise Fail("Terminal not available in test mode.", 501)
-            untrash_live.terminal(self, user)
+            # UntrashKey: the session ends when the stick is pulled
+            untrash_live.terminal(self, user, alive=lambda: untrash_key.allow("terminal", user=user))
             return
         if method == "GET" and p in ADMIN_GET:
             if p == "/api/overview":
@@ -4163,6 +4327,8 @@ class Handler(BaseHTTPRequestHandler):
                                                   or "{}"))
             if p == "/api/upnp":
                 return self.reply(200, upnp_state())
+            if p == "/api/untrashkey":
+                return self.reply(200, key_state())
             if p == "/api/iscsi":
                 return self.reply(200, iscsi_state())
             if p == "/api/cert":
@@ -4199,10 +4365,15 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and p == "/api/downloads/torrent":
             return self.reply(200, downloads_torrent(self, int(self.headers.get("Content-Length") or 0)))
         if method == "POST" and p == "/api/update/upload":
+            key_guard(p, {}, user)
             with LOCK:
                 return self.reply(200, update_upload(self, int(self.headers.get("Content-Length") or 0)))
+        if method == "POST" and p in KEY_POST:
+            with LOCK:
+                return self.reply(200, KEY_POST[p](self.json_body(), user))
         if method == "POST" and p in ADMIN_POST:
             req = self.json_body()
+            key_guard(p, req, user)
             confirm_action(user, p, req, self, bool(self.app))
             with LOCK:
                 return self.reply(200, ADMIN_POST[p](req))
